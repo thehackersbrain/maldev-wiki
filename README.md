@@ -1,7 +1,5 @@
 # maldev wiki
 
-Astro + TypeScript + Tailwind v4 implementation of the `Maldev Wiki.dc.html` concept mockup.
-
 Live at **maldev.thehackersbrain.dev** · built by Gaurav Raj ([@thehackersbrain](https://github.com/thehackersbrain)).
 
 ```bash
