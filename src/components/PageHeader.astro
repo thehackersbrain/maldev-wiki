@@ -1,0 +1,37 @@
+---
+import Breadcrumb from './Breadcrumb.astro';
+
+interface Crumb {
+  label: string;
+  href?: string;
+}
+
+interface Props {
+  title: string;
+  crumbs: Crumb[];
+  /** intro paragraph; omit for pages that go straight into content */
+  intro?: string;
+  /** widen when the intro is long */
+  introWidth?: 'narrow' | 'wide';
+}
+
+const { title, crumbs, intro, introWidth = 'narrow' } = Astro.props;
+---
+
+<Breadcrumb items={crumbs} />
+<h1 class="mb-3 text-[clamp(28px,6vw,36px)]/[1.1] font-bold tracking-[-0.02em] text-balance text-tx">
+  {title}
+</h1>
+{
+  intro && (
+    <p
+      class:list={[
+        'mb-6.5 text-base/[1.65] text-pretty text-dim',
+        introWidth === 'wide' ? 'max-w-[640px]' : 'max-w-[620px]',
+      ]}
+    >
+      {intro}
+    </p>
+  )
+}
+<slot />

@@ -1,0 +1,78 @@
+maldev wiki — licensing
+=======================
+
+This repository contains two kinds of material, licensed separately.
+
+--------------------------------------------------------------------------------
+1. Written content — CC BY-SA 4.0
+--------------------------------------------------------------------------------
+
+All prose, technique pages, detection descriptions and site copy (everything under
+`src/content/`, plus the descriptive text in `src/data/`) is licensed under the
+Creative Commons Attribution-ShareAlike 4.0 International License.
+
+  You are free to:
+    Share  — copy and redistribute the material in any medium or format
+    Adapt  — remix, transform, and build upon the material for any purpose,
+             including commercially
+
+  Under the following terms:
+    Attribution — You must give appropriate credit, provide a link to the
+                  license, and indicate if changes were made.
+    ShareAlike  — If you remix or build upon the material, you must distribute
+                  your contributions under the same license.
+
+Full licence text: https://creativecommons.org/licenses/by-sa/4.0/legalcode
+Human-readable summary: https://creativecommons.org/licenses/by-sa/4.0/
+
+Attribution should credit "maldev wiki" and link back to the page you used.
+Individual pages also credit their author in the page header; keep that credit
+where a page has one.
+
+--------------------------------------------------------------------------------
+2. Source code — MIT
+--------------------------------------------------------------------------------
+
+The site implementation (everything under `src/components/`, `src/layouts/`,
+`src/lib/`, `src/pages/`, `src/styles/`, `scripts/`, and the build configuration)
+and the abridged reference code samples embedded in technique pages are licensed
+under the MIT License:
+
+Copyright (c) 2026 Gaurav Raj (@thehackersbrain)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+3. Third-party material
+--------------------------------------------------------------------------------
+
+Fonts (Space Grotesk, JetBrains Mono) are licensed under the SIL Open Font
+License 1.1 by their respective authors and are fetched at build time rather
+than vendored here.
+
+Tools listed on the toolkit page are the property of their respective authors
+and are linked, not redistributed.
+
+--------------------------------------------------------------------------------
+4. Intended use
+--------------------------------------------------------------------------------
+
+This material is published for detection engineering, malware analysis and
+authorized security testing. Nothing in either licence grants permission to
+operate these techniques against systems you do not own or lack written
+authorization to test. See DISCLOSURE.md.

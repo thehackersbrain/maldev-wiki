@@ -1,0 +1,90 @@
+---
+import { getNavSections } from '../lib/nav';
+
+const sections = await getNavSections(Astro.url.pathname);
+---
+
+<aside
+  class="sticky top-14 hidden h-[calc(100vh-56px)] overflow-y-auto border-r border-bd px-3 pt-5 pb-16 lg:block"
+  aria-label="Documentation"
+>
+  <div class="px-2.5 pb-3.5">
+    <label class="sr-only" for="page-filter">Filter pages</label>
+    <div
+      class="flex h-9 items-center gap-2 rounded-lg border border-bd bg-panel px-3 focus-within:border-bd2"
+    >
+      <span class="font-mono text-[13px] text-faint" aria-hidden="true">⌕</span>
+      <input
+        id="page-filter"
+        type="search"
+        placeholder="Filter pages…"
+        autocomplete="off"
+        data-page-filter
+        class="w-full bg-transparent text-[13px] text-tx placeholder:text-faint focus:outline-none"
+      />
+    </div>
+  </div>
+
+  <div data-filter-root>
+    {
+      sections.map((sec) => (
+        <details open={sec.open} class="group mb-px" data-section>
+          <summary class="flex cursor-pointer list-none items-center gap-2.5 rounded-md px-2.5 py-2 hover:bg-panel">
+            <span class="w-2.5 font-mono text-[8px] text-faint group-open:text-dim" aria-hidden="true">
+              <span class="group-open:hidden">▶</span>
+              <span class="hidden group-open:inline">▼</span>
+            </span>
+            <span class="flex-1 text-[13.5px] font-semibold tracking-[0.01em] text-tx">{sec.name}</span>
+            <span class="font-mono text-[11px] font-medium text-faint">{sec.pages.length}</span>
+          </summary>
+          <div class="mt-0.5 mb-1.5 ml-[19px] flex flex-col">
+            {sec.pages.map((pg) => (
+              <a
+                href={pg.href}
+                data-filter-item
+                class:list={[
+                  'block border-l-2 px-2.5 py-[7px] text-[13.5px]/[1.4]',
+                  pg.active
+                    ? 'border-acc bg-acc/8 font-semibold text-acc'
+                    : 'border-bd text-dim hover:border-bd2 hover:bg-panel hover:text-tx',
+                ]}
+              >
+                {pg.title}
+              </a>
+            ))}
+            <a
+              href={sec.href}
+              data-filter-item
+              class="block border-l-2 border-bd px-2.5 py-[7px] text-[12.5px] font-medium text-faint hover:border-bd2 hover:text-dim"
+            >
+              all {sec.name.toLowerCase()} →
+            </a>
+          </div>
+        </details>
+      ))
+    }
+  </div>
+</aside>
+
+<script>
+  const input = document.querySelector<HTMLInputElement>('[data-page-filter]');
+  const root = document.querySelector<HTMLElement>('[data-filter-root]');
+
+  input?.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    root?.querySelectorAll<HTMLDetailsElement>('[data-section]').forEach((sec) => {
+      const links = sec.querySelectorAll<HTMLAnchorElement>('[data-filter-item]');
+      let hits = 0;
+      links.forEach((link) => {
+        const match = !q || (link.textContent ?? '').toLowerCase().includes(q);
+        link.hidden = !match;
+        if (match) hits++;
+      });
+      const sectionMatch = (sec.querySelector('summary')?.textContent ?? '')
+        .toLowerCase()
+        .includes(q);
+      sec.hidden = q !== '' && hits === 0 && !sectionMatch;
+      if (q) sec.open = true;
+    });
+  });
+</script>

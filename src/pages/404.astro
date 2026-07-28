@@ -1,0 +1,51 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Footer from '../components/Footer.astro';
+import { categories } from '../data/categories';
+---
+
+<BaseLayout title="404 — maldev wiki" description="That page does not exist on this wiki. Browse the technique index or search for the technique, MITRE id or API you were looking for." noindex>
+  <main id="main" class="mx-auto max-w-[1180px] px-6">
+    <section class="pt-20 pb-14">
+      <div class="mb-6 font-mono text-[11px] tracking-[0.14em] text-faint uppercase">error 404</div>
+      <h1 class="text-[clamp(32px,5vw,48px)]/[1.1] font-bold tracking-[-0.02em] text-balance text-tx">
+        No page mapped at that address.
+      </h1>
+      <p class="mt-5 max-w-[520px] text-[17px]/[1.65] text-pretty text-dim">
+        The URL resolved to nothing. It may have been renamed when a technique moved category, or it
+        may never have existed.
+      </p>
+
+      <div class="mt-8 flex flex-wrap gap-3">
+        <a
+          href="/techniques"
+          class="rounded-[9px] border border-accd bg-acc px-5 py-3.5 text-sm font-semibold text-[#06120b] transition-colors hover:bg-acc2"
+          >Browse the index</a
+        >
+        <a
+          href="/search"
+          class="rounded-[9px] border border-bd bg-panel/70 px-5 py-3.5 text-sm font-semibold text-tx transition-colors hover:border-bd2"
+          >Search the wiki</a
+        >
+      </div>
+
+      <div class="mt-14 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {
+          categories.map((c) => (
+            <a
+              href={`/techniques/${c.slug}`}
+              class="flex items-center gap-2.5 rounded-[11px] border border-bd bg-bg2 px-4 py-3 transition-colors hover:border-accd hover:bg-panel"
+            >
+              <span class="font-mono text-acc" aria-hidden="true">
+                {c.sym}
+              </span>
+              <span class="text-[13px] font-semibold text-tx">{c.name}</span>
+            </a>
+          ))
+        }
+      </div>
+    </section>
+
+    <Footer />
+  </main>
+</BaseLayout>

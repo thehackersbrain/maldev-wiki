@@ -1,0 +1,95 @@
+---
+title: Classic DLL Injection
+mitre: T1055.001
+category: injection
+group: Remote Thread
+summary: LoadLibrary in a remote thread. Trivially detected, but the baseline every other technique is measured against.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-06-02'
+author: thehackersbrain
+readingTime: 5 min read
+callChain:
+  - call: OpenProcess(PROCESS_ALL_ACCESS)
+    desc: Acquire a handle to the target with allocate, write and thread-create rights.
+    dll: kernel32
+  - call: VirtualAllocEx
+    desc: Reserve a small RW page in the target to hold the DLL path string.
+    dll: kernel32
+  - call: WriteProcessMemory
+    desc: Copy the fully qualified path of the DLL into that page.
+    dll: kernel32
+  - call: CreateRemoteThread(LoadLibraryA)
+    desc: Start a thread at LoadLibraryA with the path as its argument; the loader does the rest.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 8
+    text: CreateRemoteThread where the start address resolves to LoadLibraryA/W in kernel32.
+  - src: SYSMON EID 7
+    text: Image load of a DLL from a user-writable path into a process that never loads plugins.
+  - src: SYSMON EID 10
+    text: ProcessAccess with GrantedAccess 0x1F3FFF from an unusual source image.
+  - src: BEHAVIOURAL
+    text: The injected module is in the target's module list — this technique hides nothing from an inventory sweep.
+related:
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: Removes the module list entry that makes this technique trivial to spot.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1055.003
+    title: Thread Execution Hijacking
+    desc: Reuses an existing thread instead of creating one.
+    href: /techniques/injection/thread-execution-hijacking
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The oldest injection primitive on Windows: write a DLL path into a remote process and start a thread
+at `LoadLibraryA` with that path as its argument. The Windows loader maps the image, resolves its
+imports and calls `DllMain` — all the hard work is done for you by a legitimate code path.
+
+That reliance on the loader is also the technique's undoing. The injected DLL appears in the target's
+`PEB_LDR_DATA` module list, is backed by a file on disk, and had to be written to disk first. Every
+later injection technique in this category exists to remove one of those three artifacts.
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="inject.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+
+// the loader needs a path it can open, so the DLL must exist on disk
+SIZE_T len = strlen(dllPath) + 1;
+PVOID remote = VirtualAllocEx(hProc, NULL, len, MEM_COMMIT, PAGE_READWRITE);
+WriteProcessMemory(hProc, remote, dllPath, len, NULL);
+
+// LoadLibraryA sits at the same address in every process on the box
+FARPROC loadLib = GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)loadLib, remote, 0, NULL);`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Treat this one as a calibration technique. If your pipeline cannot see classic DLL injection in the
+lab, nothing further down this category will fire either.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

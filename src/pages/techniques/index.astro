@@ -1,0 +1,81 @@
+---
+import { getCollection } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import PageHeader from '../../components/PageHeader.astro';
+import SectionLabel from '../../components/SectionLabel.astro';
+import TechniqueRow from '../../components/TechniqueRow.astro';
+import { categories } from '../../data/categories';
+import { collectionJsonLd, breadcrumbJsonLd } from '../../lib/seo';
+
+const entries = (await getCollection('techniques')).filter((e) => !e.data.draft);
+
+const groups = categories.map((cat) => ({
+  ...cat,
+  pages: entries
+    .filter((e) => e.data.category === cat.slug)
+    .sort((a, b) => a.data.mitre.localeCompare(b.data.mitre))
+    .map((e) => ({
+      href: `/techniques/${e.id}`,
+      mitre: e.data.mitre,
+      title: e.data.title,
+      summary: e.data.summary,
+      platform: e.data.platform as string[],
+    })),
+}));
+const canonical = new URL(Astro.url.pathname.replace(/\/$/, ''), Astro.site).href;
+const indexDescription =
+  'The full technique index: injection, evasion, loaders, persistence, C2, anti-analysis, credential access and detection.';
+const jsonLd = [
+  collectionJsonLd(canonical, 'Technique index', indexDescription),
+  breadcrumbJsonLd([{ label: 'Home', href: '/' }, { label: 'Techniques' }], canonical),
+];
+---
+
+<DocsLayout
+  jsonLd={jsonLd}
+  title="Techniques — maldev wiki"
+  description="The full technique index: injection, evasion, loaders, persistence, C2, anti-analysis, credential access and detection."
+>
+  <div class="max-w-[1000px] px-6 pt-8 pb-24 lg:px-11">
+    <PageHeader
+      title="Technique index"
+      crumbs={[{ label: 'Home', href: '/' }, { label: 'Techniques' }]}
+      introWidth="wide"
+      intro={`${entries.length} pages across ${categories.length} categories. Every page carries a reference implementation and at least one tested detection — that pairing is the merge requirement, not a nice-to-have.`}
+    />
+
+    {
+      groups.map((g) => (
+        <section class="mb-9">
+          <div class="mb-3.5 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-bd pb-3">
+            <SectionLabel text={g.name.toLowerCase()} class="" />
+            <a
+              href={`/techniques/${g.slug}`}
+              class="text-[12.5px] font-medium text-faint hover:text-acc"
+            >
+              open category →
+            </a>
+            <span class="font-mono text-[11.5px] whitespace-nowrap text-faint sm:ml-auto">
+              {g.pages.length} {g.pages.length === 1 ? 'technique' : 'techniques'}
+            </span>
+          </div>
+
+          {g.pages.length === 0 ? (
+            <p class="px-3 py-4 text-[13px] text-faint">
+              nothing published yet —{' '}
+              <a href="/contribute" class="text-acc hover:text-acc2">
+                contribute the first page
+              </a>
+            </p>
+          ) : (
+            <div class="flex flex-col">
+              {g.pages.map((row) => (
+                <TechniqueRow row={row} />
+              ))}
+            </div>
+          )}
+        </section>
+      ))
+    }
+  </div>
+</DocsLayout>

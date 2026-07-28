@@ -1,0 +1,19 @@
+---
+interface Props {
+  title: string;
+  /** supporting line under the title */
+  sub: string;
+  href: string;
+}
+
+const { title, sub, href } = Astro.props;
+---
+
+<a
+  href={href}
+  rel="noopener"
+  class="flex flex-col gap-1.75 rounded-[11px] border border-bd bg-bg2 px-4.5 py-4 transition-colors hover:border-accd"
+>
+  <span class="text-[13.5px]/[1.3] font-semibold text-tx">{title}</span>
+  <span class="text-[12.5px]/[1.5] text-dim">{sub}</span>
+</a>

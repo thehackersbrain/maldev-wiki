@@ -1,0 +1,103 @@
+---
+title: Hunting Unbacked Executable Memory
+mitre: T1055
+category: detection
+group: Memory Forensics
+summary: The single highest-yield structural hunt across the whole injection category.
+platform: [Windows]
+tags: [Sigma, Volatility, Hunting]
+updated: '2026-07-14'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: enumerate committed regions
+    desc: Walk the VAD tree for every process and keep MEM_COMMIT regions.
+    dll: volatility
+  - call: filter for executable protection
+    desc: Keep PAGE_EXECUTE_*, discard everything read-only or writable-only.
+    dll: volatility
+  - call: check the backing file
+    desc: A region with no FILE_OBJECT behind it is private executable memory.
+    dll: volatility
+  - call: score the survivors
+    desc: Rank by size, entropy, presence of an MZ header and whether a thread starts inside it.
+    dll: —
+detections:
+  - src: SYSMON EID 8
+    text: Remote thread whose StartModule is null — the cheapest continuous approximation of this hunt.
+  - src: ETW-TI
+    text: Allocation or protection change producing executable private memory in another process.
+  - src: MEMORY SCAN
+    text: Volatility malfind, tuned to drop the known-good JIT population before scoring.
+  - src: BEHAVIOURAL
+    text: Signed system binaries — svchost, rundll32, dllhost — are never expected to host private RX memory.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: The canonical producer of this artifact.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1055.002
+    title: Module Stomping
+    desc: The main way attackers defeat this hunt — read this one next.
+    href: /techniques/injection/module-stomping
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Most injection techniques converge on the same end state: code executing from memory that no file on
+disk accounts for. Hollowing, reflective loading, shellcode stagers and manual mappers differ
+enormously in how they get there and barely at all in what they leave behind.
+
+That makes unbacked executable memory the most economical thing a defender can hunt for. One check
+covers a whole category, and the techniques that evade it — module stomping above all — have to give
+up something else to do so.
+
+<Callout type="caution">
+  This hunt has a real false-positive population: .NET, Java and every JavaScript engine generate
+  private executable memory as a matter of course. Baseline those processes explicitly rather than
+  raising the threshold until the alert goes quiet.
+</Callout>
+
+## The hunt
+
+<CallChain steps={frontmatter.callChain} />
+
+## Running it
+
+<CodeBlock
+  file="hunt.sh"
+  label="bash"
+  lang="bash"
+  class="mb-7.5"
+  code={`# offline: score every private executable region in a memory image
+vol -f capture.raw windows.malfind --dump
+
+# live triage: same idea, from the running box
+Get-Process | ForEach-Object {
+  # regions with Protect = PAGE_EXECUTE_READWRITE and Type = MEM_PRIVATE
+  Get-ProcessMemoryRegion -Id $_.Id |
+    Where-Object { $_.Type -eq 'Private' -and $_.Protect -match 'EXECUTE' }
+}`}
+/>
+
+Score, do not alert. A 4 KB private RX region in a browser is noise; a 60 KB one carrying an `MZ`
+header in `svchost.exe`, with a thread starting inside it, is an incident.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

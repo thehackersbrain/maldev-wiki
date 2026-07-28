@@ -1,0 +1,95 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import PageHeader from '../components/PageHeader.astro';
+import SectionLabel from '../components/SectionLabel.astro';
+import StepList from '../components/StepList.astro';
+import LinkCard from '../components/LinkCard.astro';
+import Callout from '../components/Callout.astro';
+import { site } from '../lib/seo';
+import CodeBlock from '../components/CodeBlock.astro';
+
+const steps = [
+  {
+    title: 'Open an issue first',
+    desc: 'Say which technique you want to document. Maintainers check it is not already covered and that it clears the disclosure policy.',
+  },
+  {
+    title: 'Write the page',
+    desc: 'Use the frontmatter template below. Overview, call chain, reference implementation, detection — in that order.',
+  },
+  {
+    title: 'Ship a detection with it',
+    desc: 'A technique page without a working Sigma, YARA or memory-scan rule will not be merged. Test it in the lab kit and paste the output.',
+  },
+  {
+    title: 'Open the PR',
+    desc: 'CI builds the page, lints the code samples and runs your rule against the corpus. Two maintainer approvals merge it.',
+  },
+];
+
+const links = [
+  { title: 'Repository ↗', sub: 'github.com/thehackersbrain/maldev-wiki', href: site.repo },
+  {
+    title: 'Style guide ↗',
+    sub: 'Voice, code formatting, citations',
+    href: `${site.repo}/blob/main/STYLE.md`,
+  },
+  {
+    title: 'Disclosure policy ↗',
+    sub: 'What we publish and what we hold',
+    href: `${site.repo}/blob/main/DISCLOSURE.md`,
+  },
+];
+
+const template = `---
+title: Process Hollowing
+mitre: T1055.012
+category: injection
+summary: Replace the image of a suspended process before it ever executes.
+platform: [Windows]
+updated: '2026-07-21'
+author: your-handle
+detections:                 # <- required, at least one
+  - src: SYSMON EID 8
+    text: Remote thread with an unbacked start address.
+---
+
+## Overview
+## The call chain
+## Reference implementation
+## Detection                <- required`;
+---
+
+<DocsLayout
+  title="Contribute — maldev wiki"
+  description="How to add a technique page: open an issue, write the page, ship a tested detection with it, open the PR."
+>
+  <div class="max-w-[900px] px-6 pt-8 pb-24 lg:px-11">
+    <PageHeader
+      title="Contribute a technique"
+      crumbs={[{ label: 'Home', href: '/' }, { label: 'Contribute' }]}
+      intro="The wiki is a git repo of markdown. Fork it, add a page, open a PR — two maintainers review every merge."
+    />
+
+    <Callout type="danger" title="We do not accept weaponized submissions.">
+      No working droppers, no live C2 infrastructure, no ransomware payloads, no samples targeting a
+      named victim. Pages must be written for detection engineers and authorized testers, and every
+      technique needs a detection section before it merges.
+    </Callout>
+
+    <SectionLabel text="the process" class="mb-4" />
+    <StepList steps={steps} class="mb-8.5" />
+
+    <SectionLabel text="page template" class="mb-4" />
+    <CodeBlock
+      file="techniques/injection/your-page.mdx"
+      lang="markdown"
+      code={template}
+      class="mb-8.5"
+    />
+
+    <div class="grid gap-3 sm:grid-cols-3">
+      {links.map((l) => <LinkCard title={l.title} sub={l.sub} href={l.href} />)}
+    </div>
+  </div>
+</DocsLayout>

@@ -1,0 +1,31 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Sidebar from '../components/Sidebar.astro';
+import MobileDocsNav from '../components/MobileDocsNav.astro';
+
+interface Props {
+  title: string;
+  description?: string;
+  jsonLd?: Record<string, unknown>[];
+  noindex?: boolean;
+  article?: { published: string; modified: string; author: string; section: string };
+}
+
+const { title, description, jsonLd, noindex, article } = Astro.props;
+---
+
+<BaseLayout
+  title={title}
+  description={description}
+  jsonLd={jsonLd}
+  noindex={noindex}
+  article={article}
+>
+  <MobileDocsNav />
+  <div class="mx-auto grid max-w-[1520px] items-start lg:grid-cols-[282px_minmax(0,1fr)]">
+    <Sidebar />
+    <div id="main" class="min-w-0">
+      <slot />
+    </div>
+  </div>
+</BaseLayout>

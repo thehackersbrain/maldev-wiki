@@ -1,0 +1,21 @@
+---
+interface Props {
+  /** code = a page ships a sample; rule = a page ships detection logic */
+  tone: 'code' | 'rule';
+  class?: string;
+}
+
+const { tone, class: className } = Astro.props;
+---
+
+<span
+  class:list={[
+    'rounded border px-1.5 py-0.75 font-mono text-[9.5px]/[1.3] font-semibold whitespace-nowrap',
+    tone === 'code'
+      ? 'border-purple/24 bg-purple/10 text-purple'
+      : 'border-info/24 bg-info/10 text-info',
+    className,
+  ]}
+>
+  <slot />
+</span>

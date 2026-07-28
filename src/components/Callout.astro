@@ -1,0 +1,23 @@
+---
+interface Props {
+  type: 'danger' | 'note' | 'caution';
+  /** bolded lead-in; defaults per type */
+  title?: string;
+}
+
+const variants = {
+  danger: { glyph: '!', color: 'text-danger', border: 'border-danger/28', bg: 'bg-danger/6', title: 'Authorized use only.' },
+  note: { glyph: '➤', color: 'text-info', border: 'border-info/26', bg: 'bg-info/6', title: 'Note.' },
+  caution: { glyph: '▲', color: 'text-warn', border: 'border-warn/26', bg: 'bg-warn/6', title: 'Caution.' },
+} as const;
+
+const { type, title } = Astro.props;
+const v = variants[type];
+---
+
+<div class:list={['mb-8 flex gap-3 rounded-[10px] border p-4', v.border, v.bg]}>
+  <span class:list={['font-mono text-sm/6 font-bold', v.color]} aria-hidden="true">{v.glyph}</span>
+  <div class="text-[13.5px]/[1.65] text-tx text-pretty">
+    <strong class:list={[v.color]}>{title ?? v.title}</strong>{' '}<slot />
+  </div>
+</div>

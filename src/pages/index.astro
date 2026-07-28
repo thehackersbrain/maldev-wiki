@@ -1,0 +1,199 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Footer from '../components/Footer.astro';
+import SectionLabel from '../components/SectionLabel.astro';
+import CategoryCard from '../components/CategoryCard.astro';
+import { categories, categoryBySlug } from '../data/categories';
+import { websiteJsonLd } from '../lib/seo';
+
+const entries = (await getCollection('techniques')).filter((e) => !e.data.draft);
+
+const latest = [...entries]
+  .sort((a, b) => b.data.updated.localeCompare(a.data.updated))
+  .slice(0, 5)
+  .map((e) => ({
+    date: e.data.updated.slice(5),
+    title: e.data.title,
+    summary: e.data.summary,
+    cat: categoryBySlug.get(e.data.category)?.name.split(' ').pop() ?? e.data.category,
+    mitre: e.data.mitre,
+    href: `/techniques/${e.id}`,
+  }));
+
+const countFor = (slug: string) => entries.filter((e) => e.data.category === slug).length;
+// derived, not asserted — it can never drift from what is actually published
+const contributors = new Set(entries.map((e) => e.data.author)).size;
+---
+
+<BaseLayout
+  title="maldev wiki — every technique, read from both sides"
+  jsonLd={[websiteJsonLd()]}
+>
+  <main id="main" class="mx-auto max-w-[1180px] px-6">
+    <section class="relative pt-16 pb-14">
+      {/* Both backdrop layers are full-bleed: clipped at the viewport edge, never mid-page. */}
+      <div
+        class="pointer-events-none absolute top-[-80px] left-1/2 h-[620px] w-screen -translate-x-1/2"
+        style="background:radial-gradient(620px 300px at 30% 30%,rgba(84,226,154,.12),transparent 70%),radial-gradient(500px 260px at 72% 12%,rgba(91,157,217,.07),transparent 70%)"
+        aria-hidden="true"
+      >
+      </div>
+      <div
+        class="pointer-events-none absolute inset-y-0 left-1/2 w-screen -translate-x-1/2 opacity-50"
+        style="background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);background-size:64px 64px;mask-image:radial-gradient(680px 380px at 36% 34%,#000,transparent 75%);-webkit-mask-image:radial-gradient(680px 380px at 36% 34%,#000,transparent 75%)"
+        aria-hidden="true"
+      >
+      </div>
+
+      <div class="relative grid items-center gap-14 lg:grid-cols-[minmax(0,1fr)_minmax(0,470px)]">
+        <div>
+          <div
+            class="mb-7 inline-flex items-center gap-2.5 rounded-full border border-bd bg-panel/80 px-3 py-1.5"
+          >
+            <span
+              class="h-1.5 w-1.5 rounded-full bg-acc"
+              style="box-shadow:0 0 8px #54e29a"
+              aria-hidden="true"></span>
+            <span class="font-mono text-[11px] font-medium tracking-[0.06em] whitespace-nowrap text-dim"
+              >{entries.length} pages · {contributors} contributors</span
+            >
+          </div>
+          <h1
+            class="text-[clamp(36px,4.6vw,56px)]/[1.05] font-bold tracking-[-0.028em] text-balance text-tx"
+          >
+            Every technique,<br />read from <span class="text-acc">both sides</span>.
+          </h1>
+          <p class="mt-6 max-w-[520px] text-[17.5px]/[1.65] text-pretty text-dim">
+            An open knowledge base for malware research — injection, evasion, persistence and C2.
+            Every page pairs annotated offensive code with the telemetry and detection logic that
+            catches it.
+          </p>
+          <div class="mt-8.5 flex flex-wrap gap-3">
+            <a
+              href="/techniques/injection/process-hollowing"
+              class="rounded-[9px] border border-accd bg-acc px-5 py-3.5 text-sm font-semibold text-[#06120b] transition-colors hover:bg-acc2"
+              style="box-shadow:0 8px 28px -10px rgba(84,226,154,.45)">Start reading →</a
+            >
+            <a
+              href="/techniques"
+              class="rounded-[9px] border border-bd bg-panel/70 px-5 py-3.5 text-sm font-semibold text-tx transition-colors hover:border-bd2"
+              >Browse the index</a
+            >
+          </div>
+        </div>
+
+        <div
+          class="overflow-hidden rounded-[13px] border border-bd bg-bg2"
+          style="box-shadow:0 32px 70px -32px rgba(0,0,0,.9)"
+        >
+          <div class="flex items-center gap-1.5 border-b border-bd bg-panel px-3.5 py-2.5">
+            <span class="h-2.75 w-2.75 rounded-full bg-danger"></span>
+            <span class="h-2.75 w-2.75 rounded-full bg-warn"></span>
+            <span class="h-2.75 w-2.75 rounded-full bg-acc"></span>
+            <span class="ml-2 font-mono text-[11px]/[1.3] font-medium text-faint">maldev — zsh</span>
+          </div>
+          <div class="overflow-x-auto px-4.5 py-4 font-mono text-[12.6px]/[1.9]">
+            <div>
+              <span class="text-acc">❯</span> <span class="text-tx">maldev</span> search{' '}
+              <span class="text-warn">"unbacked executable memory"</span>
+            </div>
+            <div class="text-faint">resolving…</div>
+            <div class="text-info">[T1055.012]<span class="text-tx"> Process Hollowing</span></div>
+            <div class="text-faint">
+              &nbsp;&nbsp;├─ <span class="text-dim">code</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hollow.c
+              · 148 lines
+            </div>
+            <div class="text-faint">
+              &nbsp;&nbsp;└─ <span class="text-purple">detect</span>&nbsp;&nbsp;&nbsp;4 rules · sigma,
+              yara
+            </div>
+            <div class="text-info">
+              [T1620]<span class="text-tx">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Reflective DLL Loading</span
+              >
+            </div>
+            <div class="text-faint">
+              &nbsp;&nbsp;└─ <span class="text-purple">detect</span>&nbsp;&nbsp;&nbsp;2 rules · etw-ti
+            </div>
+            <div>
+              <span class="text-acc">❯</span>
+              <span class="caret h-3.5 w-2" aria-hidden="true"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="mb-13 grid overflow-hidden rounded-[14px] border border-bd lg:grid-cols-2">
+      <div class="border-b border-bd bg-bg2 px-7 py-6.5 lg:border-r lg:border-b-0">
+        <div class="mb-3.5 flex items-center gap-2.5">
+          <span class="h-1.75 w-1.75 rounded-xs bg-danger" aria-hidden="true"></span>
+          <span class="font-mono text-[10px] font-semibold tracking-[0.16em] text-danger uppercase"
+            >red · how it works</span
+          >
+        </div>
+        <p class="mb-4 text-sm/[1.65] text-pretty text-dim">
+          Annotated, compilable reference code with the API chain spelled out call by call.
+        </p>
+        <pre
+          class="overflow-x-auto rounded-[9px] border border-bd bg-panel px-3.5 py-3 font-mono text-xs/[1.75] text-dim"><span class="text-purple">NtUnmapViewOfSection</span>(hProc, imageBase);
+<span class="text-purple">VirtualAllocEx</span>(hProc, base, size,
+  MEM_COMMIT, <span class="text-danger">PAGE_EXECUTE_READWRITE</span>);</pre>
+      </div>
+      <div class="bg-bg2 px-7 py-6.5">
+        <div class="mb-3.5 flex items-center gap-2.5">
+          <span class="h-1.75 w-1.75 rounded-xs bg-info" aria-hidden="true"></span>
+          <span class="font-mono text-[10px] font-semibold tracking-[0.16em] text-info uppercase"
+            >blue · how it's caught</span
+          >
+        </div>
+        <p class="mb-4 text-sm/[1.65] text-pretty text-dim">
+          The matching hunt query, sigma rule and memory artifact — on the same page, never a
+          separate site.
+        </p>
+        <pre
+          class="overflow-x-auto rounded-[9px] border border-bd bg-panel px-3.5 py-3 font-mono text-xs/[1.75] text-dim"><span class="text-info">selection</span>:
+  EventID: <span class="text-warn">10</span>
+  GrantedAccess: <span class="text-warn">'0x1F3FFF'</span>
+  SourceImage|endswith: <span class="text-warn">'.exe'</span></pre>
+      </div>
+    </section>
+
+    <section>
+      <SectionLabel text="browse by category" class="mb-4.5 !text-[15px] !text-tx" />
+      <div class="mb-13 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {
+          categories.map((c) => (
+              <CategoryCard category={c} count={countFor(c.slug)} />
+          ))
+        }
+      </div>
+    </section>
+
+    <section class="pb-10">
+      <div class="mb-4.5 flex items-baseline justify-between gap-4">
+        <SectionLabel text="recently updated" class="!text-[15px] !text-tx" />
+        <span class="font-mono text-[11.5px] text-faint">rebuilt from git on every merge</span>
+      </div>
+      <div class="flex flex-col overflow-hidden rounded-xl border border-bd">
+        {
+          latest.map((l) => (
+            <a
+              href={l.href}
+              class="grid grid-cols-[56px_minmax(0,1fr)] items-center gap-4 border-t border-bd bg-bg2 px-4.5 py-3.5 first:border-t-0 hover:bg-panel sm:grid-cols-[64px_minmax(0,1fr)_130px_86px]"
+            >
+              <span class="font-mono text-[10.5px]/[1.3] font-semibold text-faint">{l.date}</span>
+              <span class="line-clamp-2 text-[13.5px]/[1.3] font-medium text-tx sm:truncate">{l.title}</span>
+              <span class="hidden font-mono text-[11px] text-dim sm:block">{l.cat}</span>
+              <span class="hidden justify-self-end font-mono text-[11px]/[1.3] text-faint sm:block">
+                {l.mitre}
+              </span>
+            </a>
+          ))
+        }
+      </div>
+    </section>
+
+    <Footer />
+  </main>
+</BaseLayout>

@@ -1,0 +1,26 @@
+---
+import Pill from './Pill.astro';
+import type { Tool } from '../data/toolkit';
+
+interface Props {
+  tool: Tool;
+}
+
+const { tool } = Astro.props;
+---
+
+<a
+  href={tool.href}
+  rel="noopener"
+  class="flex flex-col gap-2.25 rounded-[11px] border border-bd bg-bg2 px-4.5 py-4 transition-colors hover:border-accd"
+>
+  <div class="flex flex-wrap items-center gap-2.25">
+    <span class="text-[15px]/[1.3] font-semibold text-tx">{tool.name}</span>
+    <Pill size="xs">{tool.lang}</Pill>
+  </div>
+  <p class="flex-1 text-[13px]/[1.6] text-pretty text-dim">{tool.desc}</p>
+  <div class="flex items-center gap-3 font-mono text-[11px]/[1.3] font-medium text-faint">
+    <span class="text-acc">repo ↗</span>
+    <span>{tool.meta}</span>
+  </div>
+</a>

@@ -1,0 +1,86 @@
+---
+import type { MarkdownHeading } from 'astro';
+
+interface Props {
+  headings: MarkdownHeading[];
+  labKit: { label: string; href: string }[];
+}
+
+const { headings, labKit } = Astro.props;
+const items = headings.filter((h) => h.depth === 2);
+---
+
+<div
+  class="sticky top-14 hidden h-[calc(100vh-56px)] overflow-y-auto py-10 pr-6 pl-2 xl:block"
+  data-toc
+>
+  <div class="mb-3.5 font-mono text-[10px] font-semibold tracking-[0.14em] text-faint uppercase">
+    On this page
+  </div>
+  <nav class="flex flex-col gap-px" aria-label="On this page">
+    {
+      items.map((h) => (
+        <a
+          href={`#${h.slug}`}
+          data-toc-link={h.slug}
+          class="border-l-2 border-bd px-3 py-1.5 text-[12.5px]/[1.4] text-dim hover:border-bd2 hover:text-tx aria-[current=true]:border-acc aria-[current=true]:font-semibold aria-[current=true]:text-acc"
+        >
+          {h.text}
+        </a>
+      ))
+    }
+  </nav>
+
+  {
+    labKit.length > 0 && (
+      <div class="mt-6 rounded-[10px] border border-bd bg-panel p-3.5">
+        <div class="mb-2.5 font-mono text-[10px] font-semibold tracking-[0.1em] text-faint uppercase">
+          Lab kit
+        </div>
+        {labKit.map((l) => (
+          <a
+            href={l.href}
+            class="mb-1.5 block text-[12.5px]/[1.5] font-medium text-acc last:mb-0 hover:text-acc2"
+          >
+            {l.label} ↗
+          </a>
+        ))}
+      </div>
+    )
+  }
+</div>
+
+<script>
+  // Highlight the heading nearest the top of the viewport.
+  const links = new Map(
+    [...document.querySelectorAll<HTMLAnchorElement>('[data-toc-link]')].map((a) => [
+      a.dataset.tocLink!,
+      a,
+    ]),
+  );
+  const headings = [...links.keys()]
+    .map((id) => document.getElementById(id))
+    .filter((el): el is HTMLElement => el !== null);
+
+  if (headings.length > 0) {
+    let current = '';
+    const setCurrent = (id: string) => {
+      if (id === current) return;
+      links.get(current)?.removeAttribute('aria-current');
+      links.get(id)?.setAttribute('aria-current', 'true');
+      current = id;
+    };
+
+    const update = () => {
+      const offset = 120;
+      let active = headings[0]!.id;
+      for (const h of headings) {
+        if (h.getBoundingClientRect().top <= offset) active = h.id;
+      }
+      setCurrent(active);
+    };
+
+    update();
+    window.addEventListener('scroll', update, { passive: true });
+  }
+</script>

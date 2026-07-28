@@ -1,0 +1,64 @@
+---
+import { Code } from 'astro:components';
+import type { BuiltinLanguage } from 'shiki';
+import { maldevTheme } from '../lib/shiki-theme';
+
+interface Props {
+  /** filename shown in the chrome bar */
+  file: string;
+  code: string;
+  lang: BuiltinLanguage;
+  /** pill next to the filename; omit to hide */
+  label?: string;
+  class?: string;
+}
+
+const { file, code, lang, label, class: className } = Astro.props;
+---
+
+<div
+  class:list={['overflow-hidden rounded-xl border border-bd bg-bg2', className]}
+  data-code-block
+>
+  <div class="flex items-center gap-2.5 border-b border-bd bg-panel px-3.5 py-2.5">
+    <span class="font-mono text-[11px] font-semibold text-dim">{file}</span>
+    {
+      label && (
+        <span class="rounded border border-bd px-1.5 py-0.5 font-mono text-[10px] font-medium text-faint">
+          {label}
+        </span>
+      )
+    }
+    <button
+      type="button"
+      data-copy
+      class="ml-auto flex items-center gap-1.5 rounded-md border border-bd bg-panel2 px-2.5 py-1.5 font-mono text-[11px] font-medium whitespace-nowrap text-dim transition-colors hover:border-accd hover:text-acc"
+      aria-label={`Copy ${file}`}
+    >
+      <span data-copy-label>⧉ copy</span>
+    </button>
+  </div>
+  <pre data-code-source class="hidden">{code}</pre>
+  <Code code={code} lang={lang} theme={maldevTheme} class="!bg-bg2 px-4.5 py-4 text-[12.8px]/[1.8] overflow-x-auto" />
+</div>
+
+<script>
+  // One delegated listener covers every copy button on the page.
+  document.addEventListener('click', async (e) => {
+    const btn = (e.target as HTMLElement)?.closest<HTMLButtonElement>('[data-copy]');
+    if (!btn) return;
+
+    const block = btn.closest('[data-code-block]');
+    const source = block?.querySelector('[data-code-source]')?.textContent ?? '';
+    const label = btn.querySelector('[data-copy-label]');
+    if (!label) return;
+
+    try {
+      await navigator.clipboard.writeText(source);
+      label.textContent = '✓ copied';
+    } catch {
+      label.textContent = '✗ blocked';
+    }
+    setTimeout(() => (label.textContent = '⧉ copy'), 1400);
+  });
+</script>

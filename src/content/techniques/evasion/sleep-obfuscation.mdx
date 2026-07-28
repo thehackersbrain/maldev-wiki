@@ -1,0 +1,86 @@
+---
+title: Sleep Obfuscation
+mitre: T1027.007
+category: evasion
+group: In-Memory Evasion
+summary: Encrypt a beacon's own memory while it waits between check-ins, so scanners find nothing.
+platform: [Windows]
+tags: ['x64', 'C / C++']
+updated: '2026-07-19'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: CreateTimerQueueTimer
+    desc: Queue a chain of timers that will run while the beacon thread is parked.
+    dll: kernel32
+  - call: RtlCaptureContext
+    desc: Snapshot the thread context so it can be restored after the mask/unmask cycle.
+    dll: ntdll
+  - call: VirtualProtect(RW) + SystemFunction032
+    desc: Flip the beacon's own pages to RW and RC4-encrypt them in place.
+    dll: advapi32
+  - call: WaitForSingleObject
+    desc: The actual sleep, during which the payload exists only as ciphertext.
+    dll: kernel32
+  - call: decrypt + VirtualProtect(RX)
+    desc: Reverse the cycle and NtContinue back into the beacon loop.
+    dll: ntdll
+detections:
+  - src: YARA
+    text: The queued RtlCaptureContext + NtContinue gadget sequence used by timer-based sleep masks.
+  - src: ETW-TI
+    text: Repeating RX to RW to RX protection cycles on the same private region at a fixed interval.
+  - src: MEMORY SCAN
+    text: A region with very high entropy that becomes readable code moments later — scan on a jitter offset.
+  - src: BEHAVIOURAL
+    text: Timer-queue callbacks whose target address is private memory rather than a mapped module.
+related:
+  - mitre: T1106
+    title: Direct & Indirect Syscalls
+    desc: The primitives most sleep masks use to hide their own protection changes.
+    href: /techniques/evasion/direct-syscalls
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: What the sleep mask is usually protecting from a memory scan.
+    href: /techniques/injection/reflective-dll-loading
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+An implant spends almost all of its life asleep. That idle window is exactly when a memory scanner
+runs, and a beacon sitting in plaintext RX memory is the easiest thing in the world to signature.
+Sleep obfuscation closes the window: before parking, the implant encrypts its own image, drops the
+pages to RW or NA, sleeps, then reverses the process.
+
+The published families — Ekko, Foliage, Cronos and their descendants — differ mainly in how they get
+code to run while the main thread is parked. Timer queues, APCs and fibers all end up executing a
+short ROP chain that performs the mask, the wait and the unmask.
+
+<Callout type="note">
+  The mask is only as good as its timing. Scanners that sample on a randomised interval, rather than
+  a fixed one, catch the unmasked window that every implementation still has to open to do work.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The protection-cycle signal is the durable one. Encryption defeats content matching by design, but a
+private region that oscillates between RW and RX on a regular cadence is behaviourally distinctive
+and survives every re-implementation of the mask itself.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

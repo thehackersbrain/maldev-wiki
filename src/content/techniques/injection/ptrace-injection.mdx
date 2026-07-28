@@ -1,0 +1,108 @@
+---
+title: ptrace Injection
+mitre: T1055.008
+category: injection
+group: Remote Thread
+summary: Attach to a live process on Linux and write shellcode straight into its address space.
+platform: [Linux]
+tags: [x86-64, C]
+updated: '2026-06-11'
+author: thehackersbrain
+readingTime: 5 min read
+callChain:
+  - call: PTRACE_ATTACH
+    desc: Attach to the target pid and stop it; requires matching uid or CAP_SYS_PTRACE.
+    dll: libc
+  - call: PTRACE_GETREGS
+    desc: Save the register state so the original execution can be resumed cleanly.
+    dll: libc
+  - call: PTRACE_POKETEXT
+    desc: Write the payload word by word into an executable mapping, usually inside the stack of libc text.
+    dll: libc
+  - call: PTRACE_SETREGS
+    desc: Point RIP at the written bytes.
+    dll: libc
+  - call: PTRACE_DETACH
+    desc: Resume the process; the payload runs on the borrowed thread.
+    dll: libc
+detections:
+  - src: AUDITD
+    text: An execve-less ptrace syscall with request PTRACE_ATTACH or PTRACE_POKETEXT between unrelated processes.
+  - src: EBPF
+    text: Tracepoint on sys_enter_ptrace filtered to POKETEXT/POKEDATA — no debugger issues those in production.
+  - src: PROC SCAN
+    text: An anonymous executable mapping in /proc/pid/maps for a process whose binary is fully file-backed.
+  - src: BEHAVIOURAL
+    text: TracerPid in /proc/pid/status set to a process that is not gdb, strace or a container runtime.
+related:
+  - mitre: T1055.009
+    title: /proc/pid/mem writes
+    desc: Same goal without ptrace, by writing the memory file directly.
+  - mitre: T1055.001
+    title: Classic DLL Injection
+    desc: The Windows equivalent, with the loader doing the mapping.
+    href: /techniques/injection/classic-dll-injection
+labKit:
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+`ptrace` is the debugging interface the entire Linux tooling ecosystem is built on, which makes it
+both the most convenient injection primitive and the most heavily constrained one. An attacher can
+read and write any word of the target's address space and set its registers directly — no separate
+allocate/write/execute dance.
+
+Most distributions now ship `kernel.yama.ptrace_scope=1`, which restricts attaching to descendants
+only. Anything higher in a hardened environment makes this technique a non-starter without root.
+
+<Callout type="note">
+  Check `/proc/sys/kernel/yama/ptrace_scope` in the lab before concluding a detection works. A rule
+  validated on a box where scope is `0` proves very little about production.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="inject.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`ptrace(PTRACE_ATTACH, pid, NULL, NULL);
+waitpid(pid, &status, 0);
+
+struct user_regs_struct saved, regs;
+ptrace(PTRACE_GETREGS, pid, NULL, &saved);
+regs = saved;
+
+// write the payload a word at a time into an executable mapping
+for (size_t i = 0; i < len; i += sizeof(long))
+    ptrace(PTRACE_POKETEXT, pid, target + i, *(long *)(shellcode + i));
+
+regs.rip = (unsigned long)target;
+ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+ptrace(PTRACE_DETACH, pid, NULL, NULL);`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+An eBPF tracepoint on `sys_enter_ptrace` is the cheapest continuous coverage. Allowlist your
+debuggers and profilers by executable path, and treat `POKETEXT` from anything else as high
+confidence — legitimate tools overwhelmingly read rather than write.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

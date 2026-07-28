@@ -1,0 +1,23 @@
+---
+interface Props {
+  /** the handle credited in frontmatter */
+  author: string;
+  /** overrides the default GitHub profile URL */
+  href?: string;
+}
+
+const { author, href } = Astro.props;
+const profile = href ?? `https://github.com/${author}`;
+---
+
+<a
+  href={profile}
+  rel="noopener author"
+  title={`Pages by ${author}`}
+  class="group flex items-center gap-1.5 text-faint transition-colors hover:text-tx"
+>
+  <span
+    class="h-5 w-5 rounded-full border border-bd2 transition-colors group-hover:border-accd"
+    style="background:linear-gradient(140deg,#2a2f3a,#161920)"
+    aria-hidden="true"></span>{author}
+</a>

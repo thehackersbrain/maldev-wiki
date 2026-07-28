@@ -1,0 +1,99 @@
+---
+title: COM Hijacking via TreatAs
+mitre: T1546.015
+category: persistence
+group: Object Model Abuse
+summary: Remap a system CLSID to your own object so a trusted process loads it for you.
+platform: [Windows]
+tags: [Registry, 'C / C++']
+updated: '2026-07-11'
+author: thehackersbrain
+readingTime: 5 min read
+callChain:
+  - call: pick a frequently instantiated CLSID
+    desc: Anything the shell, a scheduled task or Explorer resolves on a predictable trigger.
+    dll: —
+  - call: write HKCU\Software\Classes\CLSID\{...}\TreatAs
+    desc: Per-user hive wins over HKLM and needs no administrative rights.
+    dll: advapi32
+  - call: register the substitute InprocServer32
+    desc: Point the replacement CLSID at a DLL under a user-writable path.
+    dll: advapi32
+  - call: (wait for the trigger)
+    desc: The next CoCreateInstance for the original CLSID loads the substitute inside a signed host.
+    dll: combase
+detections:
+  - src: SYSMON EID 13
+    text: Registry write adding a TreatAs subkey under a CLSID owned by a shipped Windows component.
+  - src: SYSMON EID 7
+    text: A DLL from a user-writable path loaded by a signed system binary shortly after that write.
+  - src: INVENTORY
+    text: Any HKCU CLSID entry that shadows an HKLM one — enumerate and diff, the legitimate set is small.
+  - src: BEHAVIOURAL
+    text: InprocServer32 values pointing outside System32, WinSxS or Program Files.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Louder, simpler, and still the most commonly observed persistence.
+  - mitre: T1546.003
+    title: WMI Event Subscriptions
+    desc: Same "wait for a trigger" model, in a different subsystem.
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+COM resolves a class identifier to an implementation by walking the registry, and it checks the
+per-user hive before the machine hive. A `TreatAs` value under a CLSID tells COM "when anyone asks
+for this class, give them that one instead" — a redirection primitive that needs no administrative
+rights and no file in a protected directory.
+
+The result is persistence that executes inside whichever signed process next instantiates the
+hijacked class, with no autorun entry and no scheduled task to enumerate.
+
+<Callout type="note">
+  Abandoned CLSIDs — classes referenced by a task or shell extension but no longer registered — are
+  the quieter target. Nothing breaks when you claim one, because nothing was answering before.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="treatas.reg"
+  label="registry"
+  lang="ini"
+  class="mb-7.5"
+  code={`Windows Registry Editor Version 5.00
+
+; redirect a system CLSID to one we control — HKCU beats HKLM
+[HKEY_CURRENT_USER\\Software\\Classes\\CLSID\\{0358B920-0AC7-461F-98F4-58E32CD89148}\\TreatAs]
+@="{D20A0000-0000-0000-C000-000000000046}"
+
+[HKEY_CURRENT_USER\\Software\\Classes\\CLSID\\{D20A0000-0000-0000-C000-000000000046}\\InprocServer32]
+@="C:\\\\Users\\\\analyst\\\\AppData\\\\Local\\\\Temp\\\\payload.dll"
+"ThreadingModel"="Apartment"`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+This is an inventory problem rather than a memory problem. Snapshot the user hive's `Classes\CLSID`
+subtree on a schedule and alert on additions that shadow a machine-hive class — the legitimate rate
+of change on a managed endpoint is close to zero.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

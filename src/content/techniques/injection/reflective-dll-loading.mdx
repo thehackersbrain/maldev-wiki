@@ -1,0 +1,117 @@
+---
+title: Reflective DLL Loading
+mitre: T1620
+category: injection
+group: Manual Mapping
+summary: A DLL that maps itself — no LoadLibrary, no module list entry.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-07-12'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: (bootstrap stub)
+    desc: Position-independent prologue locates its own base by walking backwards to the MZ header.
+    dll: —
+  - call: resolve kernel32 by hash
+    desc: Walk the PEB loader list and hash export names to find LoadLibraryA and GetProcAddress.
+    dll: ntdll
+  - call: allocate + copy sections
+    desc: Map headers and each section at the chosen base with the right protection per section.
+    dll: kernel32
+  - call: process relocations + imports
+    desc: Apply the base delta and build the IAT by hand, exactly as the real loader would.
+    dll: —
+  - call: call DllMain(DLL_PROCESS_ATTACH)
+    desc: Hand control to the image; the module never appears in PEB_LDR_DATA.
+    dll: —
+detections:
+  - src: MEMORY SCAN
+    text: A committed region carrying an MZ/PE header that has no entry in the process module list.
+  - src: YARA
+    text: The bootstrap prologue that hashes export names — stable across most public loader lineages.
+  - src: ETW-TI
+    text: Protection changes to RX on private memory in a process that has just received a remote write.
+  - src: SYSMON EID 8
+    text: Remote thread whose start address falls in private memory rather than a mapped image.
+related:
+  - mitre: T1055.001
+    title: Classic DLL Injection
+    desc: The technique this one exists to replace.
+    href: /techniques/injection/classic-dll-injection
+  - mitre: T1055.002
+    title: Module Stomping
+    desc: Maps into memory that is file-backed, defeating the unbacked-memory check.
+    href: /techniques/injection/module-stomping
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A reflective DLL carries its own loader. Rather than asking Windows to map it, an exported bootstrap
+function replicates what the loader does — copy headers and sections, apply relocations, resolve
+imports, run TLS callbacks, call `DllMain` — from inside the target process.
+
+The payoff is the absence of a module list entry. `GetModuleHandle`, the loaded-module inventory in
+your EDR console, and Sysmon image-load events all miss it, because from the operating system's point
+of view no image was ever loaded.
+
+<Callout type="note">
+  Import resolution still goes through `LoadLibraryA` for dependencies. A loader that pulls in an
+  unusual DLL — `ws2_32`, `wininet` — into a process that has no business with networking is a decent
+  second-order signal.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+Abridged: the relocation and import loops are the bulk of a real loader and are omitted here.
+
+<CodeBlock
+  file="reflective_loader.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// resolve exports by hash so no strings survive in the payload
+PVOID k32 = find_module_by_hash(0x6A4ABC5B);          // kernel32.dll
+fnLoadLibraryA  pLoadLibraryA  = find_export_by_hash(k32, 0xEC0E4E8E);
+fnVirtualAlloc  pVirtualAlloc  = find_export_by_hash(k32, 0x91AFCA54);
+
+// map at the preferred base if it is free, anywhere otherwise
+PVOID base = pVirtualAlloc((PVOID)nt->OptionalHeader.ImageBase,
+                           nt->OptionalHeader.SizeOfImage,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+copy_headers(base, raw);
+copy_sections(base, raw, nt);
+apply_relocations(base, nt);      // delta = base - OptionalHeader.ImageBase
+resolve_imports(base, nt, pLoadLibraryA);
+protect_sections(base, nt);       // per-section RX / R / RW — never blanket RWX
+
+((fnDllMain)(base + nt->OptionalHeader.AddressOfEntryPoint))(base, DLL_PROCESS_ATTACH, NULL);`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Scanning committed private memory for `MZ` at page granularity finds the naive implementations
+cheaply. Loaders that erase their headers after mapping defeat that check, which is why the YARA
+signature targets the bootstrap code rather than the PE structure.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

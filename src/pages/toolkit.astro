@@ -1,0 +1,41 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import PageHeader from '../components/PageHeader.astro';
+import SectionLabel from '../components/SectionLabel.astro';
+import ToolCard from '../components/ToolCard.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+import { toolGroups, labUpScript } from '../data/toolkit';
+---
+
+<DocsLayout
+  title="Toolkit — maldev wiki"
+  description="The tooling the wiki's samples are written against, plus the lab scaffolding used to detonate and observe them."
+>
+  <div class="max-w-[1000px] px-6 pt-8 pb-24 lg:px-11">
+    <PageHeader
+      title="Toolkit"
+      crumbs={[{ label: 'Home', href: '/' }, { label: 'Toolkit' }]}
+      intro="The tooling the wiki's samples are written against — plus the lab scaffolding we use to detonate and observe them. Everything here is open source and pinned to a known-good revision."
+    />
+
+    {
+      toolGroups.map((g) => (
+        <section class="mb-8.5">
+          <SectionLabel text={g.name} />
+          <div class="grid gap-3 sm:grid-cols-2">
+            {g.tools.map((tool) => (
+              <ToolCard tool={tool} />
+            ))}
+          </div>
+        </section>
+      ))
+    }
+
+    <SectionLabel text="standing the lab up" />
+    <CodeBlock file="lab-up.sh" label="bash" lang="bash" code={labUpScript} />
+    <p class="mt-4 text-[13px]/[1.6] text-faint">
+      Revert to the clean snapshot before every detonation. Nothing on this site should be run
+      outside an isolated VM.
+    </p>
+  </div>
+</DocsLayout>

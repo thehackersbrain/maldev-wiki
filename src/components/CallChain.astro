@@ -1,0 +1,24 @@
+---
+import StepList from './StepList.astro';
+
+interface Step {
+  call: string;
+  desc: string;
+  dll: string;
+}
+
+interface Props {
+  steps: Step[];
+}
+
+const { steps } = Astro.props;
+
+const items = steps.map((st) => ({
+  title: st.call,
+  desc: st.desc,
+  tag: st.dll,
+  monoTitle: true,
+}));
+---
+
+<StepList steps={items} />

@@ -1,0 +1,111 @@
+---
+title: Unhooking ntdll
+mitre: T1562.001
+category: evasion
+group: Userland Hooks
+summary: Restore a clean copy of ntdll from disk to strip userland EDR hooks.
+platform: [Windows]
+tags: ['x64', 'C / C++']
+updated: '2026-07-19'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: CreateFile + CreateFileMapping(SEC_IMAGE)
+    desc: Map a pristine copy of ntdll.dll straight from \Windows\System32.
+    dll: kernel32
+  - call: locate .text in both copies
+    desc: Parse section headers to find the executable range in the clean and the hooked image.
+    dll: —
+  - call: VirtualProtect(PAGE_EXECUTE_READWRITE)
+    desc: Make the loaded ntdll .text writable — the step every EDR watches for.
+    dll: kernel32
+  - call: memcpy(hooked, clean)
+    desc: Overwrite the hooked stubs with the on-disk bytes, removing every inline hook at once.
+    dll: —
+  - call: VirtualProtect(restore)
+    desc: Put the original protection back so the section does not stand out.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 11 + 10
+    text: A file read of ntdll.dll correlated with a self-process write into its own text section.
+  - src: ETW-TI
+    text: Protection change to RWX on an image section belonging to ntdll — almost never legitimate.
+  - src: MEMORY SCAN
+    text: Section hash of in-memory ntdll .text matching disk in a process where the agent expects its hooks.
+  - src: BEHAVIOURAL
+    text: The EDR's own telemetry going quiet for a process that is still running is itself the signal.
+related:
+  - mitre: T1562.001
+    title: Direct & indirect syscalls
+    desc: Never touches the hooked stub instead of repairing it.
+    href: /techniques/evasion/direct-syscalls
+  - mitre: T1562.001
+    title: AMSI & ETW patching
+    desc: The same write primitive, aimed at a single function rather than a whole section.
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Userland EDR products work by patching the first bytes of syscall stubs in `ntdll.dll` with a jump
+into their own inspection routine. Because that patch lives in the process's own address space, the
+process can simply undo it: map a fresh copy of `ntdll` from disk and copy its `.text` section over
+the patched one.
+
+The technique is loud in exactly one place — the write to an image section — and silent everywhere
+else. That single artifact carries most of the detection value.
+
+<Callout type="caution">
+  Restoring the whole `.text` section also removes any hot-patch or ASLR-relocated content the loader
+  applied. Implementations that copy blindly can destabilise the process; targeted stub-by-stub
+  restoration is more common in mature tooling and produces the same telemetry.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="unhook.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// map a pristine ntdll straight off disk
+HANDLE hFile = CreateFileA("C:\\\\Windows\\\\System32\\\\ntdll.dll", GENERIC_READ,
+                           FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+HANDLE hMap  = CreateFileMappingA(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+PVOID  clean = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+
+PVOID hooked = GetModuleHandleA("ntdll.dll");
+PIMAGE_SECTION_HEADER text = find_section(hooked, ".text");
+
+PVOID dst = (PBYTE)hooked + text->VirtualAddress;
+PVOID src = (PBYTE)clean  + text->VirtualAddress;
+
+DWORD old;
+VirtualProtect(dst, text->Misc.VirtualSize, PAGE_EXECUTE_READWRITE, &old);
+memcpy(dst, src, text->Misc.VirtualSize);          // <-- the detectable event
+VirtualProtect(dst, text->Misc.VirtualSize, old, &old);`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The correlation rule is the practical one: a handle opened to `ntdll.dll` on disk, followed within a
+short window by a `ProcessAccess` or protection change against the same module in memory. Neither
+half is interesting alone; together they are close to unambiguous.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

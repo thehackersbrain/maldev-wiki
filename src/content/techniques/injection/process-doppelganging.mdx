@@ -1,0 +1,87 @@
+---
+title: Process Doppelgänging
+mitre: T1055.013
+category: injection
+group: Image Replacement
+summary: Abuse NTFS transactions so the on-disk image never matches what runs.
+platform: [Windows]
+tags: ['x64', 'C / C++']
+updated: '2026-07-09'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: CreateTransaction
+    desc: Open an NTFS transaction; everything written inside it is invisible to other readers.
+    dll: ktmw32
+  - call: CreateFileTransacted + WriteFile
+    desc: Write the payload into a transacted file — no other process, including AV, sees these bytes.
+    dll: kernel32
+  - call: NtCreateSection(SEC_IMAGE)
+    desc: Create an image section from the transacted file. The section outlives the transaction.
+    dll: ntdll
+  - call: RollbackTransaction
+    desc: Roll back the write. The file on disk reverts; the image section in memory does not.
+    dll: ktmw32
+  - call: NtCreateProcessEx + NtCreateThreadEx
+    desc: Build a process directly from the orphaned section and start it.
+    dll: ntdll
+detections:
+  - src: SYSMON EID 1
+    text: Process creation where the image file's on-disk contents do not match the executed image hash.
+  - src: ETW-TI
+    text: NtCreateProcessEx from a section not associated with any file currently on disk.
+  - src: BEHAVIOURAL
+    text: Transacted file writes (TxF) against an executable path — vanishingly rare in modern software.
+  - src: MEMORY SCAN
+    text: A running process whose main image section has no valid backing FILE_OBJECT path.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Same goal, but performs a visible NtUnmapViewOfSection.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: Avoids disk entirely rather than hiding what touched it.
+    href: /techniques/injection/reflective-dll-loading
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Doppelgänging exploits a gap between two Windows subsystems. NTFS transactions let a process write
+file contents that no other reader can see until the transaction commits. Image sections, once
+created, are independent of the file they came from. Put those together and you can create a process
+image from bytes that are rolled back before anything else has a chance to read them.
+
+Nothing is unmapped and nothing is written into a remote process, so the entire detection surface of
+hollowing is absent. What remains is the mismatch between the file the operating system reports for
+the process and the bytes actually mapped.
+
+<Callout type="note">
+  Transacted NTFS has been deprecated by Microsoft for years, which cuts both ways: the API still
+  works, and almost no legitimate software calls it. That makes TxF activity against executables a
+  near-zero-false-positive hunt on its own.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The cheapest durable check is the hash comparison at process creation: read the image path Sysmon
+reports, hash it, and compare against the hash of what was actually mapped. Doppelgänging and every
+transacted-hollowing hybrid fail that comparison by construction.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

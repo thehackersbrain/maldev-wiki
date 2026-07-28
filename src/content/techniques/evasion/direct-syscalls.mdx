@@ -1,0 +1,108 @@
+---
+title: Direct & Indirect Syscalls
+mitre: T1106
+category: evasion
+group: Userland Hooks
+summary: Skip the ntdll export table entirely by issuing the syscall instruction yourself.
+platform: [Windows]
+tags: ['x64', 'ASM', 'C / C++']
+updated: '2026-07-08'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: resolve the syscall number (SSN)
+    desc: Read it from a clean ntdll, or derive it by sorting stub addresses (Hell's Gate / Halo's Gate).
+    dll: —
+  - call: load arguments per the x64 ABI
+    desc: RCX moves to R10; the rest follow the standard register and stack layout.
+    dll: —
+  - call: syscall
+    desc: Direct variant executes the instruction from the payload's own memory.
+    dll: —
+  - call: jmp into ntdll's syscall
+    desc: Indirect variant jumps to a real syscall instruction inside ntdll so the return address looks legitimate.
+    dll: ntdll
+detections:
+  - src: ETW-TI
+    text: Kernel-side telemetry sees the call regardless of what userland did — hooks were never the only sensor.
+  - src: MEMORY SCAN
+    text: A syscall instruction in private, non-image memory; the direct variant's defining artifact.
+  - src: STACK WALK
+    text: Kernel callbacks that unwind the user stack find a return address outside any mapped module.
+  - src: YARA
+    text: The mov r10, rcx / mov eax, imm / syscall triplet is a short but usable signature in staged loaders.
+related:
+  - mitre: T1562.001
+    title: Unhooking ntdll
+    desc: Repairs the stub instead of avoiding it.
+    href: /techniques/evasion/unhooking-ntdll
+  - mitre: T1027.007
+    title: Sleep Obfuscation
+    desc: Commonly paired — syscalls to set up the mask, encryption to survive the scan.
+    href: /techniques/evasion/sleep-obfuscation
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+If a hook lives in the `ntdll` stub, the obvious answer is not to call the stub. A direct syscall
+loads the service number into `EAX` and executes `syscall` from the payload's own code, skipping
+userland entirely.
+
+That works against userland hooks and fails against everything else. The kernel still sees the call,
+ETW-TI still reports it, and the `syscall` instruction now sits in memory that no legitimate module
+owns — which is a *better* signal than the hook it evaded. Indirect syscalls exist to close that gap
+by jumping into a real `syscall` instruction inside `ntdll`, so a stack walk lands somewhere
+plausible.
+
+<Callout type="note">
+  Service numbers change between Windows builds. Hardcoded SSN tables break on patch Tuesday; that
+  fragility is why the "gate" family of techniques derives them at runtime instead.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="syscall.asm"
+  label="ASM"
+  lang="asm"
+  class="mb-7.5"
+  code={`; direct: the syscall instruction lives in our own memory
+NtAllocateVirtualMemory PROC
+    mov r10, rcx
+    mov eax, 18h            ; SSN, resolved at runtime in real tooling
+    syscall
+    ret
+NtAllocateVirtualMemory ENDP
+
+; indirect: same setup, but the instruction executed belongs to ntdll
+NtAllocateVirtualMemoryIndirect PROC
+    mov r10, rcx
+    mov eax, 18h
+    jmp qword ptr [ntdllSyscallGadget]
+NtAllocateVirtualMemoryIndirect ENDP`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Do not build the detection story on userland hooks. ETW-TI plus a periodic scan for `syscall`
+instructions outside mapped images covers both variants; the stack-walk check is what separates
+indirect syscalls from ordinary API use.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

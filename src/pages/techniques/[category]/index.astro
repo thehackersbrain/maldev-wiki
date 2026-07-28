@@ -1,0 +1,119 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { getCollection } from 'astro:content';
+import DocsLayout from '../../../layouts/DocsLayout.astro';
+import PageHeader from '../../../components/PageHeader.astro';
+import FilterBar from '../../../components/FilterBar.astro';
+import TechniqueRow from '../../../components/TechniqueRow.astro';
+import { categories } from '../../../data/categories';
+import { collectionJsonLd, breadcrumbJsonLd } from '../../../lib/seo';
+
+export const getStaticPaths = (async () => {
+  const entries = (await getCollection('techniques')).filter((e) => !e.data.draft);
+
+  return categories.map((cat) => ({
+    params: { category: cat.slug },
+    props: {
+      cat,
+      rows: entries
+        .filter((e) => e.data.category === cat.slug)
+        .sort((a, b) => a.data.mitre.localeCompare(b.data.mitre))
+        .map((e) => ({
+          href: `/techniques/${e.id}`,
+          mitre: e.data.mitre,
+          title: e.data.title,
+          summary: e.data.summary,
+          platform: e.data.platform as string[],
+          updated: e.data.updated,
+          hasCode: (e.body ?? '').includes('```') || (e.body ?? '').includes('code={`'),
+          hasRules: e.data.detections.length > 0,
+        })),
+    },
+  }));
+}) satisfies GetStaticPaths;
+
+const { cat, rows } = Astro.props;
+
+const canonical = new URL(Astro.url.pathname.replace(/\/$/, ''), Astro.site).href;
+const jsonLd = [
+  collectionJsonLd(canonical, cat.name, cat.blurb),
+  breadcrumbJsonLd(
+    [
+      { label: 'Home', href: '/' },
+      { label: 'Techniques', href: '/techniques' },
+      { label: cat.name },
+    ],
+    canonical,
+  ),
+];
+
+const filters = [
+  { id: 'all', name: 'All' },
+  { id: 'windows', name: 'Windows' },
+  { id: 'linux', name: 'Linux' },
+  { id: 'code', name: 'Has sample code' },
+  { id: 'rules', name: 'Has detections' },
+];
+---
+
+<DocsLayout title={`${cat.name} — maldev wiki`} description={cat.blurb} jsonLd={jsonLd}>
+  <div class="max-w-[1000px] px-6 pt-8 pb-24 lg:px-11">
+    <PageHeader
+      title={cat.name}
+      intro={cat.blurb}
+      introWidth="wide"
+      crumbs={[
+        { label: 'Home', href: '/' },
+        { label: 'Techniques', href: '/techniques' },
+        { label: cat.name },
+      ]}
+    />
+
+    <FilterBar
+      name="techniques"
+      filters={filters}
+      count={`${rows.length} techniques`}
+      label="Filter techniques"
+      class="mb-1"
+    />
+
+    <div class="flex flex-col">
+      {rows.map((row) => <TechniqueRow row={row} filterable />)}
+      {
+        rows.length === 0 && (
+          <p class="py-8 text-[13px] text-faint">
+            no pages published in this category yet —{' '}
+            <a href="/contribute" class="text-acc hover:text-acc2">
+              write the first one
+            </a>
+          </p>
+        )
+      }
+    </div>
+    <p hidden class="py-8 text-[13px] text-faint" data-empty>no techniques match those filters.</p>
+  </div>
+</DocsLayout>
+
+<script>
+  import { initFilterBar } from '../../../lib/filter-bar';
+
+  const isPlatform = (id: string) => id === 'windows' || id === 'linux';
+
+  initFilterBar({
+    name: 'techniques',
+    itemSelector: '[data-row]',
+    multi: true,
+    emptySelector: '[data-empty]',
+    countLabel: (n) => `${n} ${n === 1 ? 'technique' : 'techniques'}`,
+    match: (row, active) => {
+      const platforms = [...active].filter(isPlatform);
+      const rowPlatforms = (row.dataset.platform ?? '').split(',');
+
+      const platformOk = platforms.length === 0 || platforms.some((p) => rowPlatforms.includes(p));
+      const codeOk = !active.has('code') || row.dataset.code === 'true';
+      const rulesOk = !active.has('rules') || row.dataset.rules === 'true';
+
+      return platformOk && codeOk && rulesOk;
+    },
+  });
+</script>

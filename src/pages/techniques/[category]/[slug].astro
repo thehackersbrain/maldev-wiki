@@ -1,0 +1,134 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { getCollection, render } from 'astro:content';
+import DocsLayout from '../../../layouts/DocsLayout.astro';
+import Breadcrumb from '../../../components/Breadcrumb.astro';
+import Callout from '../../../components/Callout.astro';
+import Pill from '../../../components/Pill.astro';
+import AuthorLink from '../../../components/AuthorLink.astro';
+import TableOfContents from '../../../components/TableOfContents.astro';
+import { categoryBySlug } from '../../../data/categories';
+import { techArticleJsonLd, breadcrumbJsonLd, site } from '../../../lib/seo';
+
+export const getStaticPaths = (async () => {
+  const entries = (await getCollection('techniques')).filter((e) => !e.data.draft);
+
+  return entries.map((entry) => {
+    const [category, slug] = entry.id.split('/');
+    return { params: { category, slug }, props: { entry } };
+  });
+}) satisfies GetStaticPaths;
+
+const { entry } = Astro.props;
+const { Content, headings } = await render(entry);
+const d = entry.data;
+const cat = categoryBySlug.get(d.category);
+
+const crumbs = [
+  { label: cat?.name ?? d.category, href: `/techniques/${d.category}` },
+  ...(d.group ? [{ label: d.group }] : []),
+  { label: d.title },
+];
+
+const pills = [d.mitre, ...d.platform, ...d.tags];
+const editUrl = `${site.repo}/edit/main/src/content/techniques/${entry.id}.mdx`;
+
+const canonical = new URL(Astro.url.pathname.replace(/\/$/, ''), Astro.site).href;
+const jsonLd = [
+  techArticleJsonLd(canonical, {
+    title: d.title,
+    description: d.summary,
+    updated: d.updated,
+    author: d.author,
+    authorUrl: d.authorUrl,
+    mitre: d.mitre,
+    platform: d.platform as unknown as string[],
+    tags: d.tags,
+    category: cat?.name ?? d.category,
+  }),
+  breadcrumbJsonLd([{ label: 'Home', href: '/' }, ...crumbs], canonical),
+];
+---
+
+<DocsLayout
+  title={`${d.title} — maldev wiki`}
+  description={d.summary}
+  jsonLd={jsonLd}
+  article={{
+    published: d.updated,
+    modified: d.updated,
+    author: d.author,
+    section: cat?.name ?? d.category,
+  }}
+>
+  <div class="grid items-start xl:grid-cols-[minmax(0,1fr)_232px]">
+    <article class="min-w-0 max-w-[820px] px-6 pt-8.5 pb-25 lg:px-11">
+      <Breadcrumb items={crumbs} />
+
+      <div class="mb-4 flex flex-wrap gap-2">
+        {pills.map((p, i) => <Pill tone={i === 0 ? 'accent' : 'neutral'}>{p}</Pill>)}
+      </div>
+
+      <h1 class="text-[clamp(28px,6.5vw,40px)]/[1.1] font-bold tracking-[-0.02em] text-balance text-tx">
+        {d.title}
+      </h1>
+
+      <div class="my-4 mb-7 flex flex-wrap items-center gap-3 font-mono text-[12.5px]/[1.4] text-faint">
+        <span>updated {d.updated}</span><span class="hidden sm:inline" aria-hidden="true">·</span>
+        {
+          d.readingTime && (
+            <>
+              <span>{d.readingTime}</span>
+              <span class="hidden sm:inline" aria-hidden="true">
+                ·
+              </span>
+            </>
+          )
+        }
+        <AuthorLink author={d.author} href={d.authorUrl} />
+      </div>
+
+      <Callout type="danger">
+        This material is published for detection engineering, malware analysis and authorized
+        red-team engagements. Running these techniques against systems you do not own or have
+        written permission to test is illegal.
+      </Callout>
+
+      <div class="prose-maldev">
+        <Content />
+      </div>
+
+      <div
+        class="mt-2 flex flex-wrap items-center gap-3.5 border-t border-bd pt-5.5 text-[13px] text-faint"
+      >
+        <span>Was this page useful?</span>
+        <button
+          type="button"
+          data-vote="yes"
+          class="cursor-pointer rounded-md border border-bd bg-panel px-3 py-1.5 text-[13px] font-medium text-dim transition-colors hover:border-accd hover:text-acc"
+          >yes</button
+        >
+        <button
+          type="button"
+          data-vote="no"
+          class="cursor-pointer rounded-md border border-bd bg-panel px-3 py-1.5 text-[13px] font-medium text-dim transition-colors hover:border-bd2 hover:text-tx"
+          >no</button
+        >
+        <span hidden class="text-acc" data-vote-thanks>thanks — logged against this revision.</span>
+        <a href={editUrl} rel="noopener" class="ml-auto text-dim hover:text-tx">edit this page ↗</a>
+      </div>
+    </article>
+
+    <TableOfContents headings={headings} labKit={d.labKit} />
+  </div>
+</DocsLayout>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('[data-vote]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll<HTMLElement>('[data-vote]').forEach((b) => (b.hidden = true));
+      const thanks = document.querySelector<HTMLElement>('[data-vote-thanks]');
+      if (thanks) thanks.hidden = false;
+    });
+  });
+</script>

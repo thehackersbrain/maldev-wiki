@@ -1,0 +1,46 @@
+---
+export interface Step {
+  /** bold lead line — an API call on technique pages, a step name elsewhere */
+  title: string;
+  desc: string;
+  /** right-hand pill: the owning DLL, or nothing */
+  tag?: string;
+  /** render the title in mono, for API calls and other machine text */
+  monoTitle?: boolean;
+}
+
+interface Props {
+  steps: Step[];
+  class?: string;
+}
+
+const { steps, class: className } = Astro.props;
+---
+
+<ol class:list={['flex list-none flex-col overflow-hidden rounded-xl border border-bd', className ?? 'mb-7.5']}>
+  {
+    steps.map((st, i) => (
+      <li class="flex items-start gap-3.5 border-t border-bd bg-bg2 px-4.5 py-3.75 first:border-t-0">
+        <span class="grid h-6 w-6 flex-none place-items-center rounded-md border border-bd2 bg-panel2 font-mono text-[11px] font-semibold text-acc">
+          {i + 1}
+        </span>
+        <div class="min-w-0">
+          <div
+            class:list={[
+              'mb-1 break-words text-tx',
+              st.monoTitle ? 'font-mono text-[13px]/[1.4] font-semibold' : 'text-[13.5px]/[1.4] font-semibold',
+            ]}
+          >
+            {st.title}
+          </div>
+          <div class="text-[13px]/[1.6] text-pretty text-dim">{st.desc}</div>
+        </div>
+        {st.tag && (
+          <span class="ml-auto hidden flex-none rounded-[5px] border border-bd px-1.75 py-1 font-mono text-[10px] font-medium text-faint sm:block">
+            {st.tag}
+          </span>
+        )}
+      </li>
+    ))
+  }
+</ol>

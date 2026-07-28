@@ -1,0 +1,61 @@
+---
+import { getNavSections } from '../lib/nav';
+
+const sections = await getNavSections(Astro.url.pathname);
+const current = sections.find((s) => s.open);
+const currentPage = current?.pages.find((p) => p.active);
+---
+
+{/* Stands in for the sidebar below lg, where the tree has nowhere to live. */}
+<details class="group border-b border-bd bg-bg2 lg:hidden">
+  <summary
+    class="flex cursor-pointer list-none items-center gap-2.5 px-6 py-3 text-[13px] text-dim hover:text-tx"
+  >
+    <span class="font-mono text-[10px] tracking-[0.14em] text-faint uppercase">pages</span>
+    <span class="min-w-0 truncate font-medium text-tx">
+      {currentPage?.title ?? current?.name ?? 'Browse the wiki'}
+    </span>
+    <span class="ml-auto font-mono text-[9px] text-faint" aria-hidden="true">
+      <span class="group-open:hidden">▼</span>
+      <span class="hidden group-open:inline">▲</span>
+    </span>
+  </summary>
+
+  <nav class="max-h-[60vh] overflow-y-auto px-6 pt-1 pb-4" aria-label="Documentation">
+    {
+      sections.map((sec) => (
+        <div class="mb-3 last:mb-0">
+          <a
+            href={sec.href}
+            class="flex items-center gap-2 py-2 text-[13.5px] font-semibold text-tx"
+          >
+            <span class="font-mono text-acc" aria-hidden="true">
+              {sec.sym}
+            </span>
+            {sec.name}
+            <span class="ml-auto font-mono text-[11px] font-medium text-faint">
+              {sec.pages.length}
+            </span>
+          </a>
+          {sec.pages.length > 0 && (
+            <div class="ml-3 flex flex-col">
+              {sec.pages.map((pg) => (
+                <a
+                  href={pg.href}
+                  class:list={[
+                    'border-l-2 px-2.5 py-[7px] text-[13.5px]/[1.4]',
+                    pg.active
+                      ? 'border-acc bg-acc/8 font-semibold text-acc'
+                      : 'border-bd text-dim',
+                  ]}
+                >
+                  {pg.title}
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
+      ))
+    }
+  </nav>
+</details>

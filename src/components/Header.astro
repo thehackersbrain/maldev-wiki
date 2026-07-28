@@ -1,0 +1,76 @@
+---
+import { site } from '../lib/seo';
+
+const path = Astro.url.pathname;
+const nav = [
+  { href: '/techniques', label: 'Techniques' },
+  { href: '/toolkit', label: 'Toolkit' },
+  { href: '/detections', label: 'Detections' },
+  { href: '/contribute', label: 'Contribute' },
+];
+const isActive = (href: string) => path === href || path.startsWith(href + '/');
+---
+
+<header
+  class="sticky top-0 z-50 flex h-14 items-center gap-5 border-b border-bd bg-bg2/92 px-4 backdrop-blur-md sm:px-6"
+>
+  <a href="/" class="flex shrink-0 items-center gap-2.5">
+    <span
+      class="grid h-7 w-7 place-items-center rounded-lg border border-accd font-mono text-sm font-bold text-acc"
+      style="background:linear-gradient(140deg,#1a3d2e,#0d1712)">λ</span
+    >
+    <span class="font-mono text-[15px] font-bold tracking-[0.02em] text-tx"
+      >maldev <span class="text-acc">wiki</span></span
+    >
+  </a>
+
+  <nav class="ml-2 hidden gap-0.5 lg:flex">
+    {
+      nav.map((item) => (
+        <a
+          href={item.href}
+          class:list={[
+            'rounded-md px-2.5 py-2 text-[13px] font-medium whitespace-nowrap transition-colors',
+            isActive(item.href) ? 'bg-panel text-tx' : 'text-dim hover:bg-panel hover:text-tx',
+          ]}
+        >
+          {item.label}
+        </a>
+      ))
+    }
+  </nav>
+
+  <a
+    href="/search"
+    class="ml-auto flex h-9 min-w-0 shrink items-center gap-2.5 rounded-lg border border-bd bg-panel px-3 text-faint transition-colors hover:border-bd2 sm:w-full sm:max-w-[290px]"
+  >
+    <span class="font-mono text-[13px]">/</span>
+    <span class="hidden truncate text-[13px] sm:inline">Search techniques, payloads…</span>
+    <span class="ml-auto hidden rounded border border-bd px-1.5 py-0.5 font-mono text-[10px] sm:inline"
+      >⌘K</span
+    >
+  </a>
+
+  <a
+    href={site.repo}
+    rel="noopener"
+    class="hidden items-center gap-2 rounded-lg border border-bd px-2.5 py-2 font-mono text-[12.5px] font-medium whitespace-nowrap text-dim transition-colors hover:border-bd2 hover:text-tx lg:flex"
+    ><span class="text-acc">⑂</span>GitHub</a
+  >
+</header>
+
+<nav class="flex gap-1 overflow-x-auto border-b border-bd bg-bg2/92 px-4 py-2 lg:hidden">
+  {
+    nav.map((item) => (
+      <a
+        href={item.href}
+        class:list={[
+          'rounded-md px-2.5 py-1.5 text-[13px] font-medium whitespace-nowrap',
+          isActive(item.href) ? 'bg-panel text-tx' : 'text-dim',
+        ]}
+      >
+        {item.label}
+      </a>
+    ))
+  }
+</nav>

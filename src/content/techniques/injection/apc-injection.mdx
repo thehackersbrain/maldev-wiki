@@ -1,0 +1,95 @@
+---
+title: APC Injection
+mitre: T1055.004
+category: injection
+group: Context Manipulation
+summary: Queue a user-mode APC onto an alertable thread and wait for it to drain.
+platform: [Windows]
+tags: ['x64 / x86', 'C / C++']
+updated: '2026-05-19'
+author: thehackersbrain
+readingTime: 5 min read
+callChain:
+  - call: VirtualAllocEx + WriteProcessMemory
+    desc: Stage the payload in the target address space.
+    dll: kernel32
+  - call: NtQuerySystemInformation
+    desc: Enumerate threads to find one sitting in an alertable wait.
+    dll: ntdll
+  - call: QueueUserAPC
+    desc: Attach the payload address to that thread's APC queue.
+    dll: kernel32
+  - call: (thread enters alertable wait)
+    desc: The APC fires the next time the thread calls SleepEx, WaitForSingleObjectEx or similar.
+    dll: —
+detections:
+  - src: SYSMON EID 10
+    text: ProcessAccess with THREAD_SET_CONTEXT rights immediately before a queue operation.
+  - src: ETW-TI
+    text: KERNEL_THREATINT_TASK_QUEUEUSERAPC events targeting a thread in another process.
+  - src: MEMORY SCAN
+    text: Private RX memory in a process whose threads all belong to signed modules.
+  - src: BEHAVIOURAL
+    text: Early-bird variants queue the APC into a process created suspended — pair the two events.
+related:
+  - mitre: T1055.003
+    title: Thread Execution Hijacking
+    desc: Direct context rewrite instead of waiting for an alertable state.
+    href: /techniques/injection/thread-execution-hijacking
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: The early-bird variant of APC injection starts from the same suspended process.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Asynchronous Procedure Calls are a legitimate Windows mechanism for running a function in the context
+of a specific thread. A user-mode APC only fires when its target thread enters an alertable wait, so
+this technique trades reliability for quiet: no thread is created, no context is rewritten, and the
+payload runs on a thread that was always going to run.
+
+The "early bird" variant sidesteps the reliability problem entirely by queueing the APC onto the
+primary thread of a process created with `CREATE_SUSPENDED` — that thread is guaranteed to drain its
+APC queue during `ResumeThread`, before any EDR DLL has finished initialising.
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="apc.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`PVOID mem = VirtualAllocEx(hProc, NULL, size, MEM_COMMIT, PAGE_READWRITE);
+WriteProcessMemory(hProc, mem, shellcode, size, NULL);
+
+DWORD old;
+VirtualProtectEx(hProc, mem, size, PAGE_EXECUTE_READ, &old);
+
+// early bird: hThread is the primary thread of a CREATE_SUSPENDED process
+QueueUserAPC((PAPCFUNC)mem, hThread, 0);
+ResumeThread(hThread);   // the queue drains before the process fully initialises`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+ETW-TI is the only continuous source that sees the queue operation itself. Without it, you are left
+correlating the handle request with the memory artifact the payload leaves behind.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

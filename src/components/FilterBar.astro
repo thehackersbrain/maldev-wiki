@@ -1,0 +1,44 @@
+---
+export interface Filter {
+  id: string;
+  name: string;
+}
+
+interface Props {
+  filters: readonly Filter[];
+  /** identifies this bar to the client script; also the data-attribute prefix */
+  name: string;
+  /** e.g. "8 techniques" — replaced live by the filter script */
+  count: string;
+  label: string;
+  class?: string;
+}
+
+const { filters, name, count, label, class: className } = Astro.props;
+---
+
+<div
+  class:list={['flex flex-wrap items-center gap-2 border-b border-bd pb-4.5', className ?? 'mb-4.5']}
+  data-filter-bar={name}
+  role="group"
+  aria-label={label}
+>
+  {
+    filters.map((f) => (
+      <button
+        type="button"
+        data-filter={f.id}
+        aria-pressed={f.id === 'all' ? 'true' : 'false'}
+        class="cursor-pointer rounded-full border border-bd bg-panel px-2.75 py-1.75 font-mono text-[11.5px] font-medium whitespace-nowrap text-dim transition-colors hover:border-bd2 hover:text-tx aria-pressed:border-accd aria-pressed:bg-acc/12 aria-pressed:font-semibold aria-pressed:text-acc"
+      >
+        {f.name}
+      </button>
+    ))
+  }
+  <span
+    class="w-full font-mono text-[11.5px]/[1.3] whitespace-nowrap text-faint sm:ml-auto sm:w-auto sm:text-right"
+    data-filter-count
+  >
+    {count}
+  </span>
+</div>

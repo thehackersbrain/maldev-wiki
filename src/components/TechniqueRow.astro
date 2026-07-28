@@ -1,0 +1,50 @@
+---
+export interface TechniqueRowData {
+  href: string;
+  mitre: string;
+  title: string;
+  summary: string;
+  platform: string[];
+  /** YYYY-MM-DD; only the MM-DD is shown */
+  updated?: string;
+  hasCode?: boolean;
+  hasRules?: boolean;
+}
+
+interface Props {
+  row: TechniqueRowData;
+  /** filterable rows carry the data attributes the category filter bar reads */
+  filterable?: boolean;
+}
+
+const { row, filterable = false } = Astro.props;
+const showDate = row.updated !== undefined;
+---
+
+<a
+  href={row.href}
+  data-row={filterable ? '' : undefined}
+  data-platform={filterable ? row.platform.join(',').toLowerCase() : undefined}
+  data-code={filterable ? String(row.hasCode ?? false) : undefined}
+  data-rules={filterable ? String(row.hasRules ?? false) : undefined}
+  class:list={[
+    'grid grid-cols-[minmax(0,1fr)] items-center gap-x-4.5 gap-y-1 border-b border-bd px-3 py-3.75 hover:bg-panel',
+    showDate ? 'sm:grid-cols-[92px_minmax(0,1fr)_120px_70px]' : 'sm:grid-cols-[92px_minmax(0,1fr)_120px]',
+  ]}
+>
+  <span class="font-mono text-[10.5px]/[1.3] font-semibold text-faint">{row.mitre}</span>
+  <div class="min-w-0">
+    <div class="mb-1 text-[14.5px]/[1.3] font-semibold text-tx">{row.title}</div>
+    <div class="text-[12.5px]/[1.5] text-pretty text-dim">{row.summary}</div>
+  </div>
+  <span class="hidden font-mono text-[10.5px]/[1.3] text-dim sm:block">
+    {row.platform.join(', ')}
+  </span>
+  {
+    showDate && (
+      <span class="hidden justify-self-end font-mono text-[11px]/[1.3] text-faint sm:block">
+        {row.updated!.slice(5)}
+      </span>
+    )
+  }
+</a>

@@ -1,0 +1,74 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import PageHeader from '../components/PageHeader.astro';
+import FilterBar from '../components/FilterBar.astro';
+import Badge from '../components/Badge.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+import { rules, ruleFilters, sigmaSample } from '../data/rules';
+---
+
+<DocsLayout
+  title="Detection library — maldev wiki"
+  description="Sigma, YARA, ETW and memory-scan rules, each written against a technique page on this wiki and tested in the lab kit."
+>
+  <div class="max-w-[1000px] px-6 pt-8 pb-24 lg:px-11">
+    <PageHeader
+      title="Detection library"
+      crumbs={[{ label: 'Home', href: '/' }, { label: 'Detections' }]}
+      intro="Every rule here is written against a technique page on this wiki and tested in the lab kit. Sigma and YARA sources are in one repo — import the whole pack or cherry-pick."
+    />
+
+    <FilterBar
+      name="rules"
+      filters={ruleFilters}
+      count={`${rules.length} rules`}
+      label="Filter rules"
+    />
+
+    <div class="mb-8.5 flex flex-col gap-2.5">
+      {
+        rules.map((r) => (
+          <div
+            data-rule
+            data-kind={r.filter}
+            class="rounded-[11px] border border-bd bg-bg2 px-4.5 py-4"
+          >
+            <div class="mb-2 flex flex-wrap items-center gap-2.5">
+              <Badge tone="rule">{r.kind}</Badge>
+              <span class="text-[14.5px]/[1.3] font-semibold text-tx">{r.title}</span>
+              <a
+                href={r.href}
+                class="w-full font-mono text-[11px]/[1.3] font-medium whitespace-nowrap text-acc hover:text-acc2 sm:ml-auto sm:w-auto"
+              >
+                {r.mitre} ↗
+              </a>
+            </div>
+            <p class="mb-2.5 text-[13px]/[1.6] text-pretty text-dim">{r.desc}</p>
+            <div class="flex flex-wrap items-center gap-x-3.5 font-mono text-[11px]/[1.3] text-faint">
+              <span>source: {r.src}</span>
+              <span aria-hidden="true">·</span>
+              <span>fp rate: {r.fp}</span>
+              <span aria-hidden="true">·</span>
+              <span>{r.updated}</span>
+            </div>
+          </div>
+        ))
+      }
+      <p hidden class="py-6 text-[13px] text-faint" data-rule-empty>no rules of that kind yet.</p>
+    </div>
+
+    <CodeBlock file="unbacked_exec_memory.yml" label="sigma" lang="yaml" code={sigmaSample} />
+  </div>
+</DocsLayout>
+
+<script>
+  import { initFilterBar } from '../lib/filter-bar';
+
+  initFilterBar({
+    name: 'rules',
+    itemSelector: '[data-rule]',
+    emptySelector: '[data-rule-empty]',
+    countLabel: (n) => `${n} ${n === 1 ? 'rule' : 'rules'}`,
+    match: (card, active) => active.has(card.dataset.kind ?? ''),
+  });
+</script>
