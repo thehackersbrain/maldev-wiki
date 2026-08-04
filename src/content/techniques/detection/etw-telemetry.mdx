@@ -1,0 +1,227 @@
+---
+title: ETW Telemetry & ETW-TI
+mitre: T1562.006
+category: detection
+group: Telemetry Sources
+summary: Understand what Event Tracing for Windows sees, what it misses, and how attackers try to blind it.
+platform: [Windows]
+tags: ['ETW', 'C / C++', 'PowerShell']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain: []
+detections:
+  - src: ETW-TI
+    text: NtTraceEvent / EtwWrite calls from private non-image memory indicate an attacker is injecting into an ETW provider.
+  - src: SYSMON EID 25
+    text: Process tampering detected — image is modified or erased from disk after load.
+  - src: BEHAVIOURAL
+    text: A process that disables all ETW sessions via NtSetSystemInformation(SystemPerformanceTraceInformation) shortly after launch.
+related:
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Commonly paired with ETW blinding — direct syscalls avoid the hooked ntdll stubs that produce ETW events.
+    href: /techniques/evasion/direct-syscalls
+  - mitre: T1562.001
+    title: Unhooking ntdll
+    desc: Restoring ntdll stubs removes the hooks that many userland ETW providers depend on.
+    href: /techniques/evasion/unhooking-ntdll
+  - mitre: T1027
+    title: YARA Memory Scanning
+    desc: ETW blinding makes memory scanning more important as a complementary detection layer.
+    href: /techniques/detection/yara-memory-scanning
+labKit:
+  - label: etw_monitor.c + etw_patch_detect.yar
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Event Tracing for Windows (ETW) is the backbone of Windows telemetry. Every EDR, Sysmon, and
+the Microsoft Defender stack read from ETW sessions at some level. Understanding the provider
+hierarchy — and where each technique leaves a trace — is as important for defenders building
+detections as for operators planning evasions.
+
+The most privileged tier is **ETW-TI** (Threat Intelligence): a kernel-side provider that
+emits events regardless of what userland does. It sees system calls, memory allocations,
+remote thread creation, and process injection at the KiSystemCall64 layer — before any
+userland hook, before any API, before any shellcode runs. It is the source most commonly
+targeted for blinding.
+
+<Callout type="note">
+  ETW-TI requires a kernel-mode consumer (a registered callback at the `ETWTI` provider GUID).
+  Only Microsoft's own stack (`MsSense.exe`, Defender, some third-party EDRs) registers there.
+  Sysmon uses a separate driver model and is not an ETW-TI consumer — its coverage differs.
+</Callout>
+
+## The ETW provider hierarchy
+
+```
+Kernel (ETW-TI / WMI-ACT)
+  ├── NtAllocateVirtualMemory events
+  ├── NtProtectVirtualMemory events
+  ├── Remote thread creation
+  └── Process/image load events
+
+NT Kernel Logger (Session 0, always running)
+  ├── Process / thread create / exit
+  ├── Image load
+  └── Network events
+
+User-mode providers (per-process)
+  ├── Microsoft-Windows-DotNETRuntime
+  ├── Microsoft-Windows-PowerShell
+  ├── Microsoft-Antimalware-Scan-Interface (AMSI)
+  └── Vendor EDR providers (registered in each process)
+```
+
+## Writing an ETW consumer
+
+<CodeBlock
+  file="etw_consumer.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cevntrace.h\u003e
+#pragma comment(lib, "tdh.lib")
+#pragma comment(lib, "advapi32.lib")
+
+// Microsoft-Windows-Kernel-Process GUID
+static const GUID KernelProcessGuid = {
+    0x22fb2cd6, 0x0e7b, 0x422b,
+    { 0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16 }
+};
+
+static VOID WINAPI event_cb(PEVENT_RECORD rec) {
+    // filter for process-start events (EventId == 1)
+    if (rec->EventHeader.EventDescriptor.Id == 1) {
+        wprintf(L"[PROCESS START] PID=%lu\\n",
+                rec->EventHeader.ProcessId);
+    }
+}
+
+void start_etw_session(void) {
+    TRACEHANDLE session_handle = 0;
+    char buf[sizeof(EVENT_TRACE_PROPERTIES) + 256] = {0};
+    PEVENT_TRACE_PROPERTIES props = (PEVENT_TRACE_PROPERTIES)buf;
+
+    props->Wnode.BufferSize    = sizeof buf;
+    props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+    props->Wnode.ClientContext = 1;  // QueryPerformanceCounter
+    props->LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+    props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+
+    lstrcpyA((LPSTR)(props + 1), "MaldevWikiSession");
+    StartTraceA(&session_handle, "MaldevWikiSession", props);
+    EnableTraceEx2(session_handle, &KernelProcessGuid,
+                   EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                   TRACE_LEVEL_INFORMATION, 0x10 /* WINEVENT_KEYWORD_PROCESS */,
+                   0, 0, NULL);
+
+    EVENT_TRACE_LOGFILEA logfile = {0};
+    logfile.LoggerName  = "MaldevWikiSession";
+    logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME |
+                               PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.EventRecordCallback = event_cb;
+
+    TRACEHANDLE trace = OpenTraceA(&logfile);
+    ProcessTrace(&trace, 1, NULL, NULL);  // blocks until session stops
+}`}
+/>
+
+## ETW blinding techniques
+
+The most common approaches, in order of prevalence in observed malware:
+
+### 1. Patch EtwEventWrite in-process
+
+<CodeBlock
+  file="etw_patch.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// Overwrite the first bytes of EtwEventWrite with a RET instruction.
+// This silences all ETW events generated by the current process.
+// Scope: in-process only; does not affect kernel-side ETW-TI.
+void blind_etw(void) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    FARPROC fn    = GetProcAddress(ntdll, "EtwEventWrite");
+
+    DWORD old;
+    VirtualProtect(fn, 1, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE *)fn = 0xC3;   // RET
+    VirtualProtect(fn, 1, old, &old);
+}`}
+/>
+
+### 2. Patch the ETW session's BufferCallback to NULL
+
+More surgical: target only the session consuming events for a specific provider GUID rather
+than all ETW emission.
+
+### 3. Corrupt the session's `LoggerContext`
+
+Patching the `ProviderEnableInfo` in the per-process ETW registration table causes the provider
+to believe it has no active consumers and skip all emission without patching any code.
+
+## What ETW-TI still sees after blinding
+
+| Blind technique | ETW-TI sees | Sysmon sees |
+|---|---|---|
+| Patch `EtwEventWrite` | Yes — kernel events unaffected | Partially |
+| Patch AMSI DLL | Yes | Partially |
+| Unload provider DLL | Yes (image unload event) | Yes (EID 7) |
+| Patch session BufferCallback | No (consumer silenced) | Depends on Sysmon version |
+| NtTraceControl to stop session | Kernel logs session stop | Yes (EID audit) |
+
+The key insight: in-process ETW patches only silence user-mode providers. Kernel-side ETW-TI
+is unaffected by anything that runs in Ring 3. Blinding ETW completely requires a kernel
+driver — and a signed one at that, since Windows requires driver signing on 64-bit systems.
+
+## Detecting ETW blinding
+
+<CodeBlock
+  file="etw_patch_detect.yar"
+  label="YARA"
+  lang="python"
+  class="mb-7.5"
+  code={`rule ETW_EtwEventWrite_Patched
+{
+    meta:
+        description = "EtwEventWrite first byte overwritten with RET (0xC3)"
+        author      = "maldev-wiki"
+        mitre       = "T1562.006"
+
+    strings:
+        // Look for the RET opcode at the expected offset of EtwEventWrite
+        // after resolving the export — this rule is for memory scanning
+        $ret_patch = { C3 }
+
+    condition:
+        // Combine with a VT or EDR scan that checks the export address at runtime
+        // In YARA: flag if EtwEventWrite's first byte is C3 and ntdll is loaded
+        $ret_patch at 0
+        // Real implementation resolves the export and checks that specific offset
+}`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable guard against ETW blinding is to verify the integrity of provider DLL
+exports from outside the process (a kernel driver or a separate monitor process with
+`PROCESS_VM_READ` access). If the first byte of `EtwEventWrite` in a target process's ntdll
+is `0xC3`, the process has disabled its own ETW emission.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

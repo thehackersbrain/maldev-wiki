@@ -1,0 +1,201 @@
+---
+title: Anti-Debugging Techniques
+mitre: T1622
+category: anti-analysis
+group: Environment Checks
+summary: Detect or disrupt debuggers to prevent interactive analysis of a running sample.
+platform: [Windows]
+tags: ['C / C++', 'ASM', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: IsDebuggerPresent
+    desc: Reads the BeingDebugged byte from the PEB — the most obvious check.
+    dll: kernel32
+  - call: NtQueryInformationProcess(ProcessDebugPort)
+    desc: Kernel sets DebugPort to a non-zero value when the process is under a debugger.
+    dll: ntdll
+  - call: CheckRemoteDebuggerPresent
+    desc: Wraps NtQueryInformationProcess for cross-process checks.
+    dll: kernel32
+  - call: NtSetInformationThread(ThreadHideFromDebugger)
+    desc: Makes a thread invisible to the debug subsystem; breakpoints and single-step silently stop working.
+    dll: ntdll
+  - call: hardware breakpoint check via GetThreadContext
+    desc: Non-zero DR0–DR3 registers indicate that a debugger has set hardware breakpoints.
+    dll: kernel32
+  - call: timing check (RDTSC)
+    desc: Measure cycles between two RDTSC calls; single-stepping inflates the delta dramatically.
+    dll: —
+detections:
+  - src: YARA
+    text: IsDebuggerPresent / NtQueryInformationProcess with ProcessDebugPort (7) in the same function block.
+  - src: BEHAVIOURAL
+    text: NtSetInformationThread with ThreadHideFromDebugger (0x11) — no legitimate use outside malware.
+  - src: MEMORY SCAN
+    text: PEB.BeingDebugged is patched to 0 at runtime (self-patching to fool IsDebuggerPresent checks).
+  - src: SANDBOX
+    text: Log and ignore anti-debug API returns; force IsDebuggerPresent to return 0 via API hooking.
+related:
+  - mitre: T1497
+    title: Sandbox Detection
+    desc: Environment checks aimed at automated detonation rather than interactive debuggers.
+    href: /techniques/anti-analysis/sandbox-detection
+  - mitre: T1027
+    title: PE Packer / Crypter
+    desc: Outer stub often contains anti-debug checks to protect the unpacking routine.
+    href: /techniques/loaders/pe-packer-crypter
+labKit:
+  - label: anti_debug.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Anti-debugging is a cat-and-mouse game between a malware author and an analyst's debugger.
+The goal is not to be impossible to debug — given enough time and a hypervisor, everything can
+be analysed — but to raise the cost enough that automated detonation fails and interactive
+analysis requires deliberate counter-counter-measures.
+
+Detection checks fall into two categories: **passive** checks that query state a debugger
+changes (the PEB, `DebugPort`, CPU context registers), and **active** disruptions that
+alter the debugging environment (`ThreadHideFromDebugger`, exception-based anti-debug tricks).
+
+<Callout type="note">
+  `NtSetInformationThread(ThreadHideFromDebugger)` has no legitimate use in production code.
+  Any binary that calls it is either a debugger itself, a DRM system, or hostile. It is one of
+  the clearest single-API heuristics in the catalogue.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="anti_debug.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cintrin.h\u003e
+
+// forward-declare NtSetInformationThread (not in the standard headers)
+typedef NTSTATUS (NTAPI *NtSIT_t)(HANDLE, ULONG, PVOID, ULONG);
+#define ThreadHideFromDebugger 0x11
+
+// 1. PEB flag — trivially patched by a debugger plugin
+static BOOL peb_check(void) {
+    return IsDebuggerPresent();
+}
+
+// 2. DebugPort via NtQueryInformationProcess
+static BOOL debug_port_check(void) {
+    HANDLE port = NULL;
+    NtQueryInformationProcess(GetCurrentProcess(),
+        7 /* ProcessDebugPort */, &port, sizeof port, NULL);
+    return port != NULL;
+}
+
+// 3. Hardware breakpoints in DR registers
+static BOOL hwbp_check(void) {
+    CONTEXT ctx = { .ContextFlags = CONTEXT_DEBUG_REGISTERS };
+    GetThreadContext(GetCurrentThread(), &ctx);
+    return ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3;
+}
+
+// 4. RDTSC timing — single-stepping bloats the delta to millions of cycles
+static BOOL timing_check(void) {
+    UINT64 t1 = __rdtsc();
+    __cpuid((int[4]){0}, 0);  // serialising instruction
+    UINT64 t2 = __rdtsc();
+    return (t2 - t1) > 1000;  // normal: ~40 cycles; debugger: >> 10k
+}
+
+// 5. Hide the current thread from the debug subsystem (no patch survives this)
+static void hide_thread(void) {
+    NtSIT_t fn = (NtSIT_t)GetProcAddress(
+        GetModuleHandleA("ntdll.dll"), "NtSetInformationThread");
+    if (fn) fn(GetCurrentThread(), ThreadHideFromDebugger, NULL, 0);
+}
+
+BOOL debugger_present(void) {
+    return peb_check() || debug_port_check() ||
+           hwbp_check() || timing_check();
+}
+
+// call early in the loader, before the first beacon
+void anti_debug_init(void) {
+    hide_thread();
+    if (debugger_present()) ExitProcess(0);
+}`}
+/>
+
+## Exception-based tricks
+
+Beyond state polling, some samples use the CPU's own exception machinery:
+
+<CodeBlock
+  file="exception_tricks.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// OutputDebugStringA poisoning: a debugger consumes the string;
+// the error code differs between debugged and undebuggged processes.
+static BOOL output_debug_check(void) {
+    SetLastError(0xDEAD);
+    OutputDebugStringA("x");
+    return GetLastError() == 0xDEAD;   // no debugger consumed it
+}
+
+// Single-step trap: set TF, install a VEH, verify the exception fires.
+// Under some debuggers the exception is swallowed and the VEH never runs.
+static volatile BOOL seh_fired = FALSE;
+static LONG WINAPI seh_handler(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        seh_fired = TRUE;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static BOOL seh_check(void) {
+    HANDLE h = AddVectoredExceptionHandler(1, seh_handler);
+    __asm__ volatile ("pushfq; orq $0x100,(%%rsp); popfq" ::: "cc");
+    __asm__ volatile ("nop");
+    RemoveVectoredExceptionHandler(h);
+    return !seh_fired;  // TRUE → debugger swallowed the exception
+}`}
+/>
+
+## Bypassing as an analyst
+
+| Check | Bypass |
+|---|---|
+| `IsDebuggerPresent` | ScyllaHide plugin; patch `PEB.BeingDebugged` to 0 |
+| `NtQueryInformationProcess(DebugPort)` | Hook the syscall or use ScyllaHide |
+| Hardware breakpoints | Use software breakpoints (`int3`) instead |
+| `ThreadHideFromDebugger` | Kernel debugger (WinDbg kernel attach) is not affected |
+| RDTSC timing | `VMware` option "Disable time-stamp counter" in `.vmx` |
+| Sleep acceleration | Some sandboxes: `NtDelayExecution` hook that reports real elapsed time |
+
+The `ThreadHideFromDebugger` call is the one check that a user-mode debugger cannot transparently
+bypass without kernel support — the thread genuinely becomes invisible to the debug port's event
+dispatch.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

