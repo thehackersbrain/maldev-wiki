@@ -1,0 +1,280 @@
+---
+title: Sysmon Deployment & Tuning
+mitre: T1562.001
+category: detection
+group: Endpoint Telemetry
+summary: Deploy and tune Sysmon to generate high-fidelity process, network, and file events for threat hunting and incident response.
+platform: [Windows]
+tags: ['PowerShell', 'XML', 'Sysmon']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 10 min read
+callChain: []
+detections:
+  - src: SYSMON EID 1
+    text: Process creation with full command line, image hash, and parent process — foundation of most injection and execution detection.
+  - src: SYSMON EID 3
+    text: Network connections with source/destination IPs and ports, tied to the initiating process.
+  - src: SYSMON EID 7
+    text: Image load events — detect suspicious DLL loads (unsigned, loaded from writable directories).
+  - src: SYSMON EID 10
+    text: Process access events — catch OpenProcess with inject-relevant access masks (VM_READ/WRITE, CREATE_THREAD).
+  - src: SYSMON EID 11
+    text: File creation — detect payload drops, LNK creation in Startup folders, script files in temp directories.
+  - src: SYSMON EID 12/13/14
+    text: Registry create, set, and rename events — catch Run key modifications, IFEO hijacks, COM hijacks.
+  - src: SYSMON EID 25
+    text: Process tampering — detect module stomping, process hollowing memory remapping.
+related:
+  - mitre: T1562.006
+    title: ETW Telemetry
+    desc: Kernel-level telemetry complementary to Sysmon's user-mode instrumentation.
+    href: /techniques/detection/etw-telemetry
+  - mitre: T1518.001
+    title: Sigma Rule Writing
+    desc: Convert Sysmon event fields into portable detection rules.
+    href: /techniques/detection/sigma-rule-writing
+  - mitre: T1005
+    title: YARA Memory Scanning
+    desc: Combine Sysmon process creation events with in-memory YARA scanning for confirmed detections.
+    href: /techniques/detection/yara-memory-scanning
+labKit:
+  - label: Sysmon (Microsoft Sysinternals)
+    href: 'https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon'
+  - label: SwiftOnSecurity Sysmon config
+    href: 'https://github.com/SwiftOnSecurity/sysmon-config'
+  - label: Olaf Hartong Modular Sysmon
+    href: 'https://github.com/olafhartong/sysmon-modular'
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Sysmon (System Monitor) is a Windows system service and kernel driver from Sysinternals that logs security-relevant events to the Windows event log under `Microsoft-Windows-Sysmon/Operational`. Unlike native Windows audit policy events, Sysmon events include enriched fields: full command lines, image hashes, parent process information, and network connection metadata — all correlated by a unique `ProcessGuid` that persists across the process lifetime.
+
+A well-tuned Sysmon deployment dramatically increases detection fidelity for the techniques documented in this wiki: process injection, DLL hijacking, persistence via registry or Startup folders, and C2 network activity.
+
+<Callout type="note">
+  Sysmon's value is entirely in its configuration. A default installation with no config file
+  generates almost no events. The config is an XML file that specifies which events to log and
+  which to exclude — a poorly written config floods the SIEM with noise, while a good one
+  produces targeted, high-signal events with minimal volume.
+</Callout>
+
+## Installation
+
+<CodeBlock
+  file="install_sysmon.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Install with a custom config
+.\Sysmon64.exe -accepteula -i sysmon-config.xml
+
+# Update an existing config without reinstalling
+.\Sysmon64.exe -c sysmon-config.xml
+
+# Check the current config
+.\Sysmon64.exe -c
+
+# Uninstall (removes the driver and service)
+.\Sysmon64.exe -u
+
+# Verify the service is running
+Get-Service Sysmon64 | Select-Object Status, StartType
+
+# Event log location
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 10`}
+/>
+
+## Configuration skeleton
+
+<CodeBlock
+  file="sysmon-config.xml"
+  label="XML"
+  lang="xml"
+  class="mb-7.5"
+  code={`\u003cSysmonConfig version="4.82"\u003e
+  \u003cHashAlgorithms\u003eMD5,SHA256,IMPHASH\u003c/HashAlgorithms\u003e
+  \u003cCheckRevocation/\u003e
+
+  \u003cEventFiltering\u003e
+
+    \u003c!-- EID 1: Process creation --\u003e
+    \u003cRuleGroup name="ProcessCreate" groupRelation="or"\u003e
+      \u003cProcessCreate onmatch="exclude"\u003e
+        \u003cImage condition="is"\u003eC:\Windows\System32\svchost.exe\u003c/Image\u003e
+        \u003cImage condition="is"\u003eC:\Windows\System32\taskhostw.exe\u003c/Image\u003e
+      \u003c/ProcessCreate\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 3: Network connections --\u003e
+    \u003cRuleGroup name="NetworkConnect" groupRelation="or"\u003e
+      \u003cNetworkConnect onmatch="include"\u003e
+        \u003cInitiatedTcp condition="is"\u003etrue\u003c/InitiatedTcp\u003e
+        \u003cDestinationPort condition="is"\u003e443\u003c/DestinationPort\u003e
+        \u003cDestinationPort condition="is"\u003e80\u003c/DestinationPort\u003e
+        \u003cDestinationPort condition="is"\u003e53\u003c/DestinationPort\u003e
+      \u003c/NetworkConnect\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 7: Image load - log unsigned DLL loads --\u003e
+    \u003cRuleGroup name="ImageLoad" groupRelation="or"\u003e
+      \u003cImageLoad onmatch="include"\u003e
+        \u003cSigned condition="is"\u003efalse\u003c/Signed\u003e
+        \u003cImageLoaded condition="contains"\u003eAppData\u003c/ImageLoaded\u003e
+        \u003cImageLoaded condition="contains"\u003eTemp\u003c/ImageLoaded\u003e
+      \u003c/ImageLoad\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 10: Process access - injection via OpenProcess --\u003e
+    \u003cRuleGroup name="ProcessAccess" groupRelation="or"\u003e
+      \u003cProcessAccess onmatch="include"\u003e
+        \u003cGrantedAccess condition="is"\u003e0x1F0FFF\u003c/GrantedAccess\u003e
+        \u003cGrantedAccess condition="is"\u003e0x1010\u003c/GrantedAccess\u003e
+        \u003cGrantedAccess condition="is"\u003e0x143A\u003c/GrantedAccess\u003e
+      \u003c/ProcessAccess\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 11: File create in Startup / Temp --\u003e
+    \u003cRuleGroup name="FileCreate" groupRelation="or"\u003e
+      \u003cFileCreate onmatch="include"\u003e
+        \u003cTargetFilename condition="contains"\u003eStartup\u003c/TargetFilename\u003e
+        \u003cTargetFilename condition="end with"\u003e.lnk\u003c/TargetFilename\u003e
+        \u003cTargetFilename condition="end with"\u003e.ps1\u003c/TargetFilename\u003e
+      \u003c/FileCreate\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 12/13: Registry persistence --\u003e
+    \u003cRuleGroup name="RegistryEvent" groupRelation="or"\u003e
+      \u003cRegistryEvent onmatch="include"\u003e
+        \u003cTargetObject condition="contains"\u003e\Run\u003c/TargetObject\u003e
+        \u003cTargetObject condition="contains"\u003e\RunOnce\u003c/TargetObject\u003e
+        \u003cTargetObject condition="contains"\u003eImage File Execution Options\u003c/TargetObject\u003e
+      \u003c/RegistryEvent\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 22: DNS queries --\u003e
+    \u003cRuleGroup name="DnsQuery" groupRelation="or"\u003e
+      \u003cDnsQuery onmatch="exclude"\u003e
+        \u003cImage condition="is"\u003eC:\Windows\System32\svchost.exe\u003c/Image\u003e
+      \u003c/DnsQuery\u003e
+    \u003c/RuleGroup\u003e
+
+    \u003c!-- EID 25: Process tampering (hollowing, module stomping) --\u003e
+    \u003cRuleGroup name="ProcessTampering" groupRelation="or"\u003e
+      \u003cProcessTampering onmatch="include"\u003e
+        \u003cType condition="is"\u003eImage is replaced\u003c/Type\u003e
+        \u003cType condition="is"\u003eImage is locked\u003c/Type\u003e
+      \u003c/ProcessTampering\u003e
+    \u003c/RuleGroup\u003e
+
+  \u003c/EventFiltering\u003e
+\u003c/SysmonConfig\u003e`}
+/>
+
+## Key event IDs reference
+
+| EID | Event | Key fields | Primary use |
+|---|---|---|---|
+| 1 | Process Create | CommandLine, ParentImage, Hashes | Execution, injection, LOLBins |
+| 2 | File Creation Time | TargetFilename | Timestomping detection |
+| 3 | Network Connect | Initiated, DestIP, DestPort, Image | C2, lateral movement |
+| 6 | Driver Load | ImageLoaded, Signed | Kernel-mode implants |
+| 7 | Image Load | ImageLoaded, Signed, Company | DLL injection, side-loading |
+| 8 | CreateRemoteThread | SourceImage, TargetImage | Classic injection |
+| 10 | ProcessAccess | GrantedAccess, TargetImage | OpenProcess injection |
+| 11 | FileCreate | TargetFilename | Drops, Startup persistence |
+| 12/13/14 | RegistryEvent | TargetObject, Details | Registry persistence |
+| 17/18 | PipeEvent | PipeName | Named pipe C2 (SMB) |
+| 22 | DNS Query | QueryName, QueryResults | DNS C2, phishing |
+| 23 | FileDelete | TargetFilename | Anti-forensics |
+| 25 | ProcessTampering | Type (Image is replaced) | Hollowing, stomping |
+| 26 | FileDeleteDetected | TargetFilename | Ransomware, cleanup |
+
+## Tuning workflow
+
+<CodeBlock
+  file="tuning.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Count events per EventID to find noisy categories
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" |
+    Group-Object Id | Sort-Object Count -Descending |
+    Select-Object Name, Count | Format-Table
+
+# Find the noisiest processes for EID 1 (process create)
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -FilterXPath "*[System[EventID=1]]" |
+    ForEach-Object {
+        ([xml]$_.ToXml()).Event.EventData.Data |
+            Where-Object {$_.Name -eq 'Image'} | Select-Object '#text'
+    } | Group-Object '#text' | Sort-Object Count -Descending | Select-Object -First 20
+
+# Find all EID 10 (process access) grouped by GrantedAccess mask
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -FilterXPath "*[System[EventID=10]]" |
+    ForEach-Object {
+        ([xml]$_.ToXml()).Event.EventData.Data |
+            Where-Object {$_.Name -eq 'GrantedAccess'} | Select-Object '#text'
+    } | Group-Object '#text' | Sort-Object Count -Descending`}
+/>
+
+## Deployment at scale
+
+<CodeBlock
+  file="deploy_gpo.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Deploy via Group Policy startup script or PDQ Deploy
+# 1. Stage Sysmon64.exe and sysmon-config.xml in a network share
+# 2. Run on all endpoints:
+
+$sysmon = "\\\\share\\tools\\Sysmon64.exe"
+$config = "\\\\share\\tools\\sysmon-config.xml"
+
+if (-not (Get-Service Sysmon64 -ErrorAction SilentlyContinue)) {
+    Start-Process $sysmon -ArgumentList "-accepteula -i $config" -Wait
+} else {
+    Start-Process $sysmon -ArgumentList "-c $config" -Wait
+}
+
+# Verify events are flowing (should have recent EID 1 events)
+$count = (Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" \`
+    -MaxEvents 10 -ErrorAction SilentlyContinue).Count
+Write-Host "Sysmon event count (last 10): $count"`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## High-value Sysmon detection rules (inline)
+
+Three Sigma-ready patterns using Sysmon events:
+
+**Injection via OpenProcess (EID 10):**
+```
+GrantedAccess: '0x1F0FFF'
+TargetImage|not|startswith: 'C:\Windows\System32\'
+```
+
+**LNK file created in Startup by non-explorer process (EID 11):**
+```
+TargetFilename|contains: '\Start Menu\Programs\Startup\'
+TargetFilename|endswith: '.lnk'
+Image|not|contains: 'explorer'
+```
+
+**DNS query to DGA-looking domain (EID 22):**
+```
+QueryName|re: '^[a-z0-9]{10,}\.(xyz|top|tk|ml|ga|cf)$'
+```
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

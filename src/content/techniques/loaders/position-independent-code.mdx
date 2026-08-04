@@ -1,0 +1,206 @@
+---
+title: Position-Independent Code (Shellcode)
+mitre: T1027.009
+category: loaders
+group: Staged Delivery
+summary: Write code that runs at any memory address without relocation — the basis of every staged payload.
+platform: [Windows, Linux]
+tags: ['ASM', 'C / C++', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 10 min read
+callChain:
+  - call: load effective address of .data
+    desc: Use RIP-relative addressing (x64) or a call/pop prologue (x86) to find the shellcode's own base address.
+    dll: —
+  - call: resolve kernel32 / ntdll from PEB
+    desc: Walk the PEB loader list to find loaded module base addresses without calling GetModuleHandle.
+    dll: —
+  - call: resolve needed exports
+    desc: Parse the export directory of each needed module manually — no GetProcAddress dependency.
+    dll: —
+  - call: execute payload logic
+    desc: All API calls go through the resolved function pointers, all strings are accessed relative to RIP.
+    dll: —
+detections:
+  - src: MEMORY SCAN
+    text: Executable non-image memory (MEM_PRIVATE + PAGE_EXECUTE_*) containing a structured byte sequence without PE headers.
+  - src: YARA
+    text: PEB walker patterns — the TEB.PEB chain traversal byte sequence is recognisable across tools.
+  - src: ETW-TI
+    text: Thread start in private RX memory — same signal as any other shellcode execution technique.
+  - src: STACK WALK
+    text: Return addresses resolve to anonymous private memory rather than a module's .text section.
+related:
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: PIC is what runs after the loader decrypts and maps its payload.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: A DLL that contains a PIC loader stub for itself.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Syscall stubs are the simplest form of PIC — a handful of instructions with no dependencies.
+    href: /techniques/evasion/direct-syscalls
+labKit:
+  - label: pic_stub.asm + build.sh
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Position-independent code is code that contains no absolute addresses — every reference to data
+or code is expressed as an offset relative to the instruction pointer. Any code that will be
+injected into another process, loaded into an arbitrary allocation, or transmitted as a blob
+must be PIC, because it will not load at the address its compiler assumed.
+
+The x64 architecture makes PIC natural: `LEA rax, [rip+offset]` accesses data relative to
+the current instruction pointer. x86 requires an explicit trick (call + pop) to find the
+current address. The harder challenge is not addressing — it is resolving the Windows API
+without importing anything.
+
+<Callout type="note">
+  The Windows loader normally resolves imports by reading the PE's import directory. Shellcode
+  has no import directory. It must locate needed functions by walking the in-memory loader
+  structures (PEB → loader list → module bases → export tables) using only what the CPU and
+  memory give it.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## PEB walking — the core primitive
+
+<CodeBlock
+  file="peb_walk.asm"
+  label="ASM"
+  lang="asm"
+  class="mb-7.5"
+  code={`; x64 — find kernel32.dll base from the PEB without any imports
+;
+; GS:[0x60] = TEB.Peb
+; PEB + 0x18 = Ldr (PEB_LDR_DATA*)
+; Ldr + 0x20 = InMemoryOrderModuleList (FLINK points to first entry)
+; Each LIST_ENTRY (LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks)
+;   + 0x20 = DllBase
+;   + 0x50 = BaseDllName (UNICODE_STRING)
+
+find_kernel32:
+    mov   rbx, gs:[0x60]           ; PEB
+    mov   rbx, [rbx + 0x18]       ; PEB.Ldr
+    mov   rbx, [rbx + 0x20]       ; Ldr.InMemoryOrderModuleList.Flink
+    ; The list is: [ntdll] -> [kernel32] -> ...
+    ; skip the first entry (ntdll), take the second
+    mov   rbx, [rbx]              ; skip ntdll entry
+    mov   rbx, [rbx + 0x20]       ; DllBase of next module (kernel32)
+    ; rbx now holds kernel32.dll base address`}
+/>
+
+## Export table parser
+
+<CodeBlock
+  file="export_walk.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// Walk the PE export table to find a named export
+// Compiled with -fpic -fno-stack-protector, all strings in read order
+typedef unsigned char  u8;
+typedef unsigned short u16;
+typedef unsigned int   u32;
+
+static void* find_export(void *base, const char *name) {
+    u8 *b = (u8*)base;
+    // DOS header -> NT headers
+    u32 *nt  = (u32*)(b + *(u32*)(b + 0x3c));
+    // Optional header data directory
+    u32 edt_rva = *(u32*)((u8*)nt + 0x88 + 0*8);  // [0] = export dir
+    u8  *edt    = b + edt_rva;
+
+    u32 num_names = *(u32*)(edt + 0x18);
+    u32 *names    = (u32*)(b + *(u32*)(edt + 0x20));
+    u16 *ordinals = (u16*)(b + *(u32*)(edt + 0x24));
+    u32 *funcs    = (u32*)(b + *(u32*)(edt + 0x1c));
+
+    for (u32 i = 0; i < num_names; i++) {
+        const char *n = (const char*)(b + names[i]);
+        // simple strcmp without libc
+        const char *a = name, *c = n;
+        while (*a && *a == *c) { a++; c++; }
+        if (*a == 0 && *c == 0)
+            return b + funcs[ordinals[i]];
+    }
+    return 0;
+}`}
+/>
+
+## Writing PIC in C
+
+Clang and GCC can compile C to position-independent shellcode with the right flags:
+
+<CodeBlock
+  file="build.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Compile PIC shellcode from C (Linux cross-compile for Windows)
+$ x86_64-w64-mingw32-gcc -O2 \
+    -fpic \
+    -fno-stack-protector \
+    -fno-exceptions \
+    -nostdlib \
+    -masm=intel \
+    -Wl,--entry=shellcode_main \
+    -Wl,--gc-sections \
+    -o shellcode.exe shellcode.c
+
+# Extract the .text section as a raw binary
+$ objcopy -O binary --only-section=.text shellcode.exe shellcode.bin
+
+# Check for absolute addresses (should be empty)
+$ objdump -d shellcode.bin | grep -E "0x[0-9a-f]{8,}"
+(no output = PIC is clean)`}
+/>
+
+## Common mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Global / static variables | Crash at non-base-address | Move to stack; access via `[rip+offset]` |
+| String literals in `.rdata` | Access violation | Embed strings as stack arrays or char-by-char |
+| C runtime call | Missing import crash | Replace with PIC-safe equivalents or inline |
+| `call dword ptr [import]` | IAT not set up | Resolve via export walk; no IAT in shellcode |
+| Stack alignment (x64) | Crash in SIMD intrinsics | Ensure RSP is 16-byte aligned before any call |
+
+## Tooling that generates PIC
+
+| Tool | Language | Notes |
+|---|---|---|
+| `msfvenom` | Assembly | Metasploit payloads are PIC by design |
+| `donut` | C# / VBScript / PE → PIC | Converts any payload to shellcode |
+| `sRDI` | C | Converts a reflective DLL to shellcode |
+| BofNet / BOF | C | Beacon Object Files — lightweight PIC modules |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+PEB walker patterns are the most consistent YARA target across all shellcode tooling: the
+`GS:[0x60]` read followed by `[rbx+0x18]` → `[rbx+0x20]` chain appears almost verbatim in
+Cobalt Strike, Meterpreter, custom loaders, and every manually-written payload. The sequence
+is short enough (12–20 bytes) to match reliably in memory without false positives.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

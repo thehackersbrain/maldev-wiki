@@ -1,0 +1,340 @@
+---
+title: Behavioral Analytics & UEBA
+mitre: T1562.001
+category: detection
+group: Behavioral Detection
+summary: Detect attacker activity by identifying statistical deviations from baseline user and entity behaviour rather than matching known signatures.
+platform: [Windows, Linux, macOS]
+tags: ['Python', 'Splunk', 'PowerShell']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain: []
+detections:
+  - src: UEBA
+    text: User accesses resources at unusual hours or from an unusual workstation — session baseline deviation alert.
+  - src: UEBA
+    text: Service account that normally reads 10 files per day suddenly reads 10,000 — file access volume anomaly.
+  - src: BEHAVIOURAL
+    text: Process that normally makes no network connections begins beaconing to a new external IP — process network baseline violation.
+  - src: BEHAVIOURAL
+    text: Workstation executes LSASS access, lateral movement, and scheduled task creation within 30 minutes — TTP sequencing.
+related:
+  - mitre: T1518.001
+    title: Sigma Rule Writing
+    desc: Signature-based detection complements behavioral baselines — a layered approach catches both known and unknown techniques.
+    href: /techniques/detection/sigma-rule-writing
+  - mitre: T1057
+    title: Memory Forensics
+    desc: When behavioral analytics raises an alert, memory forensics confirms and characterises the threat.
+    href: /techniques/detection/memory-forensics
+  - mitre: T1562.001
+    title: Sysmon Deployment
+    desc: Sysmon provides the high-fidelity event data that behavioral analytics engines require.
+    href: /techniques/detection/sysmon-deployment
+labKit:
+  - label: Splunk Security Essentials
+    href: 'https://splunkbase.splunk.com/app/3435'
+  - label: Elastic SIEM detection rules
+    href: 'https://github.com/elastic/detection-rules'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+**User and Entity Behavior Analytics (UEBA)** builds statistical models of normal behaviour for users, workstations, servers, and service accounts, then alerts when observed behaviour deviates significantly from the baseline. Unlike signature-based detection — which requires knowing what the attacker will do in advance — UEBA can detect novel techniques, living-off-the-land attacks, and slow-burn intrusions that generate no individual high-confidence signatures.
+
+The core insight is that attackers must eventually **do something anomalous relative to the compromised entity**: a service account that suddenly runs `mimikatz.exe`, a workstation that beacons every 60 seconds to a newly registered domain, an analyst who downloads 10GB of data at 2 AM. These behaviours are detectable without any knowledge of the specific technique.
+
+<Callout type="note">
+  UEBA is not a replacement for signature-based detection — it is a complement. Signatures catch
+  known-bad at low cost; UEBA catches unknown-bad at higher computational cost. The combination
+  reduces both false-negative rates (signatures catch what UEBA's baseline misses) and
+  false-positive rates (UEBA context reduces signature alert fatigue).
+</Callout>
+
+## Process baseline detection
+
+<CodeBlock
+  file="process_baseline.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# Build a baseline of which processes make outbound network connections.
+# Alert when a process makes connections it has never made before.
+#
+# Data source: Sysmon EID 3 (NetworkConnect) events in Elasticsearch
+
+from elasticsearch import Elasticsearch
+from collections import defaultdict
+import json, datetime
+
+es = Elasticsearch("https://elastic:password@localhost:9200", verify_certs=False)
+
+def build_baseline(days=30):
+    """Return dict: process_name -> set of destination domains seen in baseline."""
+    baseline = defaultdict(set)
+    cutoff = (datetime.datetime.utcnow()
+              - datetime.timedelta(days=days)).isoformat()
+
+    resp = es.search(index="winlogbeat-*", body={
+        "size": 0,
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"event.code": "3"}},   # Sysmon network
+                    {"range": {"@timestamp": {"gte": cutoff}}}
+                ]
+            }
+        },
+        "aggs": {
+            "by_process": {
+                "terms": {"field": "process.name", "size": 1000},
+                "aggs": {
+                    "destinations": {
+                        "terms": {"field": "destination.domain", "size": 500}
+                    }
+                }
+            }
+        }
+    })
+
+    for bucket in resp["aggregations"]["by_process"]["buckets"]:
+        proc = bucket["key"]
+        for dest in bucket["destinations"]["buckets"]:
+            baseline[proc].add(dest["key"])
+
+    return baseline
+
+def detect_new_connections(baseline, lookback_minutes=60):
+    """Find network connections by processes to domains not in their baseline."""
+    cutoff = (datetime.datetime.utcnow()
+              - datetime.timedelta(minutes=lookback_minutes)).isoformat()
+
+    resp = es.search(index="winlogbeat-*", body={
+        "size": 1000,
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"event.code": "3"}},
+                    {"range": {"@timestamp": {"gte": cutoff}}}
+                ]
+            }
+        },
+        "_source": ["process.name", "destination.domain",
+                    "destination.ip", "host.name", "@timestamp"]
+    })
+
+    alerts = []
+    for hit in resp["hits"]["hits"]:
+        src  = hit["_source"]
+        proc = src.get("process.name", "")
+        dest = src.get("destination.domain", "")
+
+        if proc and dest and dest not in baseline.get(proc, set()):
+            alerts.append({
+                "timestamp":   src.get("@timestamp"),
+                "host":        src.get("host.name"),
+                "process":     proc,
+                "new_dest":    dest,
+                "dest_ip":     src.get("destination.ip"),
+                "severity":    "MEDIUM" if proc in baseline else "HIGH"
+            })
+    return alerts
+
+if __name__ == "__main__":
+    print("[*] Building baseline...")
+    baseline = build_baseline(days=30)
+    print(f"[*] Baseline: {len(baseline)} processes")
+
+    print("[*] Detecting new connections in last 60 minutes...")
+    alerts = detect_new_connections(baseline)
+    for a in alerts:
+        print(json.dumps(a, indent=2))`}
+/>
+
+## Beacon timing detection
+
+<CodeBlock
+  file="beacon_timing.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# Detect periodic beaconing by analysing inter-connection intervals.
+# A C2 beacon with 60s sleep ± 10% produces intervals clustered around 54-66s.
+# Legitimate traffic is bursty and irregular.
+
+import numpy as np
+from collections import defaultdict
+
+def analyse_connections(events):
+    """
+    events: list of dicts with keys 'host', 'dest_ip', 'timestamp' (Unix epoch float)
+    Returns suspicious (host, dest_ip) pairs with beacon-like timing.
+    """
+    by_pair = defaultdict(list)
+    for ev in events:
+        key = (ev["host"], ev["dest_ip"])
+        by_pair[key].append(ev["timestamp"])
+
+    suspects = []
+    for (host, ip), times in by_pair.items():
+        if len(times) < 5:
+            continue
+
+        times.sort()
+        intervals = np.diff(times)
+
+        mean_interval = np.mean(intervals)
+        cv = np.std(intervals) / mean_interval if mean_interval > 0 else 999
+
+        # Low coefficient of variation = highly regular = beacon-like
+        # Legitimate traffic: CV > 1.0; beacons: CV < 0.15 (±5%) to 0.3 (±15%)
+        if cv < 0.30 and 20 < mean_interval < 3600:
+            suspects.append({
+                "host":          host,
+                "dest_ip":       ip,
+                "sample_count":  len(times),
+                "mean_interval_s": round(mean_interval, 1),
+                "cv":            round(cv, 3),
+                "verdict":       "BEACON" if cv < 0.10 else "SUSPECTED_BEACON"
+            })
+
+    return sorted(suspects, key=lambda x: x["cv"])`}
+/>
+
+## TTP sequencing (kill-chain correlation)
+
+<CodeBlock
+  file="ttp_sequence.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# Detect attack kill-chain sequences by correlating multiple lower-confidence events.
+# Example: LSASS access + lateral move + scheduled task creation within 30 minutes
+# on the same host = high-confidence intrusion indicator.
+
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+# Simulated alert stream (in production: pull from SIEM)
+ALERTS = [
+    {"host": "WORKSTATION-42", "type": "lsass_access",     "time": "2026-08-04T14:10:00"},
+    {"host": "WORKSTATION-42", "type": "lateral_move",     "time": "2026-08-04T14:18:00"},
+    {"host": "WORKSTATION-42", "type": "scheduled_task",   "time": "2026-08-04T14:22:00"},
+    {"host": "WORKSTATION-99", "type": "lsass_access",     "time": "2026-08-04T14:11:00"},
+]
+
+# Sequences that constitute high-confidence intrusion activity
+SEQUENCES = [
+    {
+        "name":    "Credential dump + lateral move",
+        "steps":   ["lsass_access", "lateral_move"],
+        "window":  timedelta(minutes=60),
+        "severity": "CRITICAL"
+    },
+    {
+        "name":    "Full post-exploitation chain",
+        "steps":   ["lsass_access", "lateral_move", "scheduled_task"],
+        "window":  timedelta(minutes=30),
+        "severity": "CRITICAL"
+    },
+]
+
+def parse_time(t):
+    return datetime.fromisoformat(t)
+
+def detect_sequences(alerts, sequences):
+    by_host = defaultdict(list)
+    for a in alerts:
+        by_host[a["host"]].append(a)
+
+    findings = []
+    for host, host_alerts in by_host.items():
+        host_alerts.sort(key=lambda x: x["time"])
+
+        for seq in sequences:
+            for i, alert in enumerate(host_alerts):
+                if alert["type"] != seq["steps"][0]:
+                    continue
+
+                # Try to match subsequent steps within the window
+                matched = [alert]
+                t0 = parse_time(alert["time"])
+                remaining = list(seq["steps"][1:])
+
+                for later in host_alerts[i+1:]:
+                    if not remaining:
+                        break
+                    if parse_time(later["time"]) - t0 > seq["window"]:
+                        break
+                    if later["type"] == remaining[0]:
+                        matched.append(later)
+                        remaining.pop(0)
+
+                if not remaining:
+                    findings.append({
+                        "host":      host,
+                        "sequence":  seq["name"],
+                        "severity":  seq["severity"],
+                        "events":    [m["type"] for m in matched],
+                        "start":     matched[0]["time"],
+                        "end":       matched[-1]["time"]
+                    })
+    return findings
+
+for f in detect_sequences(ALERTS, SEQUENCES):
+    print(f"[{f['severity']}] {f['host']}: {f['sequence']}")
+    print(f"  Events: {' -> '.join(f['events'])}")
+    print(f"  Window: {f['start']} - {f['end']}")`}
+/>
+
+## Baseline models by detection type
+
+| Model | What it measures | Typical alert trigger |
+|---|---|---|
+| Network baseline | Domains/IPs a process connects to | First-seen destination for known process |
+| Timing analysis | Interval coefficient of variation | CV < 0.3 for >5 connections to same IP |
+| Volume baseline | Files/commands/bytes per hour | 10× baseline volume deviation |
+| Privilege baseline | What resources a user normally accesses | Sudden AD admin group membership check |
+| Peer grouping | Compare similar hosts (same department) | Workstation behaving like a server |
+| Temporal analysis | When the entity is active | Admin access at 2 AM for day-shift user |
+
+## SIEM queries (Splunk)
+
+<CodeBlock
+  file="splunk_beacon.spl"
+  label="text"
+  lang="text"
+  class="mb-7.5"
+  code={`| index=sysmon EventCode=3
+| bin span=1h _time
+| stats count as conn_count by host, Image, DestinationIp, DestinationPort, _time
+| where conn_count > 4
+
+| streamstats window=100 count as running_count by host Image DestinationIp
+    current=false
+
+| eventstats avg(conn_count) as avg_count stdev(conn_count) as stdev_count
+    by host Image DestinationIp
+
+| eval zscore=if(stdev_count > 0, abs(conn_count - avg_count)/stdev_count, 0)
+| where zscore > 3
+
+| table _time host Image DestinationIp DestinationPort conn_count avg_count zscore
+| sort -zscore`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

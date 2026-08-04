@@ -1,0 +1,270 @@
+---
+title: Memory Forensics with Volatility 3
+mitre: T1057
+category: detection
+group: Memory Forensics
+summary: Triage a memory image to find injected code, rogue processes, and hidden artefacts using Volatility 3.
+platform: [Windows, Linux]
+tags: ['Python', 'Volatility', 'YARA']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 10 min read
+callChain: []
+detections:
+  - src: VOLATILITY
+    text: malfind plugin identifies private executable VAD regions that contain PE headers or shellcode.
+  - src: VOLATILITY
+    text: pslist / pstree / psscan cross-reference reveals DKOM-hidden processes.
+  - src: YARA
+    text: vadyarascan applies signature rules across all process VAD regions in the image.
+  - src: VOLATILITY
+    text: dlllist / ldrmodules detects memory-resident DLLs not present in the loader's linked list.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: The definitive memory artefact — MZ in private memory, PEB base mismatch.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Private RX memory without PE headers — malfind scores it differently.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1562.006
+    title: ETW Telemetry
+    desc: Complements memory forensics — ETW sees events; memory forensics sees the resulting state.
+    href: /techniques/detection/etw-telemetry
+labKit:
+  - label: Volatility 3 (vol.py)
+    href: 'https://github.com/volatilityfoundation/volatility3'
+  - label: Detonation VM profile
+    href: /toolkit
+  - label: YARA rules bundle
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Memory forensics analyses a snapshot of RAM — either a live dump or a hibernation file — to
+find artefacts that running processes and filesystem analysis cannot surface: injected code
+that was never on disk, credential material, encryption keys, and C2 configuration blobs.
+
+Volatility 3 is the reference toolkit. It works entirely from OS-specific symbols (PDB files or
+ISF JSON) rather than requiring a compiled profile, which means it works against modern Windows
+without profile-building overhead.
+
+<Callout type="note">
+  A memory image is a point-in-time snapshot. Volatile artefacts (running threads, network
+  connections, decrypted config blobs) are only visible if they existed at capture time. Capture
+  as early in the incident as possible; every reboot or process restart destroys evidence.
+</Callout>
+
+## Acquiring memory
+
+<CodeBlock
+  file="acquire.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# WinPmem — open-source, produces raw or ELF core format
+winpmem_mini_x64_rc2.exe --output memory.raw --format raw
+
+# Magnet RAM Capture — GUI-based, writes raw or AFF4
+MagnetRAMCapture.exe /accepteula /go
+
+# From a Hyper-V or VMware snapshot
+# VMware: VM -> Snapshot -> .vmem file adjacent to .vmx
+# Hyper-V: checkpoint writes .bin file in VM path
+# VirtualBox: VBoxManage debugvm \u003cVM\u003e dumpvmcore --filename memory.elf
+
+# Live dump via WinDbg kernel debugging
+.dumpdebug
+.dump /ma C:\\memory.dmp`}
+/>
+
+## Process investigation workflow
+
+<CodeBlock
+  file="workflow.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`export IMG="memory.raw"
+alias vol="python3 vol.py -f $IMG"
+
+# 1. Baseline: list all processes three ways and compare
+vol windows.pslist       > pslist.txt
+vol windows.psscan       > psscan.txt       # scans pool tags — finds hidden processes
+vol windows.pstree       > pstree.txt
+
+# Processes in psscan but not pslist = DKOM-hidden
+diff <(awk '{print $2}' pslist.txt | sort) \
+     <(awk '{print $2}' psscan.txt | sort)
+
+# 2. Check each process's loaded modules
+vol windows.dlllist --pid 1234
+
+# 3. Compare loader list vs VAD (ldrmodules finds unlisted DLLs)
+vol windows.ldrmodules --pid 1234
+
+# 4. Dump memory of a suspicious process
+vol windows.memmap --pid 1234 --dump
+vol windows.procdump --pid 1234`}
+/>
+
+## Finding injected code
+
+<CodeBlock
+  file="malfind.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# malfind: find private VAD regions with execute permission
+# that contain PE headers (MZ) or high-entropy data
+vol windows.malfind
+
+# Output columns: PID, process name, virtual address, VAD flags, hex/ASCII preview
+#
+# PID  Process     Start              End               VadTag  Protection
+# 1234 svchost.exe 0x0000019a0000000  0x0000019a000ffff VadS    PAGE_EXECUTE_READWRITE
+#      4d5a...  MZ.......  ← PE header = hollowing / reflective load
+
+# Narrow to a single process
+vol windows.malfind --pid 1234
+
+# Dump all suspicious regions for YARA scanning
+vol windows.malfind --dump --dump-dir ./suspicious/`}
+/>
+
+## Specific technique detection
+
+<CodeBlock
+  file="technique_detection.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Process hollowing: PEB ImageBaseAddress disagrees with VAD
+vol windows.cmdline                    # check command lines for anomalies
+vol windows.dlllist --pid 1234        # compare to pstree parent
+
+# Check if ImageBaseAddress in PEB matches the actual mapping
+vol windows.vadinfo --pid 1234 | grep -A3 "MEM_IMAGE"
+
+# Injected DLL (not in loader list)
+vol windows.ldrmodules --pid 1234 | grep "False"
+# False in MappedPath means loaded but not in InLoadOrder list = injection
+
+# Detect CreateRemoteThread (Sysmon EID 8 equivalent in memory)
+vol windows.handles --pid 1234 --object-type Thread
+
+# C2 beacon configuration hunting
+vol windows.vadyarascan --yara-rules rules/cobalt_beacon.yar
+
+# Find all network connections (may show C2 callback)
+vol windows.netstat
+vol windows.netscan`}
+/>
+
+## Credential hunting
+
+<CodeBlock
+  file="creds.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# LSASS credential extraction from image (offline — no PPL, no EDR)
+vol windows.lsadump       # SAM hashes, cached credentials
+vol windows.cachedump     # domain cached credentials
+vol windows.hashdump      # SAM local account hashes
+
+# Extract Kerberos tickets
+vol windows.kerberos      # dump all TGT/TGS tickets from LSASS
+
+# Mimikatz-style sekurlsa from memory image (pypykatz)
+pypykatz lsa minidump lsass.dmp
+# or from a full image:
+pypykatz lsa minidump memory.raw --target_pagefile pagefile.sys`}
+/>
+
+## Cross-referencing VADs and loader lists
+
+The Virtual Address Descriptor (VAD) tree records every allocation in a process. The PEB
+loader list (`InLoadOrderModuleList`) records every DLL the loader knows about. The gap between
+them is where injection lives:
+
+| In VAD? | In Loader list? | Meaning |
+|---|---|---|
+| Yes | Yes | Normal loaded DLL |
+| Yes | No | Manually mapped / injected / reflective load |
+| No | Yes | Impossible (would fault on access) |
+| Yes (MEM_PRIVATE) | — | Anonymous allocation — shellcode or heap |
+
+<CodeBlock
+  file="cross_ref.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# Quick cross-reference: find VAD regions that are executable
+# but not backed by a known module
+#
+# Run after: vol windows.vadinfo --pid PID > vadinfo.txt
+#           vol windows.dlllist --pid PID > dlllist.txt
+
+import re
+
+with open('vadinfo.txt') as f:
+    vad_text = f.read()
+with open('dlllist.txt') as f:
+    dll_text = f.read()
+
+dll_bases = set(re.findall(r'0x[0-9a-f]+', dll_text, re.I))
+
+for m in re.finditer(r'(0x[0-9a-f]+)\s+.*?EXECUTE.*?MEM_PRIVATE', vad_text, re.S):
+    addr = m.group(1).lower()
+    if addr not in dll_bases:
+        print(f"[!] Unlisted executable private region at {addr}")`}
+/>
+
+## Automation with a triage script
+
+<CodeBlock
+  file="triage.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`#!/usr/bin/env bash
+# Quick triage: run the most useful plugins, save to a directory
+IMG=$1
+OUT="\${IMG%.raw}_triage"
+mkdir -p "$OUT"
+
+run() { python3 vol.py -f "$IMG" $@ 2>/dev/null; }
+
+run windows.pslist      > "$OUT/pslist.txt"
+run windows.psscan      > "$OUT/psscan.txt"
+run windows.pstree      > "$OUT/pstree.txt"
+run windows.netstat     > "$OUT/netstat.txt"
+run windows.cmdline     > "$OUT/cmdline.txt"
+run windows.malfind     > "$OUT/malfind.txt"
+run windows.ldrmodules  > "$OUT/ldrmodules.txt"
+run windows.hashdump    > "$OUT/hashdump.txt"
+
+# YARA scan if rules are present
+[ -d rules/ ] && run windows.vadyarascan \
+    --yara-rules "$(ls rules/*.yar | tr '\\n' ',')" \
+    > "$OUT/yara_hits.txt"
+
+echo "[+] Triage complete: $OUT"
+grep -l "MZ" "$OUT/malfind.txt" && echo "[!] Potential injection found"`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

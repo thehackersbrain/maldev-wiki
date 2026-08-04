@@ -1,0 +1,257 @@
+---
+title: Control Flow Obfuscation
+mitre: T1027.011
+category: evasion
+group: Code Obfuscation
+summary: Restructure a binary's control flow graph to defeat static analysis and signature detection without changing its runtime behaviour.
+platform: [Windows, Linux]
+tags: ['C / C++', 'Python', 'LLVM']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: control flow flattening
+    desc: Replace structured if/else and loops with a dispatcher switch() in a top-level loop; the CFG becomes a flat star topology.
+    dll: —
+  - call: bogus control flow insertion
+    desc: Insert fake conditional branches that are always taken the same way at runtime but confuse static analysis tools.
+    dll: —
+  - call: instruction substitution
+    desc: Replace simple operations (ADD, XOR) with semantically equivalent but more complex instruction sequences.
+    dll: —
+  - call: opaque predicates
+    desc: Insert always-true or always-false conditions based on mathematical identities that a static analyser cannot determine at compile time.
+    dll: —
+detections:
+  - src: YARA
+    text: Abnormally high ratio of jmp/je/jne instructions relative to function size — control flow flattening produces characteristic dispatcher patterns.
+  - src: STATIC ANALYSIS
+    text: CFG node with high in-degree that all other nodes branch to (the dispatcher switch) is a reliable CFF indicator.
+  - src: SANDBOX
+    text: Execution traces show long chains of opaque predicate checks before reaching any meaningful API call.
+  - src: ENTROPY
+    text: Binary sections with uniformly high entropy adjacent to low-entropy .text — packed or encrypted constants used by the obfuscator.
+related:
+  - mitre: T1027
+    title: String Encryption
+    desc: Complement CFO with string encryption to remove string-based IoCs as well.
+    href: /techniques/anti-analysis/string-encryption
+  - mitre: T1027
+    title: IAT Obfuscation
+    desc: Hide the import table alongside the obfuscated code body.
+    href: /techniques/evasion/iat-obfuscation
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Full payload encryption is the most complete form of code hiding.
+    href: /techniques/loaders/shellcode-loader
+labKit:
+  - label: OLLVM (LLVM obfuscation passes)
+    href: 'https://github.com/obfuscator-llvm/obfuscator'
+  - label: Tigress C obfuscator
+    href: 'https://tigress.wtf'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Static analysis tools — disassemblers, decompilers, YARA scanners — work by recognising patterns in a binary's structure: function prologues, loop constructs, API call sequences, string literals. Control flow obfuscation (CFO) disrupts these patterns by transforming the binary's control flow graph (CFG) into a form that is semantically equivalent but structurally unrecognisable.
+
+The three primary transforms are:
+
+1. **Control flow flattening (CFF)**: Decomposes every function into a set of basic blocks dispatched by a switch statement in an infinite loop. The CFG changes from a structured tree to a flat star. Decompilers produce incomprehensible output; YARA patterns that rely on sequential API call order break.
+
+2. **Bogus control flow (BCF)**: Inserts fake branches that are taken consistently at runtime but cannot be resolved by static analysis alone.
+
+3. **Opaque predicates**: Adds conditions based on mathematical identities (e.g., `(x*x + x) % 2 == 0` is always true) that a symbolic executor cannot simplify without expensive constraint solving.
+
+<Callout type="note">
+  Control flow obfuscation significantly increases binary size and reduces runtime performance.
+  CFF in particular can increase code size 3–10× and introduce significant overhead in tight loops.
+  Apply selectively — obfuscate only the sensitive code paths (key derivation, anti-analysis checks,
+  shellcode decryption), not the entire binary.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Manual control flow flattening (C)
+
+<CodeBlock
+  file="cff_example.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Original function (unobfuscated):
+//   if (check_a()) { do_b(); do_c(); }
+//   else { do_d(); }
+//
+// After CFF, the same function becomes:
+
+BOOL obfuscated_fn(void) {
+    int state = 0x3F1A;  // initial dispatch state (obfuscated initial value)
+    BOOL result = FALSE;
+
+    while (1) {
+        switch (state) {
+        case 0x3F1A:  // entry
+            state = check_a() ? 0xB2C4 : 0x9D7E;
+            break;
+
+        case 0xB2C4:  // path A: do_b
+            do_b();
+            state = 0x4A11;
+            break;
+
+        case 0x4A11:  // path A continued: do_c
+            do_c();
+            state = 0xFFFF;
+            result = TRUE;
+            break;
+
+        case 0x9D7E:  // path B: do_d
+            do_d();
+            state = 0xFFFF;
+            result = FALSE;
+            break;
+
+        case 0xFFFF:  // exit
+            return result;
+
+        default:      // unreachable — confuses decompilers
+            __assume(0);
+        }
+    }
+}
+
+// A static analyser sees a function that jumps between states in a loop.
+// The original if/else structure is invisible. The CFG is a flat star
+// with the switch as the hub, not a tree with branches.`}
+/>
+
+### Opaque predicate insertion
+
+<CodeBlock
+  file="opaque.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Opaque predicate: (n * (n + 1)) % 2 is always 0 (n*(n+1) is always even)
+// A static analyser cannot determine this without symbolic execution.
+static BOOL always_true(UINT n) {
+    return (n * (n + 1)) % 2 == 0;
+}
+
+// Opaque predicate: 7 * x^2 - 1 is never divisible by 3 for any x
+// (proven by checking x mod 3 = 0,1,2 all yield remainder 2 when divided by 3)
+static BOOL never_divisible_by_3(UINT x) {
+    return (7 * x * x - 1) % 3 != 0;
+}
+
+// Usage: insert dead code branches that appear conditional but are not
+void sensitive_function(void) {
+    UINT r = GetTickCount();  // runtime value — prevents constant folding
+
+    if (always_true(r)) {
+        // Real code
+        decrypt_payload();
+    } else {
+        // Dead code — inserted to confuse static analysis
+        // Can also hold a second payload that only runs if the predicate were false
+        ExitProcess(0);
+    }
+}`}
+/>
+
+### LLVM obfuscation pass usage (OLLVM / Hikari)
+
+<CodeBlock
+  file="ollvm_build.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Build with OLLVM (https://github.com/obfuscator-llvm/obfuscator)
+# Hikari is the maintained fork for modern LLVM versions
+# (https://github.com/HikariObfuscator/Hikari)
+
+# Flags:
+#   -mllvm -enable-cff     : control flow flattening
+#   -mllvm -enable-bcf     : bogus control flow
+#   -mllvm -enable-sub     : instruction substitution
+#   -mllvm -enable-indibran: indirect branching
+
+clang -mllvm -enable-cff \
+      -mllvm -enable-bcf \
+      -mllvm -bcf_prob=50 \
+      -mllvm -enable-sub \
+      -O1 \
+      -o implant_obf implant.c
+
+# Note: -O0 can cause issues with OLLVM; use -O1 minimum
+# Higher optimisation levels may undo some obfuscation transforms`}
+/>
+
+### Entropy measurement (before/after comparison)
+
+<CodeBlock
+  file="measure_entropy.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import math, struct
+
+def entropy(data):
+    if not data: return 0
+    freq = [0]*256
+    for b in data: freq[b] += 1
+    n = len(data)
+    return -sum((f/n)*math.log2(f/n) for f in freq if f)
+
+def section_entropy(pe_path):
+    import pefile
+    pe = pefile.PE(pe_path)
+    for s in pe.sections:
+        name = s.Name.decode().strip('\x00')
+        data = s.get_data()
+        print(f"  {name:10s}  entropy={entropy(data):.3f}  size={len(data)}")
+
+print("=== Before obfuscation ===")
+section_entropy("implant.exe")
+print("=== After obfuscation ===")
+section_entropy("implant_obf.exe")`}
+/>
+
+## Transform effectiveness comparison
+
+| Transform | CFG disruption | Performance cost | Binary size increase | Detectable? |
+|---|---|---|---|---|
+| Control flow flattening | High | High (10–30%) | 3–5× | Yes (dispatcher pattern) |
+| Bogus control flow | Moderate | Low (1–5%) | 1.5–2× | Partially |
+| Opaque predicates | Low | Negligible | Minimal | Rarely |
+| Instruction substitution | Low | Negligible | 1.1× | Rarely |
+| Combined all four | Very high | High (15–40%) | 4–8× | Harder |
+
+CFF alone is the most impactful transform for defeating automated analysis tools. Combined with instruction substitution and opaque predicates, decompiler output becomes nearly human-unreadable without significant manual effort.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Triage-level detection: any binary with a `.text` section where >60% of instructions are unconditional jumps (`jmp`, `je`, `jne`) is likely CFF-obfuscated. IDA Pro and Ghidra plugins exist specifically to de-flatten CFF output (ld-covrecurse, d810, D-810). These tools recover the original CFG by solving for the dispatcher state variable.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

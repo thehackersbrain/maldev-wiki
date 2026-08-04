@@ -1,0 +1,220 @@
+---
+title: Timing-Based Evasion
+mitre: T1497.003
+category: anti-analysis
+group: Environment Checks
+summary: Use elapsed-time or CPU-cycle measurements to detect single-stepping, sleep acceleration, and sandboxes.
+platform: [Windows, Linux]
+tags: ['C / C++', 'ASM', 'RDTSC']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: RDTSC before a block
+    desc: Read the time-stamp counter to establish a baseline cycle count.
+    dll: —
+  - call: execute the measured block
+    desc: The block can be a NOP sled, a CPUID, or any short sequence.
+    dll: —
+  - call: RDTSC after the block
+    desc: Compute the delta. Normal execution is tens to hundreds of cycles; a debugger single-stepping inflates this to millions.
+    dll: —
+  - call: GetTickCount before Sleep(n)
+    desc: Measure wall time to detect sleep acceleration — sandbox skips the delay but returns the wrong tick count.
+    dll: kernel32
+  - call: QueryPerformanceCounter (QPC) delta
+    desc: High-resolution wall clock; compare against RDTSC to detect cycle-count virtualisation.
+    dll: kernel32
+detections:
+  - src: YARA
+    text: RDTSC (0F 31) instructions followed by a CMP/JMP — classic timing check pattern.
+  - src: SANDBOX
+    text: Instrument RDTSC to return a monotonically advancing counter that matches real elapsed time; patch CMP thresholds to always pass.
+  - src: BEHAVIOURAL
+    text: Process that exits cleanly without performing any network or file activity — timing check decided to abort.
+related:
+  - mitre: T1497
+    title: Sandbox Detection
+    desc: Environment checks that use attributes other than timing.
+    href: /techniques/anti-analysis/sandbox-detection
+  - mitre: T1622
+    title: Anti-Debugging
+    desc: Timing checks overlap with anti-debug — RDTSC detects both single-step and hypervisor overhead.
+    href: /techniques/anti-analysis/anti-debug
+labKit:
+  - label: timing_checks.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Timing checks exploit the fact that analysis tools — debuggers, emulators, and sandbox
+accelerators — change the relationship between elapsed time and CPU cycles. A debugger
+single-steps through instructions, dramatically increasing the cycle count per code path. A
+sandbox may accelerate `Sleep` calls to avoid waiting, causing the measured wall time to diverge
+from what `GetTickCount` returns.
+
+None of these timing signals are conclusive on their own. Hypervisors can virtualise RDTSC.
+Sandboxes can patch `GetTickCount` to lie. But combining multiple orthogonal time sources makes
+comprehensive neutralisation expensive.
+
+<Callout type="note">
+  On bare-metal hardware without a hypervisor, RDTSC is the most reliable timing primitive.
+  Inside any virtualised environment, the hypervisor can intercept RDTSC and return a synthetic
+  value. The check still catches many sandboxes that do not implement RDTSC emulation.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+<CodeBlock
+  file="timing_checks.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <intrin.h>
+
+// 1. RDTSC single-step detection
+// Normal execution: delta < 500 cycles
+// Debugger single-step: delta > 100,000 cycles
+static BOOL rdtsc_single_step(void) {
+    UINT64 t1 = __rdtsc();
+    // force serialisation so the CPU doesn't reorder
+    int cpuid_regs[4];
+    __cpuid(cpuid_regs, 0);
+    UINT64 t2 = __rdtsc();
+    return (t2 - t1) > 500;
+}
+
+// 2. Sleep acceleration detection
+// Ask for 2 seconds; sandboxes often skip to milliseconds
+static BOOL sleep_accelerated(void) {
+    DWORD t1 = GetTickCount();
+    Sleep(2000);
+    DWORD elapsed = GetTickCount() - t1;
+    // If elapsed < 1500ms, the sandbox compressed the sleep
+    return elapsed < 1500;
+}
+
+// 3. QPC vs RDTSC divergence
+// In a virtualised environment, these may advance at different rates
+static BOOL qpc_rdtsc_diverge(void) {
+    LARGE_INTEGER freq, q1, q2;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&q1);
+    UINT64 r1 = __rdtsc();
+    Sleep(100);
+    QueryPerformanceCounter(&q2);
+    UINT64 r2 = __rdtsc();
+
+    // expected TSC ticks = QPC_delta * TSC_freq / QPC_freq
+    // large divergence suggests emulated RDTSC
+    double qpc_sec = (double)(q2.QuadPart - q1.QuadPart) / freq.QuadPart;
+    double rdtsc_cycles = (double)(r2 - r1);
+    // on a 3GHz CPU, 100ms ~ 300M cycles
+    // a sandbox returning 0 or very small RDTSC delta is suspicious
+    return rdtsc_cycles < 1000000;   // < 1M cycles for 100ms = suspicious
+}
+
+// 4. GetTickCount vs FILETIME comparison
+static BOOL tickcount_filetime_diverge(void) {
+    DWORD  tc  = GetTickCount();
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER ul;
+    ul.LowPart  = ft.dwLowDateTime;
+    ul.HighPart = ft.dwHighDateTime;
+    // FILETIME is 100-nanosecond intervals since 1601; convert to ms since boot
+    // This is a rough check — the key is that both should advance together
+    // A sandbox patching GetTickCount but not GetSystemTimeAsFileTime will diverge
+    (void)tc; (void)ul;
+    return FALSE;   // left as exercise; compare over two samples
+}
+
+BOOL timing_evasion_detected(void) {
+    return rdtsc_single_step()   ||
+           sleep_accelerated()   ||
+           qpc_rdtsc_diverge();
+}`}
+/>
+
+## Comparing timing sources
+
+| Source | Win API | Resolution | Virtualised by sandbox? |
+|---|---|---|---|
+| TSC | RDTSC instruction | ~1 cycle | Sometimes (KVM, VMware) |
+| QPC | `QueryPerformanceCounter` | ~100ns | Usually no |
+| GetTickCount | `GetTickCount` | ~15ms | Often patched |
+| System time | `GetSystemTimeAsFileTime` | 100ns intervals | Rarely patched |
+| HPET / PM timer | indirect via QPC | ~1µs | Rarely virtualised |
+
+A sandbox that patches `GetTickCount` to return accelerated values but does not also patch
+`GetSystemTimeAsFileTime` and `QueryPerformanceCounter` will diverge when compared. That
+divergence is the detection signal.
+
+## Inline assembly variant (MASM / GAS)
+
+<CodeBlock
+  file="rdtsc_check.asm"
+  label="ASM"
+  lang="asm"
+  class="mb-7.5"
+  code={`; Inline RDTSC timing check — position-independent, no imports
+;
+; Returns ZF=1 (JZ taken) if analysis environment detected
+check_timing PROC
+    cpuid                          ; serialise before first rdtsc
+    rdtsc
+    mov   ecx, eax                 ; save low 32 bits
+    cpuid                          ; serialise between readings
+    rdtsc
+    sub   eax, ecx                 ; delta in eax
+    cmp   eax, 500                 ; normal < 500 cycles
+    jg    analysis_detected        ; if > 500 → debugger / emulator
+    xor   eax, eax                 ; clean exit
+    ret
+analysis_detected:
+    mov   eax, 1
+    ret
+check_timing ENDP`}
+/>
+
+## Sandbox bypass for timing checks
+
+Modern hardened sandboxes address timing in several ways:
+
+| Sandbox technique | Effectiveness |
+|---|---|
+| RDTSC emulation returning real elapsed time | Defeats most RDTSC checks |
+| Patching Sleep to skip but fix GetTickCount | Defeats simple sleep checks |
+| Accurate QPC emulation | Defeats QPC checks |
+| High-CPU-load emulation (runs at full speed) | Defeats cycle-count checks |
+| Running on real hardware (bare-metal sandbox) | Defeats all virtualisation-based checks |
+
+Bare-metal sandboxes (Cuckoo running on physical iron) defeat virtually all timing checks.
+They are expensive to operate at scale, so most automated detonation still uses virtualisation.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Timing checks leave no file artefact and generate no network traffic. The detectable signal is
+the behaviour they cause: a process that performs environment checks and then exits cleanly is
+more suspicious than one that simply crashes. Log all process exits with a clean code (0) and
+no subsequent parent activity.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

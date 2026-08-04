@@ -1,0 +1,237 @@
+---
+title: Call Stack Spoofing
+mitre: T1036.005
+category: evasion
+group: Memory Evasion
+summary: Fabricate a plausible-looking call stack to hide the true origin of API calls made from shellcode or an injected beacon.
+platform: [Windows]
+tags: ['C / C++', 'ASM', 'x64']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: identify return addresses to spoof
+    desc: Walk the current call stack; determine which frames expose shellcode or unbacked memory addresses.
+    dll: —
+  - call: allocate a synthetic frame chain
+    desc: Build a chain of fake return addresses pointing to legitimate DLL code (ntdll, kernel32, clr).
+    dll: kernel32
+  - call: overwrite return addresses on the real stack
+    desc: Before calling a sensitive API, replace the return addresses in the current thread's stack frames with the spoofed chain.
+    dll: —
+  - call: execute the target API
+    desc: The API executes; any stack walker (ETW-TI, AV, EDR) sees only legitimate-looking frames.
+    dll: —
+  - call: restore original return addresses
+    desc: After the API returns, restore the real return addresses so execution continues correctly.
+    dll: —
+detections:
+  - src: ETW-TI
+    text: Call stack frames that have no corresponding module on disk, or frames pointing into RWX/private memory.
+  - src: MEMORY SCAN
+    text: Stack memory containing sequences of addresses that resolve to mid-function gadget locations (not function prologues).
+  - src: BEHAVIOURAL
+    text: Thread whose stack consistently shows only ntdll/kernel32 frames regardless of what the thread is doing.
+  - src: KERNEL
+    text: PsSetLoadImageNotifyRoutine callbacks can correlate image load events with call stacks — unbacked frames stand out.
+related:
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Stack spoofing is most valuable when the shellcode is running in a hollowed or injected context.
+    href: /techniques/injection/process-hollowing
+  - mitre: T1027.007
+    title: Heap Encryption
+    desc: Complement stack spoofing with heap encryption during sleep to minimise in-memory exposure.
+    href: /techniques/evasion/heap-encryption
+  - mitre: T1055.001
+    title: Thread Execution Hijacking
+    desc: Hijack a legitimate thread to inherit its existing call stack context.
+    href: /techniques/injection/thread-execution-hijacking
+labKit:
+  - label: SilentMoonwalk (synthetic frames)
+    href: 'https://github.com/klezVirus/SilentMoonwalk'
+  - label: AceLdr (integrated spoofer)
+    href: 'https://github.com/kyleavery/AceLdr'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Every thread keeps its execution history on the stack: each function call pushes a return address pointing to the caller's code. EDRs use `RtlCaptureStackBackTrace` (or the kernel equivalent) to walk these frames and determine *where* a suspicious API call originated. If the return chain leads back to a region of private, non-backed memory, the call is flagged — this is how many EDRs catch beacon sleep callbacks and shellcode stagers.
+
+Call stack spoofing replaces the real return addresses with plausible frames inside legitimate DLLs before making the sensitive API call, then restores them after. The stack walker sees a story that starts in `ntdll!NtWaitForSingleObject`, passes through `kernel32!SleepEx`, and ends somewhere reasonable — even if the real execution path starts from a heap allocation.
+
+<Callout type="note">
+  Stack spoofing is an arms race. Modern EDRs validate that return addresses point to function
+  prologues (not arbitrary gadgets) and cross-reference them against PEB module lists. A spoofer
+  that places frames at random offsets inside DLLs is detectable. Effective spoofing requires
+  frames that look like real call sites — mid-function, with correct RSP alignment, and with
+  plausible parameter values in the right registers.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Simple return address overwrite (conceptual)
+
+<CodeBlock
+  file="stack_spoof_simple.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// Find a ret gadget inside a known DLL for the fake return address
+static PVOID find_ret_gadget(const char *dll_name) {
+    HMODULE mod = GetModuleHandleA(dll_name);
+    if (!mod) return NULL;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)mod;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)((BYTE*)mod + dos->e_lfanew);
+    DWORD text_rva = nt->OptionalHeader.BaseOfCode;
+    DWORD text_sz  = nt->OptionalHeader.SizeOfCode;
+    BYTE *text     = (BYTE*)mod + text_rva;
+
+    for (DWORD i = 0; i < text_sz - 1; i++) {
+        if (text[i] == 0xC3) {  // RET
+            return text + i;
+        }
+    }
+    return NULL;
+}
+
+// Spoof the return address of the current function
+// WARNING: simplified — real implementation needs RSP alignment + frame setup
+void spoof_and_sleep(DWORD ms) {
+    PVOID gadget = find_ret_gadget("ntdll.dll");
+    if (!gadget) { Sleep(ms); return; }
+
+    // Get current RSP and patch the return address two frames up
+    volatile PVOID *frame;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(frame));
+
+    PVOID real_ret = frame[1];
+    frame[1] = gadget;
+    Sleep(ms);
+    frame[1] = real_ret;
+}`}
+/>
+
+### SilentMoonwalk-style synthetic frame chain
+
+<CodeBlock
+  file="synthetic_frames.asm"
+  label="ASM"
+  lang="nasm"
+  class="mb-7.5"
+  code={`; Synthetic call stack using a trampoline gadget
+; The trampoline is placed inside ntdll.dll code range and issues a call
+; to the real target function, making the call site appear legitimate.
+;
+; Stack layout when the spoofed API sees it:
+;   [RSP+0x00]  -> ntdll gadget (appears as caller)
+;   [RSP+0x08]  -> kernel32!BaseThreadInitThunk+0x14 (chain frame 1)
+;   [RSP+0x10]  -> ntdll!RtlUserThreadStart+0x21    (chain frame 2)
+;   [RSP+0x18]  -> 0 (thread base)
+;
+; The gadget itself does:
+;   push rbp          ; set up a frame so the unwinder is satisfied
+;   mov  rbp, rsp
+;   call [target_fn]  ; call the real Sleep/NtWaitForSingleObject/etc.
+;   pop  rbp
+;   ret               ; unwind back to chain frame 1
+
+spoof_trampoline:
+    push rbp
+    mov  rbp, rsp
+    ; RSP is 16-byte aligned here
+    call qword [rel target_fn_ptr]
+    pop  rbp
+    ret
+
+target_fn_ptr: dq 0  ; filled in at runtime with address of Sleep etc.`}
+/>
+
+### Gadget validation (avoid mid-instruction bytes)
+
+<CodeBlock
+  file="validate_gadget.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+// A valid spoofed frame points to the byte AFTER a CALL instruction in a legit function.
+// Naive byte scan can land inside a multi-byte encoding — use the PDB or exception directory.
+static BOOL is_valid_call_site(PVOID addr) {
+    BYTE *p = (BYTE*)addr;
+    // Check the two bytes before the return address for CALL patterns:
+    //   0xFF 0xD0  = CALL RAX
+    //   0xFF 0xD3  = CALL RBX
+    //   0xE8 xx xx xx xx = CALL rel32
+    if (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0) return TRUE;
+    if (p[-5] == 0xE8)                            return TRUE;
+    return FALSE;
+}
+
+PVOID find_call_site(const char *dll, const char *fn_hint) {
+    HMODULE mod = GetModuleHandleA(dll);
+    BYTE *base  = (BYTE*)mod;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    BYTE *text = base + nt->OptionalHeader.BaseOfCode;
+    DWORD sz   = nt->OptionalHeader.SizeOfCode;
+
+    for (DWORD i = 5; i < sz; i++) {
+        PVOID candidate = text + i;
+        if (is_valid_call_site(candidate))
+            return candidate;
+    }
+    return NULL;
+}`}
+/>
+
+## Frame chain anatomy
+
+A valid synthetic frame chain needs to satisfy the Windows x64 unwinder. Each frame must have:
+
+| Requirement | Why it matters |
+|---|---|
+| RSP 16-byte aligned at CALL boundary | ABI requirement; misalignment causes immediate crash |
+| Return address points after a CALL instruction | Unwinder validates this during exception handling |
+| Frame is inside a module listed in PEB | EDRs cross-check addresses against loaded module ranges |
+| Frame points to a function with PDATA entry | Structured exception handling traversal requires RUNTIME_FUNCTION records |
+
+The most robust approach uses a copy of a real function's prologue (e.g., `ntdll!RtlUserThreadStart`) as the spoofed frame and patches the first CALL target to reach the actual API.
+
+## Published implementations
+
+| Tool | Technique | Notes |
+|---|---|---|
+| SilentMoonwalk | Full synthetic stack | Builds entire frame chain; validates unwinder compatibility |
+| AceLdr | Integrated BOF spoofer | Hooks Sleep for Cobalt Strike; restores after wake |
+| Unwinder | Exception-table-aware | Cross-references PDATA to avoid invalid frames |
+| VulcanRaven | Indirect syscall spoofer | Combines with direct syscalls for deeper evasion |
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+The most reliable counter is kernel-level stack capture during thread scheduling events (ETW-TI `THREAT_INTEL_PSSetCreateThreadNotify`). This fires on every context switch, making it expensive for EDRs to evaluate, but impossible to spoof without kernel privileges.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

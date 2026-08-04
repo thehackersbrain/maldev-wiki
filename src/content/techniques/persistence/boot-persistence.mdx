@@ -1,0 +1,248 @@
+---
+title: Bootkit Persistence
+mitre: T1542.003
+category: persistence
+group: Pre-OS Boot
+summary: Implant malicious code in the Master Boot Record or UEFI firmware to survive OS reinstallation and persist below the operating system.
+platform: [Windows, Linux]
+tags: ['C / C++', 'ASM', 'UEFI']
+updated: '2026-08-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: gain kernel-level access
+    desc: Bootkit installation requires a kernel driver, physical access, or pre-boot exploitation — user-mode access is insufficient.
+    dll: —
+  - call: read and modify the MBR or VBR
+    desc: The MBR (sector 0) or the Volume Boot Record of the active partition is read, modified to include the malicious loader, and written back.
+    dll: ntdll (IoControlCode to disk device)
+  - call: store second-stage payload
+    desc: Hide the next-stage loader in unused sectors, a fake partition entry, or the file slack space — outside the visible filesystem.
+    dll: —
+  - call: BIOS/UEFI loads the infected MBR
+    desc: On each boot, the firmware loads the MBR into 0x7C00 and executes it. The modified MBR runs the malicious stage before the OS loader.
+    dll: —
+  - call: patch the OS kernel during load
+    desc: The bootkit intercepts the Windows kernel load (ntoskrnl.exe), patching DSE (Driver Signature Enforcement) or PatchGuard before executing.
+    dll: —
+detections:
+  - src: WINDOWS EID 7043
+    text: Boot device is not the expected configuration — UEFI Secure Boot violations generate platform log entries.
+  - src: MEMORY FORENSICS
+    text: Physical memory dump from firmware (UEFI shell) reveals malicious code at 0x7C00 or in SMRAM.
+  - src: BEHAVIOURAL
+    text: Disk sector 0 content hash changes after a boot cycle — monitor with a Tripwire-equivalent on the raw disk.
+  - src: UEFI FIRMWARE
+    text: Secure Boot policy violations logged to UEFI variable store; measured boot (TPM PCR values) change after infection.
+related:
+  - mitre: T1542.001
+    title: System Firmware
+    desc: UEFI-level implants persist above even disk-level bootkits.
+  - mitre: T1014
+    title: Rootkit
+    desc: OS-level rootkits are deployed by the bootkit after the kernel loads.
+  - mitre: T1543.003
+    title: Service Creation
+    desc: Bootkits often install a kernel driver via service creation once OS is running.
+    href: /techniques/persistence/service-creation
+labKit:
+  - label: Bootkitty (first UEFI bootkit PoC for Linux, 2024)
+    href: 'https://www.welivesecurity.com/en/eset-research/bootkitty-analyzing-first-uefi-bootkit-linux/'
+  - label: BootSector (legacy MBR analysis)
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A bootkit is malicious code that executes **before the operating system**, at the firmware or bootloader stage. Because it runs before the OS kernel, it can patch the kernel during load, disable security features (Driver Signature Enforcement, PatchGuard, Secure Boot checks), and establish persistence that survives OS reinstallation — only a disk wipe or firmware reflash removes it.
+
+Modern bootkits target one of three layers:
+- **MBR (Master Boot Record)**: Sector 0 on legacy BIOS systems. Executed by the BIOS before the OS bootloader.
+- **VBR (Volume Boot Record)**: The first sector of the active partition; executed by the MBR on Windows systems.
+- **UEFI firmware modules**: DXE or PEI modules implanted directly in flash storage, executed by the firmware before any disk access.
+
+Historical examples include Stoned Bootkit (2009), TDL4/Alureon (2011), and the more recent Bootkit.UEFI.ESPecter (2021) and BlackLotus (2022-2023), the first in-the-wild UEFI bootkit that bypassed Secure Boot on Windows 11.
+
+<Callout type="caution">
+  Bootkit installation is a high-impact, potentially irreversible operation. Writing incorrect
+  data to the MBR can make a system unbootable. On lab systems without Secure Boot, UEFI
+  firmware modification carries the risk of bricking the hardware. All testing must be performed
+  on isolated, backed-up systems with no production data.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+### Read and analyse the existing MBR
+
+<CodeBlock
+  file="read_mbr.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+#include <stdio.h>
+
+// Read the first 512 bytes (MBR) from the physical disk
+// Requires Administrator + SeBackupPrivilege or direct physical disk access
+BOOL read_mbr(BYTE mbr[512]) {
+    // Open the physical disk (requires elevated privileges)
+    HANDLE disk = CreateFileA(
+        "\\\\.\\PhysicalDrive0",
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, 0, NULL);
+
+    if (disk == INVALID_HANDLE_VALUE) return FALSE;
+
+    DWORD read;
+    BOOL ok = ReadFile(disk, mbr, 512, &read, NULL);
+    CloseHandle(disk);
+    return ok && read == 512;
+}
+
+void analyse_mbr(const BYTE *mbr) {
+    // Check MBR signature (last 2 bytes should be 0x55 0xAA)
+    printf("MBR signature: %02X %02X %s\n",
+        mbr[510], mbr[511],
+        (mbr[510] == 0x55 && mbr[511] == 0xAA) ? "(valid)" : "(INVALID)");
+
+    // Check for known bootkit indicators
+    // TDL4 signature at offset 0x000
+    if (memcmp(mbr, "\xEB\x5A\x90", 3) == 0)
+        printf("[!] Possible TDL4 bootkit signature detected\n");
+
+    // Print partition table (starts at offset 0x1BE)
+    printf("\nPartition table:\n");
+    for (int i = 0; i < 4; i++) {
+        const BYTE *entry = mbr + 0x1BE + (i * 16);
+        printf("  [%d] Status: %02X Type: %02X LBA: %u Sectors: %u\n",
+            i, entry[0], entry[4],
+            *(DWORD*)(entry + 8), *(DWORD*)(entry + 12));
+    }
+}`}
+/>
+
+### MBR hook concept (educational, x86 real-mode ASM)
+
+<CodeBlock
+  file="mbr_hook.asm"
+  label="ASM"
+  lang="nasm"
+  class="mb-7.5"
+  code={`; Minimal MBR hook concept — loads at 0x7C00 in real mode
+; Relocates original MBR and redirects boot
+; THIS IS A CONCEPTUAL EXAMPLE — do not run on production hardware
+
+BITS 16
+ORG 0x7C00
+
+start:
+    ; Disable interrupts during setup
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+
+    ; Save the original MBR elsewhere in memory
+    mov si, 0x7C00
+    mov di, 0x0600        ; copy original MBR to 0x0600
+    mov cx, 512
+    rep movsb
+
+    ; Load our second-stage from hidden sectors
+    ; Int 0x13 extended read: read 1 sector from LBA 62 (hidden track)
+    mov ah, 0x42
+    xor dl, dl            ; drive 0x80 (first HDD)
+    or  dl, 0x80
+    mov si, disk_packet
+    int 0x13
+
+    ; Jump to second stage at 0x8000
+    jmp 0x0000:0x8000
+
+disk_packet:
+    db 0x10               ; packet size
+    db 0x00               ; reserved
+    dw 0x0001             ; sectors to read
+    dw 0x8000             ; destination offset
+    dw 0x0000             ; destination segment
+    dq 0x0000003E         ; LBA 62 (hidden sector)
+
+; Pad to 510 bytes, add boot signature
+times 510-($-$$) db 0
+dw 0xAA55`}
+/>
+
+### UEFI Secure Boot bypass context (BlackLotus technique overview)
+
+<CodeBlock
+  file="secure_boot_notes.txt"
+  label="text"
+  lang="text"
+  class="mb-7.5"
+  code={`BlackLotus (CVE-2022-21894 "Baton Drop") — Key technique summary:
+
+1. VULNERABILITY: Windows Boot Manager (bootmgfw.efi) had a flaw
+   allowing unsigned UEFI applications to be executed even with
+   Secure Boot enabled, by exploiting the revocation check.
+
+2. MECHANISM:
+   a. Drop a vulnerable (unpatched) copy of bootmgfw.efi that is
+      still signed but contains the unpatched vulnerability.
+   b. The UEFI firmware accepts it because it has a valid Microsoft signature.
+   c. The vulnerable bootmgfw.efi executes the malicious bootkit DXE driver.
+   d. The DXE driver patches the Secure Boot validation in memory,
+      allowing arbitrary unsigned EFI modules to load.
+
+3. PERSISTENCE: Once installed, the bootkit survives:
+   - OS reinstallation
+   - Secure Boot key rotation (if UEFI flash is not updated)
+   - Standard AV/EDR removal
+
+4. MITIGATION:
+   - Apply KB5025885 (Windows Secure Boot DBX update, May 2023)
+   - Ensure UEFI firmware is updated to reject the vulnerable bootmgfw.efi
+   - Enable Secured-core PC features (HVCI, Secure Boot, TPM 2.0)
+
+5. DETECTION:
+   - UEFI Secure Boot violation events in Windows event log
+   - TPM PCR[4] change (measures the boot loader)
+   - bootmgfw.efi hash mismatch against Microsoft's known-good hash`}
+/>
+
+## Persistence survival matrix
+
+| Attack action | MBR bootkit | UEFI firmware bootkit |
+|---|---|---|
+| Malware removal tool | Survives | Survives |
+| OS reinstall (keep drive) | Survives | Survives |
+| OS reinstall (format drive) | Removed | Survives |
+| Drive replacement | Removed | Survives |
+| Firmware reflash | Survives | Removed |
+| Hardware replacement | Removed | Removed |
+
+UEFI firmware bootkits (implanted in SPI flash) are effectively permanent without manufacturer-level firmware reflashing — a capability most enterprise incident responders do not have.
+
+## Detection
+
+<DetectionGrid items={frontmatter.detections} />
+
+**Measured boot** (TPM 2.0 + Windows Defender System Guard) records a hash of every boot component in TPM PCR registers. If any boot component changes — including the MBR, VBR, or bootloader — the PCR value changes and can be compared against a baseline. This is the primary enterprise-grade detection mechanism for bootkit persistence.
+
+**Secure Boot** prevents execution of unsigned or revoked boot code — but only if the firmware is updated to include the revocation entries for known-vulnerable signed components (as BlackLotus demonstrated).
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />
