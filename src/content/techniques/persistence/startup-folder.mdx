@@ -1,0 +1,154 @@
+---
+title: Startup Folder
+mitre: T1547.001
+category: persistence
+group: Boot / Logon Autostart
+summary: Drop an executable in a user or common Startup folder so the shell runs it at every logon.
+platform: [Windows]
+tags: ['File System', 'PowerShell', 'Shortcut']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: Pick the startup location
+    desc: Per-user APPDATA Startup (user write) or the common ProgramData Startup (admin).
+    dll: '-'
+  - call: Drop the payload
+    desc: Write an .exe, .lnk or script into the folder; an .lnk can point anywhere.
+    dll: kernel32
+  - call: Logon triggers the shell
+    desc: Explorer enumerates the folder at logon and launches each item it finds.
+    dll: '-'
+  - call: Payload runs as the user
+    desc: The dropped item executes in the logged-on user's context on every logon.
+    dll: '-'
+detections:
+  - src: SYSMON EID 11
+    text: A file created in a Startup folder by a non-interactive or unexpected parent process.
+  - src: SYSMON EID 1
+    text: A process with an image path under a Startup folder and parent explorer.exe at logon.
+  - src: EDR
+    text: A new .lnk or executable in a startup directory whose target is temp, public or OneDrive.
+  - src: BEHAVIOURAL
+    text: A startup-folder process appearing within seconds of a logon, consistently across sessions.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: The registry-based sibling - a Run value instead of a folder, same logon trigger.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1053.005
+    title: Scheduled Tasks
+    desc: Time- or logon-triggered via the task scheduler instead of the shell.
+    href: /techniques/persistence/scheduled-tasks
+  - mitre: T1547.009
+    title: LNK Hijacking
+    desc: Abuses the same .lnk files the startup folder holds, but hijacks an existing one.
+    href: /techniques/persistence/lnk-hijacking
+  - mitre: T1542.003
+    title: Boot Persistence
+    desc: Broader boot-time persistence; the startup folder is the per-logon, user-facing slice.
+    href: /techniques/persistence/boot-persistence
+labKit:
+  - label: Startup persistence drop script
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+The Startup folder is one of the oldest and simplest persistence mechanisms on Windows. When a
+user completes an interactive logon, the shell - `explorer.exe` - enumerates the Startup folder
+and launches whatever it finds there. Drop an executable, a shortcut, or a script into the right
+folder and it runs automatically on the next logon, with no service, no registry run key, and
+no scheduler entry. It is a [registry run key](/techniques/persistence/registry-run-keys) with
+the registry replaced by a folder.
+
+There are two folders that matter. The per-user Startup folder can be written by that user with
+no elevation, so it is the default for user-context implants. The common Startup folder applies
+to every user on the machine and needs administrative write, so it is the choice when the implant
+must run regardless of who logs in. Both are plain files on disk, which is what makes the
+technique trivial to deploy and trivial to spot.
+
+<Callout type="note">
+  A shortcut (`.lnk`) in the Startup folder is the more interesting drop. The file the shell
+  launches is the `.lnk`, but it points at whatever the attacker chose - a payload in `temp`, a
+  remote SMB path, a script engine. The file on disk in the Startup folder is a small, innocent
+  stub; the payload it runs can be anywhere.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+Two locations, two privilege levels. The drop is a single file write.
+
+| Location | Scope | Write needed |
+|----------|-------|--------------|
+| `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` | Current user | User |
+| `C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup` | All users | Admin |
+
+The practical drop below writes a shortcut so the payload can live outside the folder entirely.
+
+<CodeBlock
+  file="startup_drop.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# common startup folder - runs for every user who logs on
+$startup = '\\\\?\\C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup'
+# payload hides outside the folder
+$payload = '$env:TEMP\\.u\\svc.exe'
+
+$sh = New-Object -ComObject WScript.Shell
+$lnk = $sh.CreateShortcut("$startup\\svc.lnk")
+$lnk.TargetPath = $payload
+$lnk.WorkingDirectory = $env:TEMP
+$lnk.Description = ''
+$lnk.Save()
+# on the next logon, explorer.exe launches svc.lnk -> svc.exe`}
+/>
+
+## Verifying in the lab
+
+Log out and back in. The shortcut fires from `explorer.exe`. The tell in the event log is a
+process create whose image path is the shortcut and whose parent is `explorer.exe`, within
+seconds of the logon.
+
+<CodeBlock
+  file="logon"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> dir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+svc.lnk   1,204   09/04/2026
+
+# EID 1 at logon:
+# New Process: svc.exe     Parent: explorer.exe
+# Image path:  C:\\ProgramData\\...\\Startup\\svc.lnk   <-- the artifact`}
+/>
+
+## Detection
+
+The technique leaves two clean artifacts: the file appearing in the folder, and the process
+firing from it at logon.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 11 file-creation rule is the earliest and cheapest continuous control and
+catches most drops, including `.lnk` stubs. The EID 1 process-create rule confirms execution and
+is the better alert for triage. The EDR target-path check narrows the `.lnk` cases to the
+suspicious ones.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

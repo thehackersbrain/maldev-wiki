@@ -1,0 +1,203 @@
+---
+title: Manual PE Mapping
+mitre: T1620
+category: loaders
+group: In-Memory Execution
+summary: Map a PE into memory by hand - parse the headers, reserve sections, and patch relocations without a loader.
+platform: [Windows]
+tags: ['C / C++', 'PE', 'Windows API']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: Read the DOS and PE headers
+    desc: Walk the MZ header to e_lfanew, then the COFF header and data directories.
+    dll: kernel32
+  - call: Reserve the image region
+    desc: VirtualAlloc a region at the image PreferredBase (or a free base) sized to ImageSize.
+    dll: kernel32
+  - call: Copy the sections
+    desc: For each section, commit its raw size and copy the file bytes into place.
+    dll: kernel32
+  - call: Apply base relocations
+    desc: If the image is not at its preferred base, walk the BaseReloc table and patch deltas.
+    dll: '-'
+  - call: Bind the import table
+    desc: Resolve each imported function address from its DLL and write it into the IAT.
+    dll: kernel32
+  - call: Run the entry point
+    desc: Call DllMain (DLL) or the entry point (EXE) with the mapped base as hModule.
+    dll: '-'
+detections:
+  - src: MEMORY SCAN
+    text: A committed region beginning MZ that is absent from the PEB loaded-module list.
+  - src: SYSMON EID 5
+    text: A large commit to a private region big enough for a PE, with no EID 7 image load for it.
+  - src: SYSMON EID 10
+    text: Cross-process memory writes by a parent that never loaded the child's image.
+  - src: EVENT 21
+    text: A PAGEFAULT storm into an anonymous private region with no corresponding image load.
+related:
+  - mitre: T1620
+    title: Reflective DLL Loading
+    desc: The same map, but the image carries the loader and maps itself from a bootstrap.
+    href: /techniques/injection/reflective-dll-loading
+  - mitre: T1027.009
+    title: Donut Shellcode
+    desc: Turns a PE into raw shellcode that runs it; manual mapping does the same by hand.
+    href: /techniques/loaders/donut-shellcode
+  - mitre: T1027.009
+    title: Shellcode Loader
+    desc: The raw-bytes side of the same problem; manual mapping adds a full PE with an IAT.
+    href: /techniques/loaders/shellcode-loader
+  - mitre: T1027
+    title: PE Packer / Crypter
+    desc: Hides the bytes that manual mapping then has to restore before it can run.
+    href: /techniques/loaders/pe-packer-crypter
+  - mitre: T1055.012
+    title: Process Hollowing
+    desc: Maps the image over a suspended process instead of into fresh memory.
+    href: /techniques/injection/process-hollowing
+labKit:
+  - label: Manual-map lab DLL + loader
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Manual mapping - also called reflective loading - loads a portable executable into a process
+without asking the Windows loader to do it. Instead of `LoadLibrary` or an image on disk, the
+code reads the PE's headers itself, reserves the memory the image needs, copies the sections in,
+patches the places that depend on where the image landed, resolves the imports, and calls the
+entry point. The result is a fully functional DLL or EXE that the operating system never saw
+arrive: no file handle to the image, no module in the process's module list, and the code sits
+at whatever address the loader picked.
+
+The reason this is worth the effort is that the loader is a detector. A normal image load
+produces an image-load event, a module entry in the PEB, and a file-backed mapping. Manual
+mapping produces none of those by default, which is exactly why it is the backbone of in-memory
+execution, [shellcode](/techniques/loaders/shellcode-loader) that wants a full PE, and
+[hollowing](/techniques/injection/process-hollowing). The cost is that every step the loader
+would normally do - relocations, import binding, section permissions - is now your bug to get
+right.
+
+<Callout type="caution">
+  Manual mapping is not position-independent by default. If the preferred base is taken you must
+  rebase the image, which means relocations must be applied *and* the import table rebuilt. Get
+  either wrong and the image crashes on its first import call, often long after the map "succeeded".
+</Callout>
+
+<Callout type="note">
+  This is the map performed by a loader that is separate from the image - code that already holds
+  the PE in a file or a buffer and maps it into memory. A
+  [reflective DLL](/techniques/injection/reflective-dll-loading) is the case where the image
+  carries that loader and maps itself from an exported bootstrap stub. The steps are identical;
+  only the home of the mapping code differs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The map below is abridged - it reserves the region and copies the sections. Relocation and
+import binding are the parts that actually differ most between implementations, so they are
+flagged rather than fully written out.
+
+<CodeBlock
+  file="manual_map.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+
+HMODULE ManualMap(const char* path) {
+    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return NULL;
+
+    // --- headers --------------------------------------------------------
+    IMAGE_DOS_HEADER dos;
+    ReadFile(hf, &dos, sizeof(dos), NULL, NULL);
+    SetFilePointer(hf, dos.e_lfanew, NULL, FILE_BEGIN);
+    IMAGE_NT_HEADERS nt;
+    ReadFile(hf, &nt, sizeof(nt), NULL, NULL);
+    IMAGE_SECTION_HEADER* s = IMAGE_FIRST_SECTION(&nt);
+
+    SIZE_T imageSize = nt.OptionalHeader.SizeOfImage;
+    DWORD  align     = nt.OptionalHeader.SectionAlignment;
+
+    // --- reserve the image region at the preferred base -----------------
+    LPVOID img = VirtualAlloc((LPVOID)nt.OptionalHeader.ImageBase,
+                              imageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!img)  // base is taken: rebase, which forces relocations + IAT fixup
+        img = VirtualAlloc(NULL, imageSize,
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    LPVOID base = img;
+
+    // --- copy the sections ---------------------------------------------
+    for (WORD i = 0; i < nt.FileHeader.NumberOfSections; i++) {
+        if (s[i].SizeOfRawData == 0) continue;
+        LPVOID dst = (LPBYTE)base + s[i].VirtualAddress;
+        SIZE_T n   = ((s[i].Misc.VirtualSize + 0xFFF) / 0x1000) * 0x1000;
+        VirtualAlloc(dst, n, MEM_COMMIT, PAGE_READWRITE);
+        SetFilePointer(hf, s[i].PointerToRawData, NULL, FILE_BEGIN);
+        ReadFile(hf, dst, s[i].SizeOfRawData, NULL, NULL);
+    }
+
+    // --- relocations + IAT + entry point   <-- omitted for brevity -------
+    // if (base != ImageBase) apply the BaseReloc delta table,
+    // then walk the ImportTable and ResolveImport each function,
+    // then: ((DWORD(*)(HMODULE,DWORD,PVOID))base)(base, DLL_PROCESS_ATTACH, NULL);
+    CloseHandle(hf);
+    return (HMODULE)base;
+}`}
+/>
+
+## Verifying in the lab
+
+Load the map in WinDbg against the target process. The tell is a committed region whose first
+bytes are `MZ` that does not appear in the module list.
+
+<CodeBlock
+  file="windbg"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`0:000> !peb
+...
+0:000> lm
+start             end                 module name
+7c800000 7c9xxx00   ntdll
+74xx0000 74xxyy00   kernel32
+(no entry for the mapped image)  <-- absent from the module list
+
+0:000> dd <mapped_base> L2
+<mapped_base>  4d5a 9000 0300 0000   ^ MZ header in a private region`}
+/>
+
+## Detection
+
+Without a loader, there is no image-load event and no module entry. Detection has to look at
+memory itself or at the writes that put the image there.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the memory scan for an `MZ` region outside the module list is the highest-fidelity
+check but is periodic and expensive. The SYSMON EID 5 / EID 10 correlation catches the act of
+writing the image and runs continuously. The PAGEFAULT signal is noisy on its own but useful as
+a tripwire to trigger a deeper scan.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

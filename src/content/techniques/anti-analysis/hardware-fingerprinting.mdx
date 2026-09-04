@@ -1,0 +1,177 @@
+---
+title: Hardware Fingerprinting
+mitre: T1497.001
+category: anti-analysis
+group: Environment Checks
+summary: Hash the machine's hardware identifiers so the implant behaves only on the target and flags sandboxes.
+platform: [Windows, Linux, macOS]
+tags: ['C / C++', 'Windows API', 'System Calls']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: Query the identifiers
+    desc: Read CPU id, SMBIOS serial, disk model and size, MAC OUI and memory via WMI or IOCTL.
+    dll: kernel32 / ntdll
+  - call: Normalize the values
+    desc: Trim, lowercase and order the raw values so one machine always yields the same bytes.
+    dll: '-'
+  - call: Hash into a fingerprint
+    desc: Combine and hash the values into a single fingerprint the implant compares against.
+    dll: '-'
+  - call: Branch on the result
+    desc: Match the expected fingerprint to proceed, or a VM signature to idle and burn cycles.
+    dll: '-'
+detections:
+  - src: WMI EDR
+    text: A burst of CIM queries for Processor, ComputerSystem, DiskDrive and NetworkAdapter in one window.
+  - src: SYSMON EID 10
+    text: A fresh binary reading many hardware identifiers from the registry before any file or network IO.
+  - src: BEHAVIOURAL
+    text: A process performing dozens of hardware reads then going quiet with no output.
+  - src: EDR
+    text: An implant whose behaviour flips only after a set of hardware reads resolve - the gate.
+related:
+  - mitre: T1497
+    title: Sandbox Detection
+    desc: Behavioural and timing tells; fingerprinting is the static hardware-identity half.
+    href: /techniques/anti-analysis/sandbox-detection
+  - mitre: T1622
+    title: Anti-Debug
+    desc: Debugger-aware checks; fingerprinting is the machine-aware sibling of the same evasion.
+    href: /techniques/anti-analysis/anti-debug
+  - mitre: T1497.003
+    title: Timing Evasion
+    desc: Delays and entropy tricks; often paired with a hardware gate to sidestep the VM.
+    href: /techniques/anti-analysis/timing-evasion
+  - mitre: T1027
+    title: String Encryption
+    desc: The fingerprint source strings are usually encrypted so a static scan cannot find the serials.
+    href: /techniques/anti-analysis/string-encryption
+labKit:
+  - label: Fingerprint lab binary
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Hardware fingerprinting reads a set of stable machine identifiers - the CPU, the disk, the
+network adapter, the BIOS - and folds them into a single value the implant can test against.
+Because those identifiers are fixed for a given physical machine, the fingerprint is the same on
+every run and different on every other box. That makes it useful in two distinct ways. As
+evasion, a virtual machine has a distinctive fingerprint - few cores, a small disk, a
+hypervisor-registered MAC, a tiny amount of RAM - so the implant can see "this is a VM" and
+idle. As a control, the implant can be issued for one fingerprint and refuse to run anywhere
+else, which binds it to the target and breaks naive multi-VM detonation.
+
+This is the static half of [sandbox detection](/techniques/anti-analysis/sandbox-detection).
+Sandbox detection leans on behaviour and timing - how fast the host responds, whether a
+debugger is attached, how much entropy is available. Fingerprinting ignores all of that and
+simply asks "what machine am I on?", then checks the answer. The two are routinely combined: a
+[timing gate](/techniques/anti-analysis/timing-evasion) to shed the fast analysis box, and a
+hardware gate to shed the virtual one.
+
+<Callout type="note">
+  The fingerprint source values are almost always obfuscated. A defender who greps the binary for
+  a disk model string or a MAC OUI finds nothing, because the strings are
+  [encrypted](/techniques/anti-analysis/string-encryption) and only assembled at the point of
+  the query. The detection target is the *act of querying*, not the strings.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The pattern is: read a handful of identifiers, hash them together, and branch. The sample
+combines the CPU core count, the MAC OUI, and the installed memory - three cheap reads that
+already separate most VMs from most hosts.
+
+<CodeBlock
+  file="fingerprint.c"
+  label="C"
+  lang="c"
+  class="mb-7.5"
+  code={`#include \u003cwindows.h\u003e
+#include \u003ciphlpapi.h\u003e
+#pragma comment(lib, "iphlpapi.lib")
+
+static void fnv(unsigned long long* h, const void* p, unsigned long n) {
+    const unsigned char* b = p;
+    while (n--) *h = (*h ^ *b++) * 1099511628211ULL;
+}
+
+unsigned long long fingerprint() {
+    unsigned long long h = 1469598103934665603ULL;
+
+    // 1. CPU core count - VMs report small, round numbers
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    fnv(&h, &si.dwNumberOfProcessors, sizeof(si.dwNumberOfProcessors));
+
+    // 2. MAC OUI - the first 3 bytes expose the hypervisor vendor
+    IP_ADAPTER_INFO ai; ULONG len = sizeof(ai);
+    if (GetAdaptersInfo(&ai, &len) == ERROR_SUCCESS)
+        fnv(&h, ai.Address, 3);   // 00:05:69 / 00:0C:29 / 00:50:56 = VMware
+
+    // 3. installed memory - lab VMs are small
+    ULONGLONG mem = 0;
+    GetPhysicallyInstalledSystemMemory(&mem);
+    fnv(&h, &mem, sizeof(mem));
+
+    // compare h to the fingerprint the implant was issued for;
+    // on mismatch (or a known-VM OUI) enter a spin loop and burn CPU.
+    return h;
+}`}
+/>
+
+The identifiers that give a virtual machine away, and the value that betrays it.
+
+| Identifier | Read via | VM tell |
+|------------|----------|---------|
+| MAC OUI | `GetAdaptersInfo` | `00:05:69` / `00:0C:29` / `00:50:56` (VMware), `08:00:27` (VirtualBox) |
+| Core count | `GetSystemInfo` | small, round numbers; host cores are higher |
+| Memory | `GetPhysicallyInstalledSystemMemory` | lab VMs are 2-8 GB |
+| Disk size | IOCTL / WMI | far smaller than a real disk |
+| BIOS / SMBIOS | WMI `Win32_ComputerSystem` | `VirtualBox`, `VMware`, `innotek` strings |
+
+## Verifying in the lab
+
+Run the binary on a physical host and in a VM. On the host the fingerprint matches and the
+implant proceeds; in the VM it hits the OUI / core-count tell and drops into its idle loop.
+
+<CodeBlock
+  file="run"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`$ ./fingerprint.exe
+[fingerprint] cores=16 mem=32768MB oui=00:1b:21  -> host, proceeding
+$ # in the lab VM:
+[fingerprint] cores=2  mem=4096MB  oui=08:00:27  -> VM (VirtualBox), idling
+    ^ the OUI and the small core count are the gate  <-- the artifact`}
+/>
+
+## Detection
+
+A fingerprint check is a burst of hardware reads from a fresh process that then goes quiet.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the WMI / EDR burst rule is the most direct continuous control and catches the query
+storm at the moment it happens. The EID 10 registry-read rule catches the non-WMI variant that
+reads the identifiers from the registry. The "goes quiet" behavioural rule is higher fidelity
+but needs a short correlation window to separate a real fingerprint gate from a benign probe.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

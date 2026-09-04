@@ -1,0 +1,156 @@
+---
+title: Winlogon Userinit & Helper DLL
+mitre: T1547.004
+category: persistence
+group: Boot / Logon Autostart
+summary: Point Winlogon's Userinit or register a Helper DLL so a payload loads into the logon manager at every interactive logon.
+platform: [Windows]
+tags: ['Registry', 'Windows API', 'DLL']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 7 min read
+callChain:
+  - call: Target the Winlogon key
+    desc: HKLM ...\Winlogon Userinit, Shell, or a Notify subkey under the same hive.
+    dll: advapi32
+  - call: Append or register the payload
+    desc: Add a DLL to the comma-separated Userinit list, or register a Notify package.
+    dll: advapi32
+  - call: User logs on
+    desc: Winlogon starts and loads Userinit, which LoadLibrary's each entry in the list.
+    dll: '-'
+  - call: Payload runs in winlogon
+    desc: The DLL's DllMain executes inside winlogon.exe for the whole session.
+    dll: '-'
+detections:
+  - src: SYSMON EID 13
+    text: A value set on HKLM ...\Winlogon Userinit or Shell that is not the stock userinit.exe path.
+  - src: SYSMON EID 7
+    text: An image load of a non-system32 DLL into winlogon.exe at logon.
+  - src: EDR
+    text: A new subkey under HKLM ...\Winlogon\Notify registering SPI or DllUnregisterServer functions.
+  - src: BEHAVIOURAL
+    text: The Userinit value holding a comma-separated list longer than the default single entry.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: Run keys load in user context via Explorer; Winlogon loads in the logon manager, pre-desktop.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1542.003
+    title: Boot Persistence
+    desc: Winlogon is the interactive-logon slice of broader boot or logon autostart persistence.
+    href: /techniques/persistence/boot-persistence
+  - mitre: T1574.001
+    title: DLL Hijacking
+    desc: If the appended path is a hijackable name, this overlaps DLL search-order hijacking.
+    href: /techniques/persistence/dll-hijacking
+  - mitre: T1547.001
+    title: Startup Folder
+    desc: The folder-based sibling - the shell launches it; Winlogon loads this one in-process.
+    href: /techniques/persistence/startup-folder
+labKit:
+  - label: Winlogon helper lab DLL + keys
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Winlogon - `winlogon.exe`, the secure logon manager - loads a fixed set of components at every
+interactive logon. Two of those are attacker-writable, which is what makes Winlogon a
+persistence target. The `Userinit` value under `HKLM\...\Winlogon` names the executable the
+logon manager runs after authentication; the default is `C:\Windows\System32\Userinit.exe`. The
+value is a comma-separated list, and `winlogon` will `LoadLibrary` each entry - so appending a
+second path loads an arbitrary DLL before the desktop even appears.
+
+The other vector is the Winlogon notification (Notify) package. A signed DLL registered under
+`HKLM\...\Winlogon\Notify` is called by `winlogon` at logon and logoff through its exported SPI
+functions. Because the OS loads it from a registry-declared path, it runs with the integrity of
+the logon manager - `winlogon.exe` is `SYSTEM`, so the helper is effectively `SYSTEM` too, and
+it is loaded before most userland persistence can fire.
+
+<Callout type="danger">
+  Winlogon persistence runs in the logon manager, not in a new process. A broken helper DLL can
+  hang the logon, and a helper that references a missing export can take the session down with it.
+  This is the trade-off: higher integrity and earlier execution than a
+  [run key](/techniques/persistence/registry-run-keys), at the cost of being inside a critical
+  system process.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The three vectors, and what each one requires.
+
+| Vector | Key / location | Privilege | Runs as |
+|--------|----------------|-----------|---------|
+| Userinit append | `HKLM\...\Winlogon` `Userinit` | Admin | `winlogon` (SYSTEM) |
+| Shell override | `HKLM\...\Winlogon` `Shell` | Admin | `winlogon` (SYSTEM) |
+| Notify package | `HKLM\...\Winlogon\Notify\<name>` | Admin | `winlogon` (SYSTEM) |
+
+The Userinit append is the most common. The value becomes a comma-terminated list and
+`winlogon` loads each entry.
+
+<CodeBlock
+  file="winlogon_append.reg"
+  lang="ini"
+  class="mb-7.5"
+  code={`Windows Registry Editor Version 5.00
+
+# the stock value is C:\\\\Windows\\\\system32\\\\Userinit.exe,
+# appending a second entry makes winlogon LoadLibrary your DLL too
+[HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon]
+"Userinit"="C:\\\\Windows\\\\system32\\\\Userinit.exe, C:\\\\ProgramData\\\\.u\\\\hook.dll,"`}
+/>
+
+<Callout type="note">
+  The trailing comma after each entry is load-bearing. `winlogon` splits the value on commas and
+  expects each element to be terminated; dropping the final comma is the most common reason an
+  appended helper silently never loads.
+</Callout>
+
+## Verifying in the lab
+
+Log out and back in. The helper is loaded into `winlogon.exe`, not launched as its own process.
+Sysmon records the image load; there is no process-create for the DLL.
+
+<CodeBlock
+  file="logon"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# EID 7 at logon (no EID 1 - it is a load, not a spawn):
+# Image loaded: C:\\ProgramData\\.u\\hook.dll
+# Process:      winlogon.exe
+#                ^ loaded into the logon manager  <-- the artifact
+
+> reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" /v Userinit
+Userinit    REG_SZ    C:\\Windows\\system32\\Userinit.exe, C:\\ProgramData\\.u\\hook.dll,`}
+/>
+
+## Detection
+
+The signature is a change to a `winlogon` registry value, or a non-system DLL loading into the
+logon manager at logon.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 13 value-set rule on the `Winlogon` key is the earliest continuous control and
+catches both the Userinit append and a Notify registration. The EID 7 image-load rule confirms
+execution inside `winlogon.exe` and is the cleaner alert for triage. The behavioural list-length
+check catches appended helpers that the path-based rules can miss.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

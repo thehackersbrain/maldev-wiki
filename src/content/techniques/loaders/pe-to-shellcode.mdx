@@ -1,0 +1,175 @@
+---
+title: PE to Shellcode
+mitre: T1620
+category: loaders
+group: Shellcode Generation
+summary: Embed a PE as bytes in position-independent shellcode that reflects the image into memory and jumps to its entry point.
+platform: [Windows]
+tags: ['C / C++', 'Shellcode', 'PE']
+updated: '2026-09-04'
+author: thehackersbrain
+readingTime: 9 min read
+callChain:
+  - call: Embed the PE as a byte array
+    desc: The PE file becomes an unsigned char payload[] inside the shellcode.
+    dll: '-'
+  - call: Find a free region
+    desc: Locate space for the image via the PEB Ldr table or a free-range search.
+    dll: '-'
+  - call: Copy the PE bytes in place
+    desc: Write the embedded payload into the reserved region; the shellcode must be relocatable.
+    dll: '-'
+  - call: Run the manual-map fixups
+    desc: Apply relocations and bind the IAT on the copied image, as a loader would.
+    dll: '-'
+  - call: Jump to the entry point
+    desc: Transfer control to the mapped entry point; the shellcode's job is done.
+    dll: '-'
+detections:
+  - src: MEMORY SCAN
+    text: An RWX private region holding an MZ blob with no backing file and no image-load event.
+  - src: SYSMON EID 8
+    text: A remote thread whose start address points into a private region, not a loaded module.
+  - src: SYSMON EID 5
+    text: A process writing a full PE into another process's private memory with no new module.
+  - src: STATIC
+    text: Shellcode carrying an embedded MZ header plus relocation and import fixup logic.
+related:
+  - mitre: T1027.009
+    title: Donut Shellcode
+    desc: The generator that turns your PE into exactly this kind of shellcode for you.
+    href: /techniques/loaders/donut-shellcode
+  - mitre: T1620
+    title: Manual PE Mapping
+    desc: The step-by-step mapping the generated shellcode performs in memory.
+    href: /techniques/loaders/pe-manual-mapping
+  - mitre: T1027.009
+    title: Position Independent Code
+    desc: Why the shellcode itself must be relocatable before it can relocate the PE.
+    href: /techniques/loaders/position-independent-code
+  - mitre: T1027.009
+    title: Shellcode Loader
+    desc: The injection side that places the resulting shellcode into a target process.
+    href: /techniques/loaders/shellcode-loader
+labKit:
+  - label: PE-to-shellcode generator + samples
+    href: 'https://github.com/thehackersbrain/maldev-lab-kit'
+  - label: Sigma rule pack
+    href: /detections
+  - label: Detonation VM profile
+    href: /toolkit
+---
+
+import Callout from '../../../components/Callout.astro';
+import CallChain from '../../../components/CallChain.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import DetectionGrid from '../../../components/DetectionGrid.astro';
+import RelatedList from '../../../components/RelatedList.astro';
+
+## Overview
+
+PE-to-shellcode is the conversion of a portable executable into a self-contained shellcode blob.
+The PE's bytes are embedded as a C array, and a small position-independent preamble is written
+that, when it runs, finds free memory, copies the embedded image in, applies the
+[relocations and import fixups](/techniques/loaders/pe-manual-mapping) a loader would normally
+do, and jumps to the entry point. After that jump, you are executing the original PE in memory
+- no file on disk, no module the OS registered.
+
+This is the bridge between two things people often conflate. On one side is raw
+[shellcode](/techniques/loaders/shellcode-loader), which is just bytes that do one thing. On the
+other is a full PE with sections, an import table and an entry point. PE-to-shellcode makes the
+second look like the first: the thing you inject is a blob of machine code, but what that blob
+boots is a complete image. Tools like [Donut](/techniques/loaders/donut-shellcode) exist
+precisely to generate this blob for you so you do not have to hand-write the preamble.
+
+<Callout type="note">
+  The preamble must be position-independent. It runs at an unknown address before it has set
+  anything up, so it cannot use absolute references to itself. See
+  [position independent code](/techniques/loaders/position-independent-code) for why this is the
+  single most common source of "works in x64dbg, crashes in the real target" bugs.
+</Callout>
+
+## The call chain
+
+<CallChain steps={frontmatter.callChain} />
+
+## Reference implementation
+
+The first step is mechanical: turn the PE into a byte array.
+
+<CodeBlock
+  file="embed.sh"
+  lang="shell"
+  class="mb-7.5"
+  code={`# turn the PE into a C array the shellcode can carry
+xxd -i implant.dll > implant_bytes.h`}
+/>
+
+What the generated shellcode then does, conceptually. This is the anatomy of the blob, not a
+complete implementation - a generator such as Donut emits the real thing.
+
+<CodeBlock
+  file="shellcode_anatomy.c"
+  label="C (shellcode)"
+  lang="c"
+  class="mb-7.5"
+  code={`// position-independent preamble, abridged
+extern const unsigned char payload[];   // the embedded PE (from xxd -i)
+extern const unsigned long  payload_len;
+
+void __fastcall shellcode_entry() {
+    // 1. find a free region large enough for the image
+    //    - walk the PEB Ldr data table for a free range, or
+    //    - VirtualAlloc a fresh block sized to SizeOfImage
+    // 2. copy the embedded bytes in place  <-- the image now exists in memory
+    memcpy(region, payload, payload_len);
+
+    // 3. apply relocations if region != PreferredBase, then bind the IAT
+    //    (identical steps to a manual map, on the copied bytes)
+    fixup_relocations(region);
+    fixup_imports(region);
+
+    // 4. jump to the entry point - control never returns here
+    ((void(*)())region)();
+}`}
+/>
+
+<Callout type="caution">
+  The shellcode and the embedded PE are two different position-independent problems. The
+  preamble must be PIC *before* it runs; the PE must be rebased *after* it is copied in. Tools
+  that generate the blob handle both, but a hand-rolled preamble that forgets the second step
+  will crash on the PE's first import call.
+</Callout>
+
+## Verifying in the lab
+
+Generate the blob, drop it into a target, and watch the PE appear in memory. WinDbg will show an
+`MZ` region that is not in the module list, and the process executing the implant's code.
+
+<CodeBlock
+  file="windbg"
+  lang="shellsession"
+  class="mb-7.5"
+  code={`0:000> !process 0 0
+...
+0:000> lm
+(no module for the implant)  <-- injected as shellcode, not a module
+
+0:000> dd <region> L2
+<region>  4d5a 9000 0300 0000   ^ the embedded PE, now running`}
+/>
+
+## Detection
+
+The detection surface is the same as manual mapping, plus the fact that a full PE landed inside
+what should have been a small shellcode blob.
+
+<DetectionGrid items={frontmatter.detections} />
+
+Rank them: the static scan for an embedded `MZ` plus fixup logic catches the blob before it
+runs and is the cheapest control. The EID 8 remote-thread-with-private-start check catches the
+injection at runtime. The memory scan is the highest-fidelity but periodic catch-all.
+
+## Variants & related
+
+<RelatedList items={frontmatter.related} />
